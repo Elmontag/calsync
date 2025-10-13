@@ -1,0 +1,27 @@
+version: '3.9'
+
+services:
+  backend:
+    build: ./backend
+    container_name: calsync-backend
+    environment:
+      - TZ=Europe/Berlin
+    volumes:
+      - backend-data:/app/data
+    ports:
+      - '8000:8000'
+  web:
+    build: ./web
+    container_name: calsync-web
+    depends_on:
+      - backend
+    ports:
+      - '4173:4173'
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: calsync-mailhog
+    ports:
+      - '1025:1025'
+      - '8025:8025'
+volumes:
+  backend-data:
