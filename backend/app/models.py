@@ -4,7 +4,16 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, Column, DateTime, Enum as SqlEnum, ForeignKey, Integer, JSON, String
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Enum as SqlEnum,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+)
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -70,6 +79,8 @@ class TrackedEvent(Base):
     id = Column(Integer, primary_key=True, index=True)
     uid = Column(String, unique=True, nullable=False)
     mailbox_message_id = Column(String, nullable=True)
+    source_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    source_folder = Column(String, nullable=True)
     summary = Column(String, nullable=True)
     organizer = Column(String, nullable=True)
     start = Column(DateTime, nullable=True)
@@ -81,3 +92,19 @@ class TrackedEvent(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SyncMapping(Base):
+    """Configuration describing how IMAP sources map to CalDAV targets."""
+
+    __tablename__ = "sync_mappings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    imap_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    imap_folder = Column(String, nullable=False)
+    caldav_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    calendar_url = Column(String, nullable=False)
+    calendar_name = Column(String, nullable=True)
+
+    imap_account = relationship("Account", foreign_keys=[imap_account_id])
+    caldav_account = relationship("Account", foreign_keys=[caldav_account_id])

@@ -33,6 +33,7 @@ class CalendarCandidate:
     message_id: str
     subject: str
     sender: str
+    folder: str
     attachments: List[MailAttachment]
     links: List[str]
 
@@ -100,6 +101,7 @@ def fetch_calendar_candidates(
                         message_id=str(uid),
                         subject=message.get("Subject", "(no subject)"),
                         sender=message.get("From", "unknown"),
+                        folder=folder,
                         attachments=attachments,
                         links=links,
                     )

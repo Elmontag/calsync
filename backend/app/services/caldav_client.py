@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional
 
 from caldav import DAVClient
 from caldav.objects import Calendar
@@ -48,9 +48,12 @@ def upload_ical(calendar_url: str, ical: ICalendar, settings: CalDavSettings) ->
         calendar.save_event(ical.to_ical())
 
 
-def list_calendars(settings: CalDavSettings) -> Iterable[str]:
+def list_calendars(settings: CalDavSettings) -> Iterable[Dict[str, str]]:
     """Return all calendar URLs accessible with the given credentials."""
     with CalDavConnection(settings) as client:
         principal = client.principal()
         for calendar in principal.calendars():
-            yield calendar.url
+            yield {
+                "url": calendar.url,
+                "name": getattr(calendar, "name", None) or calendar.url,
+            }

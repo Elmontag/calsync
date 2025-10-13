@@ -6,13 +6,24 @@ interface Props {
   events: TrackedEvent[];
   onManualSync: (payload: ManualSyncRequest) => Promise<{ uploaded: string[] }>;
   onScan: () => Promise<void>;
+  onSyncAll: () => Promise<void>;
+  autoSyncEnabled: boolean;
+  onAutoSyncToggle: (enabled: boolean) => Promise<void>;
 }
 
-export default function EventTable({ events, onManualSync, onScan }: Props) {
+export default function EventTable({
+  events,
+  onManualSync,
+  onScan,
+  onSyncAll,
+  autoSyncEnabled,
+  onAutoSyncToggle,
+}: Props) {
   const [selected, setSelected] = useState<number[]>([]);
   const [calendarUrl, setCalendarUrl] = useState('');
   const [open, setOpen] = useState(false);
   const [syncResult, setSyncResult] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
 
   function toggleSelection(id: number) {
     setSelected((prev) =>
@@ -31,16 +42,57 @@ export default function EventTable({ events, onManualSync, onScan }: Props) {
     setSelected([]);
   }
 
+  async function handleSyncAll() {
+    setBusy(true);
+    try {
+      await onSyncAll();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleAutoSyncToggle() {
+    setBusy(true);
+    try {
+      await onAutoSyncToggle(!autoSyncEnabled);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-slate-100">Gefundene Termine</h2>
-        <div className="space-x-2">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-100">Gefundene Termine</h2>
+          <p className="text-sm text-slate-400">
+            Wähle Termine aus oder synchronisiere alle automatisch über die Zuordnungen.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
           <button
             onClick={onScan}
             className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-700"
           >
             Postfächer scannen
+          </button>
+          <button
+            onClick={handleSyncAll}
+            disabled={busy}
+            className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-sky-950 hover:bg-sky-500 disabled:opacity-40"
+          >
+            Alle synchronisieren
+          </button>
+          <button
+            onClick={handleAutoSyncToggle}
+            disabled={busy}
+            className={`rounded-lg px-4 py-2 text-sm font-semibold transition ${
+              autoSyncEnabled
+                ? 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400'
+                : 'bg-slate-800 text-slate-100 hover:bg-slate-700'
+            } disabled:opacity-40`}
+          >
+            {autoSyncEnabled ? 'AutoSync deaktivieren' : 'AutoSync aktivieren'}
           </button>
           <button
             onClick={() => setOpen(true)}
@@ -61,6 +113,9 @@ export default function EventTable({ events, onManualSync, onScan }: Props) {
               </th>
               <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-400">
                 Betreff
+              </th>
+              <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-400">
+                Quelle
               </th>
               <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-400">
                 Zeitraum
@@ -86,6 +141,10 @@ export default function EventTable({ events, onManualSync, onScan }: Props) {
                 <td className="px-4 py-2">
                   <p className="text-sm font-medium text-slate-100">{event.summary ?? 'Unbenannt'}</p>
                   <p className="text-xs text-slate-400">UID: {event.uid}</p>
+                </td>
+                <td className="px-4 py-2 text-xs text-slate-300">
+                  {event.source_account_id ? `Konto #${event.source_account_id}` : 'unbekannt'}
+                  {event.source_folder ? ` · ${event.source_folder}` : ''}
                 </td>
                 <td className="px-4 py-2 text-sm text-slate-300">
                   {event.start ? new Date(event.start).toLocaleString() : 'Unbekannt'}

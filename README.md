@@ -11,7 +11,8 @@ CalSync ist ein leichtgewichtiger Service, der definierbare IMAP-Ordner nach Kal
   - Hintergrundscheduler (APScheduler) für automatische Scans
 - **Frontend** (`web/`)
   - React + Vite + TailwindCSS Dashboard
-  - Verwaltung von IMAP-/CalDAV-Konten, Verbindungstests und manueller Export
+  - Verwaltung von IMAP-/CalDAV-Konten samt Verbindungstests
+  - Zuordnung von IMAP-Ordnern zu CalDAV-Kalendern, manueller Export und AutoSync-Schalter
 - **Docker Compose** (`docker-compose.yml`)
   - Startet Backend, Web-UI und optionale Mailhog-Testumgebung
 
@@ -59,10 +60,16 @@ npm run dev
 | GET    | `/accounts`       | Auflistung aller Konten                       |
 | POST   | `/accounts`       | Neues Konto anlegen                           |
 | POST   | `/accounts/test`  | Verbindungstest für IMAP oder CalDAV          |
+| GET    | `/accounts/{id}/calendars` | Alle CalDAV-Kalender eines Kontos auflisten |
 | GET    | `/events`         | Gefundene Termine anzeigen                    |
 | POST   | `/events/scan`    | Manuelles Scannen der IMAP-Ordner             |
 | POST   | `/events/manual-sync` | Manuelle Übertragung in CalDAV-Kalender |
-| POST   | `/events/schedule`    | Automatische Scans planen                 |
+| POST   | `/events/sync-all` | Alle Termine entsprechend der Zuordnungen exportieren |
+| GET/POST | `/events/auto-sync` | AutoSync-Status abfragen bzw. aktivieren |
+| GET    | `/sync-mappings`  | Zuordnungen zwischen IMAP und CalDAV anzeigen |
+| POST   | `/sync-mappings`  | Neue Zuordnung anlegen                        |
+| PUT    | `/sync-mappings/{id}` | Zuordnung aktualisieren                  |
+| DELETE | `/sync-mappings/{id}` | Zuordnung entfernen                      |
 
 ## Datenpersistenz
 

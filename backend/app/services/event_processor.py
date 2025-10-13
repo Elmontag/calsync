@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 from sqlalchemy import select
 
@@ -16,7 +16,12 @@ from .caldav_client import CalDavSettings, upload_ical
 logger = logging.getLogger(__name__)
 
 
-def upsert_events(parsed_events: Iterable[ParsedEvent], source_message_id: str) -> List[TrackedEvent]:
+def upsert_events(
+    parsed_events: Iterable[ParsedEvent],
+    source_message_id: str,
+    source_account_id: Optional[int] = None,
+    source_folder: Optional[str] = None,
+) -> List[TrackedEvent]:
     """Insert new or update existing events based on parsed ICS data."""
     stored_events: List[TrackedEvent] = []
     with session_scope() as session:
@@ -32,6 +37,8 @@ def upsert_events(parsed_events: Iterable[ParsedEvent], source_message_id: str) 
             if event is None:
                 event = TrackedEvent(
                     uid=parsed.uid,
+                    source_account_id=source_account_id,
+                    source_folder=source_folder,
                     summary=parsed.summary,
                     organizer=parsed.organizer,
                     start=parsed.start,
@@ -50,6 +57,8 @@ def upsert_events(parsed_events: Iterable[ParsedEvent], source_message_id: str) 
                 event.end = parsed.end
                 event.payload = parsed.event.to_ical().decode()
                 event.status = parsed.status if parsed.status != EventStatus.NEW else EventStatus.UPDATED
+                event.source_account_id = source_account_id or event.source_account_id
+                event.source_folder = source_folder or event.source_folder
                 event.history = merge_histories(event.history or [], history_entry)
                 event.updated_at = datetime.utcnow()
                 logger.info("Updated event %s", parsed.uid)
@@ -81,21 +90,31 @@ def mark_as_synced(events: Iterable[TrackedEvent]) -> None:
 
 def manual_sync(request: ManualSyncRequest, settings: CalDavSettings) -> List[str]:
     """Manually export selected events to a CalDAV calendar."""
-    uploaded_uids: List[str] = []
     with session_scope() as session:
         events = list(
             session.execute(
                 select(TrackedEvent).where(TrackedEvent.id.in_(request.event_ids))
             ).scalars()
         )
-        for event in events:
-            try:
-                upload_ical(request.target_calendar, event_payload_to_ical(event), settings)
-                uploaded_uids.append(event.uid)
-            except Exception:
-                logger.exception("Failed to upload event %s", event.uid)
-                continue
-        mark_as_synced(events)
+        return sync_events_to_calendar(events, request.target_calendar, settings)
+
+
+def sync_events_to_calendar(
+    events: Iterable[TrackedEvent],
+    calendar_url: str,
+    settings: CalDavSettings,
+) -> List[str]:
+    """Upload a batch of events to the configured CalDAV calendar."""
+    uploaded_uids: List[str] = []
+    events_list = list(events)
+    for event in events_list:
+        try:
+            upload_ical(calendar_url, event_payload_to_ical(event), settings)
+            uploaded_uids.append(event.uid)
+        except Exception:
+            logger.exception("Failed to upload event %s", event.uid)
+            continue
+    mark_as_synced(events_list)
     return uploaded_uids
 
 

@@ -40,6 +40,8 @@ export interface ConnectionTestResult {
 export interface TrackedEvent {
   id: number;
   uid: string;
+  source_account_id?: number;
+  source_folder?: string;
   summary?: string;
   organizer?: string;
   start?: string;
@@ -57,4 +59,31 @@ export interface EventHistoryEntry {
 export interface ManualSyncRequest {
   event_ids: number[];
   target_calendar: string;
+}
+
+export interface SyncMapping {
+  id: number;
+  imap_account_id: number;
+  imap_folder: string;
+  caldav_account_id: number;
+  calendar_url: string;
+  calendar_name?: string | null;
+}
+
+export interface SyncMappingCreateInput {
+  imap_account_id: number;
+  imap_folder: string;
+  caldav_account_id: number;
+  calendar_url: string;
+  calendar_name?: string | null;
+}
+
+export interface AutoSyncStatus {
+  enabled: boolean;
+  interval_minutes?: number;
+}
+
+export interface CalendarInfo {
+  url: string;
+  name: string;
 }

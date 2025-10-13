@@ -40,5 +40,9 @@ class SyncScheduler:
             self._jobs.pop(job_id, None)
             logger.info("Cancelled job %s", job_id)
 
+    def is_job_active(self, job_id: str) -> bool:
+        """Return whether a job is currently scheduled."""
+        return job_id in self._jobs
+
 
 scheduler = SyncScheduler()

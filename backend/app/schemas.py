@@ -66,6 +66,8 @@ class EventHistoryEntry(BaseModel):
 class TrackedEventRead(BaseModel):
     id: int
     uid: str
+    source_account_id: Optional[int] = None
+    source_folder: Optional[str] = None
     summary: Optional[str] = None
     organizer: Optional[str] = None
     start: Optional[datetime] = None
@@ -86,3 +88,36 @@ class SyncJobStatus(BaseModel):
     status: str
     processed: int = 0
     total: Optional[int] = None
+
+
+class SyncMappingBase(BaseModel):
+    imap_account_id: int
+    imap_folder: str
+    caldav_account_id: int
+    calendar_url: HttpUrl
+    calendar_name: Optional[str] = None
+
+
+class SyncMappingCreate(SyncMappingBase):
+    pass
+
+
+class SyncMappingUpdate(BaseModel):
+    calendar_url: Optional[HttpUrl] = None
+    calendar_name: Optional[str] = None
+
+
+class SyncMappingRead(SyncMappingBase):
+    id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AutoSyncStatus(BaseModel):
+    enabled: bool
+    interval_minutes: Optional[int] = None
+
+
+class AutoSyncRequest(BaseModel):
+    enabled: bool
+    interval_minutes: int = 5

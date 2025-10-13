@@ -3,9 +3,13 @@ import api from './client';
 import {
   Account,
   AccountCreateInput,
+  AutoSyncStatus,
+  CalendarInfo,
   ConnectionTestRequest,
   ConnectionTestResult,
   ManualSyncRequest,
+  SyncMapping,
+  SyncMappingCreateInput,
   TrackedEvent,
 } from '../types/api';
 
@@ -47,6 +51,7 @@ export async function runConnectionTest(payload: ConnectionTestRequest) {
 export function useEvents() {
   const [events, setEvents] = useState<TrackedEvent[]>([]);
   const [loading, setLoading] = useState(true);
+  const [autoSync, setAutoSync] = useState<AutoSyncStatus>({ enabled: false });
 
   async function refresh() {
     setLoading(true);
@@ -55,8 +60,14 @@ export function useEvents() {
     setLoading(false);
   }
 
+  async function loadAutoSync() {
+    const { data } = await api.get<AutoSyncStatus>('/events/auto-sync');
+    setAutoSync(data);
+  }
+
   useEffect(() => {
     refresh();
+    loadAutoSync();
   }, []);
 
   async function scan() {
@@ -70,5 +81,50 @@ export function useEvents() {
     return data;
   }
 
-  return { events, loading, refresh, scan, manualSync };
+  async function syncAll() {
+    await api.post('/events/sync-all');
+    await refresh();
+  }
+
+  async function toggleAutoSync(enabled: boolean) {
+    const { data } = await api.post<AutoSyncStatus>('/events/auto-sync', {
+      enabled,
+    });
+    setAutoSync(data);
+  }
+
+  return { events, loading, refresh, scan, manualSync, syncAll, autoSync, toggleAutoSync, loadAutoSync };
+}
+
+export function useSyncMappings() {
+  const [mappings, setMappings] = useState<SyncMapping[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  async function refresh() {
+    setLoading(true);
+    const { data } = await api.get<SyncMapping[]>('/sync-mappings');
+    setMappings(data);
+    setLoading(false);
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  async function addMapping(payload: SyncMappingCreateInput) {
+    await api.post<SyncMapping>('/sync-mappings', payload);
+    await refresh();
+  }
+
+  async function removeMapping(id: number) {
+    await api.delete(`/sync-mappings/${id}`);
+    await refresh();
+  }
+
+  return { mappings, loading, refresh, addMapping, removeMapping };
+}
+
+export async function fetchCalendars(accountId: number) {
+  const { data } = await api.get<{ calendars: CalendarInfo[] }>(`/accounts/${accountId}/calendars`);
+  return data.calendars;
 }
