@@ -135,17 +135,23 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
                 "Ungültige CalDAV Einstellungen für Konto %s", account.id
             )
             continue
-        with CalDavConnection(settings) as client:
-            calendar = client.principal().calendar(cal_url=mapping.calendar_url)
-            for event in events_for_mapping:
-                start, end = _event_search_window(event)
-                if start is None or end is None:
-                    continue
-                conflicts = find_conflicting_events(
-                    calendar, start, end, exclude_uid=event.uid
-                )
-                if conflicts:
-                    setattr(event, "conflicts", conflicts)
+        try:
+            with CalDavConnection(settings) as client:
+                calendar = client.principal().calendar(cal_url=mapping.calendar_url)
+                for event in events_for_mapping:
+                    start, end = _event_search_window(event)
+                    if start is None or end is None:
+                        continue
+                    conflicts = find_conflicting_events(
+                        calendar, start, end, exclude_uid=event.uid
+                    )
+                    if conflicts:
+                        setattr(event, "conflicts", conflicts)
+        except Exception:
+            logger.exception(
+                "Konfliktprüfung für Mapping %s fehlgeschlagen", mapping.id
+            )
+            continue
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -538,13 +544,16 @@ def perform_sync_all(db: Session, apply_auto_response: bool = False) -> int:
         ).scalars().all()
         if not events:
             continue
-        uploaded_uids = event_processor.sync_events_to_calendar(events, mapping.calendar_url, settings)
+        uploaded_uids = event_processor.sync_events_to_calendar(
+            events, mapping.calendar_url, settings
+        )
         total_uploaded += len(uploaded_uids)
         if (
             apply_auto_response
             and auto_sync_preferences.get("auto_response") == EventResponseStatus.ACCEPTED
             and uploaded_uids
         ):
+            accepted_events: List[TrackedEvent] = []
             for event in events:
                 if event.uid not in uploaded_uids:
                     continue
@@ -552,6 +561,7 @@ def perform_sync_all(db: Session, apply_auto_response: bool = False) -> int:
                 if current is None:
                     continue
                 current.response_status = EventResponseStatus.ACCEPTED
+                event_processor.annotate_response(current)
                 current.history = merge_histories(
                     current.history or [],
                     {
@@ -561,7 +571,18 @@ def perform_sync_all(db: Session, apply_auto_response: bool = False) -> int:
                     },
                 )
                 db.add(current)
+                accepted_events.append(current)
             db.commit()
+            if accepted_events:
+                try:
+                    event_processor.sync_events_to_calendar(
+                        accepted_events, mapping.calendar_url, settings
+                    )
+                except Exception:
+                    logger.exception(
+                        "Automatische Zusage für Mapping %s konnte nicht zum Kalender synchronisiert werden",
+                        mapping.id,
+                    )
     return total_uploaded
 
 
