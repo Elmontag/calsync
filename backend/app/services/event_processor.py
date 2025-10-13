@@ -107,14 +107,19 @@ def sync_events_to_calendar(
     """Upload a batch of events to the configured CalDAV calendar."""
     uploaded_uids: List[str] = []
     events_list = list(events)
+    successfully_uploaded: List[TrackedEvent] = []
     for event in events_list:
         try:
             upload_ical(calendar_url, event_payload_to_ical(event), settings)
             uploaded_uids.append(event.uid)
+            successfully_uploaded.append(event)
         except Exception:
             logger.exception("Failed to upload event %s", event.uid)
             continue
-    mark_as_synced(events_list)
+    if successfully_uploaded:
+        mark_as_synced(successfully_uploaded)
+    else:
+        logger.warning("No events could be synced to %s", calendar_url)
     return uploaded_uids
 
 

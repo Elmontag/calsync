@@ -7,7 +7,7 @@ from typing import List
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine
@@ -23,6 +23,7 @@ from .models import (
 from .schemas import (
     AccountCreate,
     AccountRead,
+    AccountUpdate,
     ConnectionTestRequest,
     ConnectionTestResult,
     ManualSyncRequest,
@@ -111,6 +112,70 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_account)
     return db_account
+
+
+@app.put("/accounts/{account_id}", response_model=AccountRead)
+def update_account(account_id: int, payload: AccountUpdate, db: Session = Depends(get_db)):
+    db_account = db.get(Account, account_id)
+    if db_account is None:
+        raise HTTPException(status_code=404, detail="Konto nicht gefunden")
+
+    db_account.label = payload.label
+    db_account.type = payload.type
+    db_account.direction = payload.direction
+    db_account.settings = payload.settings
+    if payload.type == AccountType.IMAP:
+        db_account.imap_folders = [
+            ImapFolder(
+                name=folder.name,
+                include_subfolders=folder.include_subfolders,
+            )
+            for folder in payload.imap_folders
+        ]
+    else:
+        db_account.imap_folders = []
+
+    db.add(db_account)
+    db.commit()
+    db.refresh(db_account)
+    logger.info("Updated account %s", account_id)
+    return db_account
+
+
+@app.delete("/accounts/{account_id}")
+def delete_account(account_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    account = db.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Konto nicht gefunden")
+
+    logger.info("Deleting account %s", account_id)
+    mappings = (
+        db.execute(
+            select(SyncMapping).where(
+                or_(
+                    SyncMapping.imap_account_id == account_id,
+                    SyncMapping.caldav_account_id == account_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for mapping in mappings:
+        db.delete(mapping)
+
+    events = (
+        db.execute(select(TrackedEvent).where(TrackedEvent.source_account_id == account_id))
+        .scalars()
+        .all()
+    )
+    for event in events:
+        event.source_account_id = None
+        db.add(event)
+
+    db.delete(account)
+    db.commit()
+    return {"deleted": True}
 
 
 @app.post("/accounts/test", response_model=ConnectionTestResult)

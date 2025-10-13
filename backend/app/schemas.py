@@ -36,6 +36,10 @@ class AccountCreate(AccountBase):
     pass
 
 
+class AccountUpdate(AccountBase):
+    pass
+
+
 class AccountRead(AccountBase):
     id: int
 

@@ -26,6 +26,8 @@ export interface AccountCreateInput {
   imap_folders: ImapFolder[];
 }
 
+export type AccountUpdateInput = AccountCreateInput;
+
 export interface ConnectionTestRequest {
   type: AccountType;
   settings: Record<string, unknown>;

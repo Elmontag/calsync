@@ -3,6 +3,7 @@ import api from './client';
 import {
   Account,
   AccountCreateInput,
+  AccountUpdateInput,
   AutoSyncStatus,
   CalendarInfo,
   ConnectionTestRequest,
@@ -40,7 +41,17 @@ export function useAccounts() {
     await refresh();
   }
 
-  return { accounts, loading, error, refresh, addAccount };
+  async function updateAccount(accountId: number, payload: AccountUpdateInput) {
+    await api.put<Account>(`/accounts/${accountId}`, payload);
+    await refresh();
+  }
+
+  async function removeAccount(accountId: number) {
+    await api.delete(`/accounts/${accountId}`);
+    await refresh();
+  }
+
+  return { accounts, loading, error, refresh, addAccount, updateAccount, removeAccount };
 }
 
 export async function runConnectionTest(payload: ConnectionTestRequest) {

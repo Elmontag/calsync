@@ -1,24 +1,81 @@
+import { useEffect } from 'react';
 import { useForm, useFieldArray } from 'react-hook-form';
-import { AccountCreateInput } from '../types/api';
+import { Account, AccountCreateInput } from '../types/api';
 
 interface Props {
+  account?: Account | null;
   onSubmit: (data: AccountCreateInput) => Promise<void>;
+  onCancel?: () => void;
+  loading?: boolean;
 }
 
-const defaultFolder = { name: 'INBOX', include_subfolders: true };
+const createDefaultFolder = () => ({ name: 'INBOX', include_subfolders: true });
 
-export default function AccountForm({ onSubmit }: Props) {
-  const { register, control, handleSubmit, watch, reset } = useForm<AccountCreateInput>({
-    defaultValues: {
+function toFormDefaults(account?: Account | null): AccountCreateInput {
+  if (!account) {
+    return {
       label: '',
       type: 'imap',
       direction: 'imap_to_caldav',
-      settings: {},
-      imap_folders: [defaultFolder],
+      settings: { ssl: true },
+      imap_folders: [createDefaultFolder()],
+    };
+  }
+
+  if (account.type === 'imap') {
+    const settings = account.settings as Record<string, any>;
+    return {
+      label: account.label,
+      type: 'imap',
+      direction: account.direction,
+      settings: {
+        host: settings.host ?? '',
+        username: settings.username ?? '',
+        password: settings.password ?? '',
+        port: settings.port ?? '',
+        ssl: settings.ssl ?? true,
+      },
+      imap_folders:
+        account.imap_folders.length > 0
+          ? account.imap_folders.map((folder) => ({
+              name: folder.name,
+              include_subfolders: folder.include_subfolders,
+            }))
+          : [createDefaultFolder()],
+    };
+  }
+
+  const settings = account.settings as Record<string, any>;
+  return {
+    label: account.label,
+    type: 'caldav',
+    direction: account.direction,
+    settings: {
+      url: settings.url ?? '',
+      username: settings.username ?? '',
+      password: settings.password ?? '',
     },
+    imap_folders: [],
+  };
+}
+
+export default function AccountForm({ account, onSubmit, onCancel, loading }: Props) {
+  const defaultValues = toFormDefaults(account);
+  const { register, control, handleSubmit, watch, reset } = useForm<AccountCreateInput>({
+    defaultValues,
   });
   const { fields, append, remove } = useFieldArray({ control, name: 'imap_folders' });
   const accountType = watch('type');
+
+  useEffect(() => {
+    reset(toFormDefaults(account));
+  }, [account, reset]);
+
+  useEffect(() => {
+    if (accountType === 'imap' && fields.length === 0) {
+      append(createDefaultFolder());
+    }
+  }, [accountType, fields.length, append]);
 
   const submit = handleSubmit(async (values) => {
     const payload: AccountCreateInput = {
@@ -38,7 +95,9 @@ export default function AccountForm({ onSubmit }: Props) {
           },
     };
     await onSubmit(payload);
-    reset();
+    if (!account) {
+      reset(toFormDefaults());
+    }
   });
 
   return (
@@ -118,7 +177,7 @@ export default function AccountForm({ onSubmit }: Props) {
               </h4>
               <button
                 type="button"
-                onClick={() => append(defaultFolder)}
+                onClick={() => append(createDefaultFolder())}
                 className="text-xs font-medium text-emerald-400 hover:text-emerald-300"
               >
                 Ordner hinzufügen
@@ -182,12 +241,24 @@ export default function AccountForm({ onSubmit }: Props) {
         </div>
       )}
 
-      <button
-        type="submit"
-        className="w-full rounded-lg bg-emerald-500 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400"
-      >
-        Konto speichern
-      </button>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+        {account && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 hover:border-slate-600 hover:text-slate-100"
+          >
+            Abbrechen
+          </button>
+        )}
+        <button
+          type="submit"
+          disabled={loading}
+          className="w-full rounded-lg bg-emerald-500 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:opacity-50 sm:w-auto sm:px-6"
+        >
+          {loading ? 'Speichere…' : account ? 'Konto aktualisieren' : 'Konto speichern'}
+        </button>
+      </div>
     </form>
   );
 }
