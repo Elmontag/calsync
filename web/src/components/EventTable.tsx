@@ -1,9 +1,14 @@
 import { useState } from 'react';
-import { ManualSyncRequest, TrackedEvent } from '../types/api';
+import {
+  ManualSyncRequest,
+  ManualSyncResponse,
+  ManualSyncMissingDetail,
+  TrackedEvent,
+} from '../types/api';
 
 interface Props {
   events: TrackedEvent[];
-  onManualSync: (payload: ManualSyncRequest) => Promise<{ uploaded: string[] }>;
+  onManualSync: (payload: ManualSyncRequest) => Promise<ManualSyncResponse>;
   onScan: () => Promise<void>;
   onSyncAll: () => Promise<void>;
   autoSyncEnabled: boolean;
@@ -21,9 +26,8 @@ export default function EventTable({
   const [selected, setSelected] = useState<number[]>([]);
   const [syncResult, setSyncResult] = useState<string[]>([]);
   const [syncError, setSyncError] = useState<string | null>(null);
-  const [missing, setMissing] = useState<
-    Array<{ uid?: string; reason?: string; account_id?: number; folder?: string }>
-  >([]);
+  const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const [missing, setMissing] = useState<ManualSyncMissingDetail[]>([]);
   const [busy, setBusy] = useState(false);
 
   function toggleSelection(id: number) {
@@ -38,13 +42,28 @@ export default function EventTable({
     }
     setBusy(true);
     setSyncError(null);
+    setSyncNotice(null);
     setMissing([]);
     try {
       const payload: ManualSyncRequest = { event_ids: selected };
       const result = await onManualSync(payload);
       setSyncResult(result.uploaded);
-      setSelected([]);
+      setMissing(result.missing ?? []);
+      if (result.missing && result.missing.length > 0) {
+        setSyncError('Für einige Termine existiert keine Sync-Zuordnung.');
+        setSelected(result.missing.map((item) => item.event_id));
+      } else {
+        setSyncError(null);
+        setSelected([]);
+      }
+      if (result.uploaded.length > 0) {
+        setSyncNotice('Ausgewählte Termine wurden synchronisiert.');
+      } else if (!result.missing?.length) {
+        setSyncError('Keine Termine konnten synchronisiert werden.');
+      }
     } catch (error: any) {
+      setSyncResult([]);
+      setSyncNotice(null);
       const detail = error?.response?.data?.detail;
       if (typeof detail === 'string') {
         setSyncError(detail);
@@ -57,13 +76,13 @@ export default function EventTable({
               reason: item?.reason,
               account_id: item?.account_id,
               folder: item?.folder,
+              event_id: Number(item?.event_id ?? 0),
             })),
           );
         }
       } else {
         setSyncError('Synchronisation fehlgeschlagen.');
       }
-      setSyncResult([]);
     } finally {
       setBusy(false);
     }
@@ -232,6 +251,7 @@ export default function EventTable({
       {syncResult.length > 0 && (
         <div className="rounded-lg border border-emerald-700 bg-emerald-500/10 p-4 text-sm text-emerald-200">
           <p className="font-semibold">Erfolg!</p>
+          {syncNotice && <p className="mt-1">{syncNotice}</p>}
           <p className="mt-1">Folgende UIDs wurden exportiert:</p>
           <ul className="mt-1 list-inside list-disc">
             {syncResult.map((uid) => (

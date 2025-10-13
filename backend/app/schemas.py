@@ -85,6 +85,19 @@ class ManualSyncRequest(BaseModel):
     event_ids: List[int]
 
 
+class ManualSyncMissingDetail(BaseModel):
+    event_id: int
+    uid: Optional[str] = None
+    account_id: Optional[int] = None
+    folder: Optional[str] = None
+    reason: str
+
+
+class ManualSyncResponse(BaseModel):
+    uploaded: List[str] = Field(default_factory=list)
+    missing: List[ManualSyncMissingDetail] = Field(default_factory=list)
+
+
 class SyncJobStatus(BaseModel):
     job_id: str
     status: str

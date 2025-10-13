@@ -9,6 +9,7 @@ import {
   ConnectionTestRequest,
   ConnectionTestResult,
   ManualSyncRequest,
+  ManualSyncResponse,
   SyncMapping,
   SyncMappingCreateInput,
   TrackedEvent,
@@ -87,7 +88,7 @@ export function useEvents() {
   }
 
   async function manualSync(payload: ManualSyncRequest) {
-    const { data } = await api.post<{ uploaded: string[] }>('/events/manual-sync', payload);
+    const { data } = await api.post<ManualSyncResponse>('/events/manual-sync', payload);
     await refresh();
     return data;
   }

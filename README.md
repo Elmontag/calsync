@@ -74,8 +74,8 @@ npm run dev
 ## Bedienhinweise
 
 - **Kontenansicht:** Der Verbindungstest befindet sich direkt im Kontoformular und nutzt die aktuellen Eingaben für IMAP- bzw. CalDAV-Zugänge. Nach erfolgreichen Tests werden etwaige Kalenderlisten angezeigt.
-- **Manuelle Synchronisation:** Die Aktion „Auswahl synchronisieren“ greift ausschließlich auf konfigurierte Sync-Zuordnungen zurück. Fehlt für ein gefundenes Ereignis eine Zuordnung (Konto/Ordner → Kalender), bricht der Export ab und die betroffenen Termine werden inklusive Fehlermeldung angezeigt.
-- **Sync-Zuordnungen:** In der Synchronisationsansicht erscheinen die Zuordnungen als rechte Seitenleiste neben der Terminliste und lassen sich parallel pflegen.
+- **Manuelle Synchronisation:** Die Aktion „Auswahl synchronisieren“ nutzt ausschließlich hinterlegte Sync-Zuordnungen. Fehlt eine Zuordnung, wird das betroffene Ereignis mit einer Fehlermeldung ausgewiesen, während alle gültig zugeordneten Termine dennoch übertragen werden.
+- **Sync-Zuordnungen:** Die Verwaltung der Zuordnungen befindet sich im Menüpunkt „Einstellungen“. Dort legst du neue Verknüpfungen an oder entfernst bestehende, die anschließend in manuellen und automatischen Sync-Läufen berücksichtigt werden.
 
 ## Datenpersistenz
 

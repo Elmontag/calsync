@@ -6,8 +6,10 @@ import SyncMappingConfigurator from './components/SyncMappingConfigurator';
 import { useAccounts, useEvents, useSyncMappings } from './api/hooks';
 import type { Account, AccountCreateInput } from './types/api';
 
+type ActiveView = 'sync' | 'accounts' | 'settings';
+
 function App() {
-  const [activeView, setActiveView] = useState<'sync' | 'accounts'>('sync');
+  const [activeView, setActiveView] = useState<ActiveView>('sync');
   const { accounts, addAccount, updateAccount, removeAccount } = useAccounts();
   const { events, scan, manualSync, syncAll, autoSync, toggleAutoSync } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
@@ -74,33 +76,35 @@ function App() {
             >
               Konten ({accounts.length})
             </button>
+            <button
+              onClick={() => setActiveView('settings')}
+              className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
+                activeView === 'settings'
+                  ? 'bg-emerald-500 text-emerald-950'
+                  : 'bg-slate-800 text-slate-200 hover:bg-slate-700'
+              }`}
+            >
+              Einstellungen
+            </button>
           </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-6xl px-6 py-10">
-        {activeView === 'sync' ? (
-          <div className="grid gap-8 lg:grid-cols-[2fr,1fr]">
-            <section className="space-y-8">
-              <EventTable
-                events={events}
-                onManualSync={manualSync}
-                onScan={scan}
-                onSyncAll={syncAll}
-                autoSyncEnabled={autoSync.enabled}
-                onAutoSyncToggle={toggleAutoSync}
-              />
-            </section>
-            <aside className="space-y-8">
-              <SyncMappingConfigurator
-                accounts={accounts}
-                mappings={mappings}
-                onCreate={addMapping}
-                onDelete={removeMapping}
-              />
-            </aside>
+        {activeView === 'sync' && (
+          <div className="space-y-8">
+            <EventTable
+              events={events}
+              onManualSync={manualSync}
+              onScan={scan}
+              onSyncAll={syncAll}
+              autoSyncEnabled={autoSync.enabled}
+              onAutoSyncToggle={toggleAutoSync}
+            />
           </div>
-        ) : (
+        )}
+
+        {activeView === 'accounts' && (
           <div className="grid gap-8 lg:grid-cols-2">
             <section className="space-y-6">
               <div className="rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-lg shadow-emerald-500/10">
@@ -130,6 +134,28 @@ function App() {
                 activeAccountId={editingAccount?.id ?? null}
               />
             </aside>
+          </div>
+        )}
+
+        {activeView === 'settings' && (
+          <div className="grid gap-8 lg:grid-cols-2">
+            <section className="space-y-6">
+              <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
+                <h2 className="text-lg font-semibold text-slate-100">Sync-Zuordnungen verwalten</h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  Definiere hier, welcher IMAP-Ordner in welchen CalDAV-Kalender exportiert wird. Die
+                  Einstellungen werden sowohl für manuelle Exporte als auch für AutoSync verwendet.
+                </p>
+                <div className="mt-6">
+                  <SyncMappingConfigurator
+                    accounts={accounts}
+                    mappings={mappings}
+                    onCreate={addMapping}
+                    onDelete={removeMapping}
+                  />
+                </div>
+              </div>
+            </section>
           </div>
         )}
       </main>

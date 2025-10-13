@@ -18,7 +18,9 @@ from .schemas import (
     AccountUpdate,
     ConnectionTestRequest,
     ConnectionTestResult,
+    ManualSyncMissingDetail,
     ManualSyncRequest,
+    ManualSyncResponse,
     AutoSyncRequest,
     AutoSyncStatus,
     SyncJobStatus,
@@ -227,10 +229,10 @@ def scan_mailboxes(db: Session = Depends(get_db)):
     return SyncJobStatus(job_id="manual-scan", status="completed", processed=total_processed)
 
 
-@app.post("/events/manual-sync")
-def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> dict[str, List[str]]:
+@app.post("/events/manual-sync", response_model=ManualSyncResponse)
+def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> ManualSyncResponse:
     if not payload.event_ids:
-        return {"uploaded": []}
+        return ManualSyncResponse(uploaded=[])
 
     events = (
         db.execute(select(TrackedEvent).where(TrackedEvent.id.in_(payload.event_ids)))
@@ -240,17 +242,17 @@ def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> di
     if not events:
         raise HTTPException(status_code=404, detail="Keine passenden Termine gefunden")
 
-    missing_events: list[dict[str, Any]] = []
+    missing_events: list[ManualSyncMissingDetail] = []
     sync_groups: Dict[int, Dict[str, Any]] = {}
 
     for event in events:
         if event.source_account_id is None or not event.source_folder:
             missing_events.append(
-                {
-                    "event_id": event.id,
-                    "uid": event.uid,
-                    "reason": "Keine Quellinformationen vorhanden",
-                }
+                ManualSyncMissingDetail(
+                    event_id=event.id,
+                    uid=event.uid,
+                    reason="Keine Quellinformationen vorhanden",
+                )
             )
             continue
 
@@ -265,26 +267,26 @@ def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> di
         )
         if mapping is None:
             missing_events.append(
-                {
-                    "event_id": event.id,
-                    "uid": event.uid,
-                    "account_id": event.source_account_id,
-                    "folder": event.source_folder,
-                    "reason": "Keine Sync-Zuordnung für Konto und Ordner",
-                }
+                ManualSyncMissingDetail(
+                    event_id=event.id,
+                    uid=event.uid,
+                    account_id=event.source_account_id,
+                    folder=event.source_folder,
+                    reason="Keine Sync-Zuordnung für Konto und Ordner",
+                )
             )
             continue
 
         caldav_account = db.get(Account, mapping.caldav_account_id)
         if caldav_account is None or caldav_account.type != AccountType.CALDAV:
             missing_events.append(
-                {
-                    "event_id": event.id,
-                    "uid": event.uid,
-                    "account_id": event.source_account_id,
-                    "folder": event.source_folder,
-                    "reason": "Zugeordnetes CalDAV-Konto nicht gefunden",
-                }
+                ManualSyncMissingDetail(
+                    event_id=event.id,
+                    uid=event.uid,
+                    account_id=event.source_account_id,
+                    folder=event.source_folder,
+                    reason="Zugeordnetes CalDAV-Konto nicht gefunden",
+                )
             )
             continue
 
@@ -293,13 +295,13 @@ def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> di
         except TypeError as exc:
             logger.exception("CalDAV settings invalid for account %s", caldav_account.id)
             missing_events.append(
-                {
-                    "event_id": event.id,
-                    "uid": event.uid,
-                    "account_id": event.source_account_id,
-                    "folder": event.source_folder,
-                    "reason": f"Ungültige CalDAV Einstellungen: {exc}",
-                }
+                ManualSyncMissingDetail(
+                    event_id=event.id,
+                    uid=event.uid,
+                    account_id=event.source_account_id,
+                    folder=event.source_folder,
+                    reason=f"Ungültige CalDAV Einstellungen: {exc}",
+                )
             )
             continue
 
@@ -310,14 +312,7 @@ def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> di
         group["events"].append(event)
 
     if missing_events:
-        logger.warning("Manual sync aborted due to missing mappings: %s", missing_events)
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Für einige Termine existiert keine Sync-Zuordnung.",
-                "missing": missing_events,
-            },
-        )
+        logger.warning("Manual sync completed with missing mappings: %s", missing_events)
 
     uploaded: list[str] = []
     for group in sync_groups.values():
@@ -332,7 +327,7 @@ def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> di
             )
         )
 
-    return {"uploaded": uploaded}
+    return ManualSyncResponse(uploaded=uploaded, missing=missing_events)
 
 
 @app.post("/events/schedule")

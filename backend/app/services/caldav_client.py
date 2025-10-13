@@ -43,7 +43,7 @@ def upload_ical(calendar_url: str, ical: ICalendar, settings: CalDavSettings) ->
     """Upload a parsed calendar event to the given calendar."""
     with CalDavConnection(settings) as client:
         principal = client.principal()
-        calendar: Calendar = principal.calendar(url=calendar_url)
+        calendar: Calendar = principal.calendar(cal_url=calendar_url)
         logger.info("Uploading event %s to %s", ical.get("UID"), calendar_url)
         calendar.save_event(ical.to_ical())
 

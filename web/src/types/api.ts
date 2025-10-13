@@ -58,6 +58,19 @@ export interface ManualSyncRequest {
   event_ids: number[];
 }
 
+export interface ManualSyncMissingDetail {
+  event_id: number;
+  uid?: string;
+  account_id?: number;
+  folder?: string;
+  reason: string;
+}
+
+export interface ManualSyncResponse {
+  uploaded: string[];
+  missing: ManualSyncMissingDetail[];
+}
+
 export interface SyncMapping {
   id: number;
   imap_account_id: number;
