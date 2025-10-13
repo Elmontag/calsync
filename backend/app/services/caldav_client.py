@@ -53,7 +53,8 @@ def list_calendars(settings: CalDavSettings) -> Iterable[Dict[str, str]]:
     with CalDavConnection(settings) as client:
         principal = client.principal()
         for calendar in principal.calendars():
+            calendar_url = str(calendar.url)
             yield {
-                "url": calendar.url,
-                "name": getattr(calendar, "name", None) or calendar.url,
+                "url": calendar_url,
+                "name": getattr(calendar, "name", None) or calendar_url,
             }
