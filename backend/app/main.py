@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from .database import Base, SessionLocal, engine
+from .database import Base, SessionLocal, apply_schema_upgrades, engine
 from .models import (
     Account,
     AccountType,
@@ -57,6 +57,8 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 Base.metadata.create_all(bind=engine)
+
+apply_schema_upgrades()
 
 app = FastAPI(title="CalSync", version="0.1.0")
 
