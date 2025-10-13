@@ -88,7 +88,15 @@ class TrackedEvent(Base):
     end = Column(DateTime, nullable=True)
     status = Column(SqlEnum(EventStatus), default=EventStatus.NEW)
     response_status = Column(
-        SqlEnum(EventResponseStatus),
+        SqlEnum(
+            EventResponseStatus,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+            native_enum=False,
+            validate_strings=True,
+        ),
+        # SQLite stores Enum values as strings; using the value list keeps
+        # existing lower-case payloads readable while still mapping to the
+        # Enum instances in Python.
         default=EventResponseStatus.NONE,
         nullable=False,
     )
