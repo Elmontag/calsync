@@ -1,6 +1,5 @@
-import { Fragment, useState } from 'react';
+import { useState } from 'react';
 import { ManualSyncRequest, TrackedEvent } from '../types/api';
-import { Dialog, Transition } from '@headlessui/react';
 
 interface Props {
   events: TrackedEvent[];
@@ -20,9 +19,11 @@ export default function EventTable({
   onAutoSyncToggle,
 }: Props) {
   const [selected, setSelected] = useState<number[]>([]);
-  const [calendarUrl, setCalendarUrl] = useState('');
-  const [open, setOpen] = useState(false);
   const [syncResult, setSyncResult] = useState<string[]>([]);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [missing, setMissing] = useState<
+    Array<{ uid?: string; reason?: string; account_id?: number; folder?: string }>
+  >([]);
   const [busy, setBusy] = useState(false);
 
   function toggleSelection(id: number) {
@@ -31,15 +32,41 @@ export default function EventTable({
     );
   }
 
-  async function handleSync() {
-    const payload: ManualSyncRequest = {
-      event_ids: selected,
-      target_calendar: calendarUrl,
-    };
-    const result = await onManualSync(payload);
-    setSyncResult(result.uploaded);
-    setOpen(false);
-    setSelected([]);
+  async function handleSyncSelection() {
+    if (selected.length === 0) {
+      return;
+    }
+    setBusy(true);
+    setSyncError(null);
+    setMissing([]);
+    try {
+      const payload: ManualSyncRequest = { event_ids: selected };
+      const result = await onManualSync(payload);
+      setSyncResult(result.uploaded);
+      setSelected([]);
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      if (typeof detail === 'string') {
+        setSyncError(detail);
+      } else if (detail && typeof detail.message === 'string') {
+        setSyncError(detail.message);
+        if (Array.isArray(detail.missing)) {
+          setMissing(
+            detail.missing.map((item: any) => ({
+              uid: item?.uid,
+              reason: item?.reason,
+              account_id: item?.account_id,
+              folder: item?.folder,
+            })),
+          );
+        }
+      } else {
+        setSyncError('Synchronisation fehlgeschlagen.');
+      }
+      setSyncResult([]);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleSyncAll() {
@@ -95,8 +122,8 @@ export default function EventTable({
             {autoSyncEnabled ? 'AutoSync deaktivieren' : 'AutoSync aktivieren'}
           </button>
           <button
-            onClick={() => setOpen(true)}
-            disabled={selected.length === 0}
+            onClick={handleSyncSelection}
+            disabled={selected.length === 0 || busy}
             className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50"
           >
             Auswahl synchronisieren
@@ -181,67 +208,26 @@ export default function EventTable({
         </table>
       </div>
 
-      <Transition appear show={open} as={Fragment}>
-        <Dialog as="div" className="relative z-10" onClose={() => setOpen(false)}>
-          <Transition.Child
-            as={Fragment}
-            enter="ease-out duration-300"
-            enterFrom="opacity-0"
-            enterTo="opacity-100"
-            leave="ease-in duration-200"
-            leaveFrom="opacity-100"
-            leaveTo="opacity-0"
-          >
-            <div className="fixed inset-0 bg-slate-950/70" />
-          </Transition.Child>
-
-          <div className="fixed inset-0 overflow-y-auto">
-            <div className="flex min-h-full items-center justify-center p-4 text-center">
-              <Transition.Child
-                as={Fragment}
-                enter="ease-out duration-300"
-                enterFrom="opacity-0 scale-95"
-                enterTo="opacity-100 scale-100"
-                leave="ease-in duration-200"
-                leaveFrom="opacity-100 scale-100"
-                leaveTo="opacity-0 scale-95"
-              >
-                <Dialog.Panel className="w-full max-w-lg transform overflow-hidden rounded-2xl bg-slate-900 p-6 text-left align-middle shadow-xl transition-all">
-                  <Dialog.Title className="text-lg font-medium text-slate-100">
-                    Zielkalender wählen
-                  </Dialog.Title>
-                  <div className="mt-4 space-y-2">
-                    <label className="text-sm text-slate-300">CalDAV Kalender URL</label>
-                    <input
-                      value={calendarUrl}
-                      onChange={(event) => setCalendarUrl(event.target.value)}
-                      className="w-full rounded border border-slate-700 bg-slate-950 p-2 text-slate-100"
-                      placeholder="https://cloud.example.com/remote.php/dav/calendars/user/persoenlich/"
-                    />
-                  </div>
-                  <div className="mt-6 flex justify-end gap-2">
-                    <button
-                      type="button"
-                      className="rounded-lg bg-slate-800 px-4 py-2 text-sm text-slate-200 hover:bg-slate-700"
-                      onClick={() => setOpen(false)}
-                    >
-                      Abbrechen
-                    </button>
-                    <button
-                      type="button"
-                      disabled={!calendarUrl}
-                      className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
-                      onClick={handleSync}
-                    >
-                      Jetzt exportieren
-                    </button>
-                  </div>
-                </Dialog.Panel>
-              </Transition.Child>
-            </div>
-          </div>
-        </Dialog>
-      </Transition>
+      {syncError && (
+        <div className="rounded-lg border border-rose-700 bg-rose-500/10 p-4 text-sm text-rose-200">
+          <p className="font-semibold">{syncError}</p>
+          {missing.length > 0 && (
+            <ul className="mt-2 space-y-1 text-xs">
+              {missing.map((item, index) => (
+                <li key={`${item.uid ?? index}-${index}`}>
+                  <span className="font-semibold">{item.uid ?? 'Unbekannte UID'}:</span>{' '}
+                  {item.reason ?? 'Keine Zuordnung gefunden'}
+                  {(item.account_id || item.folder) && (
+                    <span className="text-slate-300">{` (Konto ${
+                      item.account_id ?? 'unbekannt'
+                    }${item.folder ? ` · ${item.folder}` : ''})`}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {syncResult.length > 0 && (
         <div className="rounded-lg border border-emerald-700 bg-emerald-500/10 p-4 text-sm text-emerald-200">

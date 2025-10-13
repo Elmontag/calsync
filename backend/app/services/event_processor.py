@@ -9,7 +9,6 @@ from sqlalchemy import select
 
 from ..database import session_scope
 from ..models import EventStatus, TrackedEvent
-from ..schemas import ManualSyncRequest
 from ..utils.ics_parser import ParsedEvent, merge_histories
 from .caldav_client import CalDavSettings, upload_ical
 
@@ -86,17 +85,6 @@ def mark_as_synced(events: Iterable[TrackedEvent]) -> None:
             )
             session.add(db_event)
     logger.debug("Marked %s events as synced", len(events_list))
-
-
-def manual_sync(request: ManualSyncRequest, settings: CalDavSettings) -> List[str]:
-    """Manually export selected events to a CalDAV calendar."""
-    with session_scope() as session:
-        events = list(
-            session.execute(
-                select(TrackedEvent).where(TrackedEvent.id.in_(request.event_ids))
-            ).scalars()
-        )
-        return sync_events_to_calendar(events, request.target_calendar, settings)
 
 
 def sync_events_to_calendar(

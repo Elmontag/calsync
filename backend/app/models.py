@@ -19,13 +19,6 @@ from sqlalchemy.orm import relationship
 from .database import Base
 
 
-class SyncDirection(str, Enum):
-    """Allowed synchronization directions."""
-
-    IMAP_TO_CALDAV = "imap_to_caldav"
-    BIDIRECTIONAL = "bidirectional"
-
-
 class AccountType(str, Enum):
     """Different account types used for synchronization."""
 
@@ -41,7 +34,6 @@ class Account(Base):
     id = Column(Integer, primary_key=True, index=True)
     label = Column(String, nullable=False)
     type = Column(SqlEnum(AccountType), nullable=False)
-    direction = Column(SqlEnum(SyncDirection), default=SyncDirection.IMAP_TO_CALDAV)
     settings = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

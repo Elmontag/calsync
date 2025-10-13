@@ -1,6 +1,7 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useForm, useFieldArray } from 'react-hook-form';
-import { Account, AccountCreateInput } from '../types/api';
+import { runConnectionTest } from '../api/hooks';
+import { Account, AccountCreateInput, ConnectionTestResult } from '../types/api';
 
 interface Props {
   account?: Account | null;
@@ -16,7 +17,6 @@ function toFormDefaults(account?: Account | null): AccountCreateInput {
     return {
       label: '',
       type: 'imap',
-      direction: 'imap_to_caldav',
       settings: { ssl: true },
       imap_folders: [createDefaultFolder()],
     };
@@ -27,7 +27,6 @@ function toFormDefaults(account?: Account | null): AccountCreateInput {
     return {
       label: account.label,
       type: 'imap',
-      direction: account.direction,
       settings: {
         host: settings.host ?? '',
         username: settings.username ?? '',
@@ -49,7 +48,6 @@ function toFormDefaults(account?: Account | null): AccountCreateInput {
   return {
     label: account.label,
     type: 'caldav',
-    direction: account.direction,
     settings: {
       url: settings.url ?? '',
       username: settings.username ?? '',
@@ -61,14 +59,17 @@ function toFormDefaults(account?: Account | null): AccountCreateInput {
 
 export default function AccountForm({ account, onSubmit, onCancel, loading }: Props) {
   const defaultValues = toFormDefaults(account);
-  const { register, control, handleSubmit, watch, reset } = useForm<AccountCreateInput>({
+  const { register, control, handleSubmit, watch, reset, getValues } = useForm<AccountCreateInput>({
     defaultValues,
   });
   const { fields, append, remove } = useFieldArray({ control, name: 'imap_folders' });
   const accountType = watch('type');
+  const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const [testing, setTesting] = useState(false);
 
   useEffect(() => {
     reset(toFormDefaults(account));
+    setTestResult(null);
   }, [account, reset]);
 
   useEffect(() => {
@@ -77,28 +78,69 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
     }
   }, [accountType, fields.length, append]);
 
+  useEffect(() => {
+    setTestResult(null);
+  }, [accountType]);
+
   const submit = handleSubmit(async (values) => {
-    const payload: AccountCreateInput = {
-      ...values,
-      settings: accountType === 'imap'
-        ? {
-            host: (values.settings as any).host,
-            username: (values.settings as any).username,
-            password: (values.settings as any).password,
-            port: (values.settings as any).port ? Number((values.settings as any).port) : undefined,
-            ssl: (values.settings as any).ssl ?? true,
-          }
-        : {
-            url: (values.settings as any).url,
-            username: (values.settings as any).username,
-            password: (values.settings as any).password,
-          },
-    };
+    const payload = buildAccountPayload(values);
     await onSubmit(payload);
     if (!account) {
       reset(toFormDefaults());
     }
+    setTestResult(null);
   });
+
+  function buildAccountPayload(values: AccountCreateInput): AccountCreateInput {
+    if (values.type === 'imap') {
+      const settings = values.settings as Record<string, unknown>;
+      return {
+        ...values,
+        settings: {
+          host: settings.host,
+          username: settings.username,
+          password: settings.password,
+          port: settings.port ? Number(settings.port) : undefined,
+          ssl: settings.ssl ?? true,
+        },
+      };
+    }
+
+    const settings = values.settings as Record<string, unknown>;
+    return {
+      ...values,
+      settings: {
+        url: settings.url,
+        username: settings.username,
+        password: settings.password,
+      },
+      imap_folders: [],
+    };
+  }
+
+  async function handleConnectionTest() {
+    const values = getValues();
+    const payload = buildAccountPayload(values);
+    setTesting(true);
+    try {
+      const requestSettings =
+        payload.type === 'imap'
+          ? {
+              ...(payload.settings as Record<string, unknown>),
+              folders: payload.imap_folders.map((folder) => folder.name),
+            }
+          : (payload.settings as Record<string, unknown>);
+      const result = await runConnectionTest({
+        type: payload.type,
+        settings: requestSettings,
+      });
+      setTestResult(result);
+    } catch (error) {
+      setTestResult({ success: false, message: 'Verbindungstest fehlgeschlagen.' });
+    } finally {
+      setTesting(false);
+    }
+  }
 
   return (
     <form className="space-y-6" onSubmit={submit}>
@@ -111,8 +153,8 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
         />
       </div>
 
-      <div className="grid grid-cols-2 gap-4">
-        <div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div className="sm:col-span-1">
           <label className="block text-sm font-medium text-slate-200">Kontotyp</label>
           <select
             {...register('type')}
@@ -120,16 +162,6 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
           >
             <option value="imap">IMAP</option>
             <option value="caldav">CalDAV</option>
-          </select>
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-slate-200">Richtung</label>
-          <select
-            {...register('direction')}
-            className="mt-1 w-full rounded-md border border-slate-700 bg-slate-900 p-2"
-          >
-            <option value="imap_to_caldav">IMAP ➜ CalDAV</option>
-            <option value="bidirectional">Bidirektional</option>
           </select>
         </div>
       </div>
@@ -240,6 +272,41 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
           </div>
         </div>
       )}
+
+      <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-200">Verbindungstest</h3>
+            <p className="text-xs text-slate-400">
+              Nutze die aktuellen Eingaben, um Zugangsdaten direkt zu prüfen.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleConnectionTest}
+            disabled={testing}
+            className="rounded-lg bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-100 transition hover:bg-slate-700 disabled:opacity-50"
+          >
+            {testing ? 'Teste…' : 'Verbindung testen'}
+          </button>
+        </div>
+        {testResult && (
+          <div
+            className={`mt-3 rounded border px-3 py-2 text-xs ${
+              testResult.success
+                ? 'border-emerald-600 text-emerald-200'
+                : 'border-rose-600 text-rose-200'
+            }`}
+          >
+            <p className="font-semibold">{testResult.message}</p>
+            {testResult.details && (
+              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-[11px] text-slate-200/90">
+                {JSON.stringify(testResult.details, null, 2)}
+              </pre>
+            )}
+          </div>
+        )}
+      </div>
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
         {account && (

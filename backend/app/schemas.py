@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
-from .models import AccountType, EventStatus, SyncDirection
+from .models import AccountType, EventStatus
 
 
 class ImapFolderBase(BaseModel):
@@ -27,7 +27,6 @@ class ImapFolderRead(ImapFolderBase):
 class AccountBase(BaseModel):
     label: str
     type: AccountType
-    direction: SyncDirection = SyncDirection.IMAP_TO_CALDAV
     settings: dict[str, Any]
     imap_folders: List[ImapFolderCreate] = Field(default_factory=list)
 
@@ -84,7 +83,6 @@ class TrackedEventRead(BaseModel):
 
 class ManualSyncRequest(BaseModel):
     event_ids: List[int]
-    target_calendar: HttpUrl
 
 
 class SyncJobStatus(BaseModel):

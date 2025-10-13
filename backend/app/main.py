@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,15 +11,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine
-from .models import (
-    Account,
-    AccountType,
-    EventStatus,
-    ImapFolder,
-    SyncDirection,
-    SyncMapping,
-    TrackedEvent,
-)
+from .models import Account, AccountType, EventStatus, ImapFolder, SyncMapping, TrackedEvent
 from .schemas import (
     AccountCreate,
     AccountRead,
@@ -96,7 +88,6 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     db_account = Account(
         label=account.label,
         type=account.type,
-        direction=account.direction,
         settings=account.settings,
     )
     db.add(db_account)
@@ -122,7 +113,6 @@ def update_account(account_id: int, payload: AccountUpdate, db: Session = Depend
 
     db_account.label = payload.label
     db_account.type = payload.type
-    db_account.direction = payload.direction
     db_account.settings = payload.settings
     if payload.type == AccountType.IMAP:
         db_account.imap_folders = [
@@ -238,11 +228,110 @@ def scan_mailboxes(db: Session = Depends(get_db)):
 
 
 @app.post("/events/manual-sync")
-def manual_sync(payload: ManualSyncRequest) -> dict[str, List[str]]:
-    settings = CalDavSettings(
-        url=str(payload.target_calendar),
+def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> dict[str, List[str]]:
+    if not payload.event_ids:
+        return {"uploaded": []}
+
+    events = (
+        db.execute(select(TrackedEvent).where(TrackedEvent.id.in_(payload.event_ids)))
+        .scalars()
+        .all()
     )
-    uploaded = event_processor.manual_sync(payload, settings)
+    if not events:
+        raise HTTPException(status_code=404, detail="Keine passenden Termine gefunden")
+
+    missing_events: list[dict[str, Any]] = []
+    sync_groups: Dict[int, Dict[str, Any]] = {}
+
+    for event in events:
+        if event.source_account_id is None or not event.source_folder:
+            missing_events.append(
+                {
+                    "event_id": event.id,
+                    "uid": event.uid,
+                    "reason": "Keine Quellinformationen vorhanden",
+                }
+            )
+            continue
+
+        mapping = (
+            db.execute(
+                select(SyncMapping)
+                .where(SyncMapping.imap_account_id == event.source_account_id)
+                .where(SyncMapping.imap_folder == event.source_folder)
+            )
+            .scalars()
+            .first()
+        )
+        if mapping is None:
+            missing_events.append(
+                {
+                    "event_id": event.id,
+                    "uid": event.uid,
+                    "account_id": event.source_account_id,
+                    "folder": event.source_folder,
+                    "reason": "Keine Sync-Zuordnung für Konto und Ordner",
+                }
+            )
+            continue
+
+        caldav_account = db.get(Account, mapping.caldav_account_id)
+        if caldav_account is None or caldav_account.type != AccountType.CALDAV:
+            missing_events.append(
+                {
+                    "event_id": event.id,
+                    "uid": event.uid,
+                    "account_id": event.source_account_id,
+                    "folder": event.source_folder,
+                    "reason": "Zugeordnetes CalDAV-Konto nicht gefunden",
+                }
+            )
+            continue
+
+        try:
+            settings = CalDavSettings(**caldav_account.settings)
+        except TypeError as exc:
+            logger.exception("CalDAV settings invalid for account %s", caldav_account.id)
+            missing_events.append(
+                {
+                    "event_id": event.id,
+                    "uid": event.uid,
+                    "account_id": event.source_account_id,
+                    "folder": event.source_folder,
+                    "reason": f"Ungültige CalDAV Einstellungen: {exc}",
+                }
+            )
+            continue
+
+        group = sync_groups.setdefault(
+            mapping.id,
+            {"events": [], "mapping": mapping, "settings": settings},
+        )
+        group["events"].append(event)
+
+    if missing_events:
+        logger.warning("Manual sync aborted due to missing mappings: %s", missing_events)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Für einige Termine existiert keine Sync-Zuordnung.",
+                "missing": missing_events,
+            },
+        )
+
+    uploaded: list[str] = []
+    for group in sync_groups.values():
+        mapping: SyncMapping = group["mapping"]
+        settings: CalDavSettings = group["settings"]
+        events_for_mapping: List[TrackedEvent] = group["events"]
+        uploaded.extend(
+            event_processor.sync_events_to_calendar(
+                events_for_mapping,
+                mapping.calendar_url,
+                settings,
+            )
+        )
+
     return {"uploaded": uploaded}
 
 

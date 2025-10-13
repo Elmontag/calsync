@@ -1,11 +1,10 @@
 import { useState } from 'react';
 import AccountForm from './components/AccountForm';
 import AccountList from './components/AccountList';
-import ConnectionTester from './components/ConnectionTester';
 import EventTable from './components/EventTable';
 import SyncMappingConfigurator from './components/SyncMappingConfigurator';
-import { runConnectionTest, useAccounts, useEvents, useSyncMappings } from './api/hooks';
-import type { Account, AccountCreateInput, ConnectionTestResult } from './types/api';
+import { useAccounts, useEvents, useSyncMappings } from './api/hooks';
+import type { Account, AccountCreateInput } from './types/api';
 
 function App() {
   const [activeView, setActiveView] = useState<'sync' | 'accounts'>('sync');
@@ -14,18 +13,12 @@ function App() {
   const { mappings, addMapping, removeMapping } = useSyncMappings();
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [savingAccount, setSavingAccount] = useState(false);
-  const [testingAccountId, setTestingAccountId] = useState<number | null>(null);
-  const [accountTests, setAccountTests] = useState<Record<number, ConnectionTestResult>>({});
 
   async function handleAccountSubmit(values: AccountCreateInput) {
     setSavingAccount(true);
     try {
       if (editingAccount) {
         await updateAccount(editingAccount.id, values);
-        setAccountTests((prev) => {
-          const { [editingAccount.id]: _removed, ...rest } = prev;
-          return rest;
-        });
         setEditingAccount(null);
       } else {
         await addAccount(values);
@@ -41,37 +34,8 @@ function App() {
       return;
     }
     await removeAccount(account.id);
-    setAccountTests((prev) => {
-      const { [account.id]: _removed, ...rest } = prev;
-      return rest;
-    });
     if (editingAccount?.id === account.id) {
       setEditingAccount(null);
-    }
-  }
-
-  async function handleTestAccount(account: Account) {
-    setTestingAccountId(account.id);
-    try {
-      const payload = {
-        type: account.type,
-        settings:
-          account.type === 'imap'
-            ? {
-                ...(account.settings as Record<string, unknown>),
-                folders: account.imap_folders.map((folder) => folder.name),
-              }
-            : (account.settings as Record<string, unknown>),
-      };
-      const result = await runConnectionTest(payload);
-      setAccountTests((prev) => ({ ...prev, [account.id]: result }));
-    } catch (error) {
-      setAccountTests((prev) => ({
-        ...prev,
-        [account.id]: { success: false, message: 'Verbindungstest fehlgeschlagen.' },
-      }));
-    } finally {
-      setTestingAccountId(null);
     }
   }
 
@@ -116,8 +80,8 @@ function App() {
 
       <main className="mx-auto max-w-6xl px-6 py-10">
         {activeView === 'sync' ? (
-          <div className="grid gap-8 lg:grid-cols-3">
-            <section className="lg:col-span-2 space-y-8">
+          <div className="grid gap-8 lg:grid-cols-[2fr,1fr]">
+            <section className="space-y-8">
               <EventTable
                 events={events}
                 onManualSync={manualSync}
@@ -126,15 +90,14 @@ function App() {
                 autoSyncEnabled={autoSync.enabled}
                 onAutoSyncToggle={toggleAutoSync}
               />
+            </section>
+            <aside className="space-y-8">
               <SyncMappingConfigurator
                 accounts={accounts}
                 mappings={mappings}
                 onCreate={addMapping}
                 onDelete={removeMapping}
               />
-            </section>
-            <aside className="space-y-8">
-              <ConnectionTester />
             </aside>
           </div>
         ) : (
@@ -147,7 +110,7 @@ function App() {
                 <p className="mt-1 text-sm text-slate-400">
                   {editingAccount
                     ? 'Passe Zugangsdaten und Ordnerzuweisungen für das ausgewählte Konto an.'
-                    : 'Hinterlege hier IMAP oder CalDAV Verbindungen inkl. Syncrichtung.'}
+                    : 'Hinterlege hier IMAP oder CalDAV Verbindungen und teste deine Zugangsdaten direkt.'}
                 </p>
                 <div className="mt-6">
                   <AccountForm
@@ -164,10 +127,7 @@ function App() {
                 accounts={accounts}
                 onEdit={setEditingAccount}
                 onDelete={handleDeleteAccount}
-                onTest={handleTestAccount}
                 activeAccountId={editingAccount?.id ?? null}
-                testingAccountId={testingAccountId}
-                testResults={accountTests}
               />
             </aside>
           </div>

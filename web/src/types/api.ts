@@ -1,6 +1,4 @@
 export type AccountType = 'imap' | 'caldav';
-export type SyncDirection = 'imap_to_caldav' | 'bidirectional';
-
 export interface ImapFolder {
   id?: number;
   name: string;
@@ -11,7 +9,6 @@ export interface Account {
   id: number;
   label: string;
   type: AccountType;
-  direction: SyncDirection;
   settings: Record<string, unknown>;
   imap_folders: ImapFolder[];
   created_at: string;
@@ -21,7 +18,6 @@ export interface Account {
 export interface AccountCreateInput {
   label: string;
   type: AccountType;
-  direction: SyncDirection;
   settings: Record<string, unknown>;
   imap_folders: ImapFolder[];
 }
@@ -60,7 +56,6 @@ export interface EventHistoryEntry {
 
 export interface ManualSyncRequest {
   event_ids: number[];
-  target_calendar: string;
 }
 
 export interface SyncMapping {

@@ -11,7 +11,7 @@ CalSync ist ein leichtgewichtiger Service, der definierbare IMAP-Ordner nach Kal
   - Hintergrundscheduler (APScheduler) für automatische Scans
 - **Frontend** (`web/`)
   - React + Vite + TailwindCSS Dashboard
-  - Verwaltung von IMAP-/CalDAV-Konten samt Verbindungstests
+- Verwaltung von IMAP-/CalDAV-Konten mit integriertem Verbindungstest pro Kontoformular
   - Zuordnung von IMAP-Ordnern zu CalDAV-Kalendern, manueller Export und AutoSync-Schalter
 - **Docker Compose** (`docker-compose.yml`)
   - Startet Backend, Web-UI und optionale Mailhog-Testumgebung
@@ -63,13 +63,19 @@ npm run dev
 | GET    | `/accounts/{id}/calendars` | Alle CalDAV-Kalender eines Kontos auflisten |
 | GET    | `/events`         | Gefundene Termine anzeigen                    |
 | POST   | `/events/scan`    | Manuelles Scannen der IMAP-Ordner             |
-| POST   | `/events/manual-sync` | Manuelle Übertragung in CalDAV-Kalender |
+| POST   | `/events/manual-sync` | Manuelle Übertragung auf Basis der Sync-Zuordnungen |
 | POST   | `/events/sync-all` | Alle Termine entsprechend der Zuordnungen exportieren |
 | GET/POST | `/events/auto-sync` | AutoSync-Status abfragen bzw. aktivieren |
 | GET    | `/sync-mappings`  | Zuordnungen zwischen IMAP und CalDAV anzeigen |
 | POST   | `/sync-mappings`  | Neue Zuordnung anlegen                        |
 | PUT    | `/sync-mappings/{id}` | Zuordnung aktualisieren                  |
 | DELETE | `/sync-mappings/{id}` | Zuordnung entfernen                      |
+
+## Bedienhinweise
+
+- **Kontenansicht:** Der Verbindungstest befindet sich direkt im Kontoformular und nutzt die aktuellen Eingaben für IMAP- bzw. CalDAV-Zugänge. Nach erfolgreichen Tests werden etwaige Kalenderlisten angezeigt.
+- **Manuelle Synchronisation:** Die Aktion „Auswahl synchronisieren“ greift ausschließlich auf konfigurierte Sync-Zuordnungen zurück. Fehlt für ein gefundenes Ereignis eine Zuordnung (Konto/Ordner → Kalender), bricht der Export ab und die betroffenen Termine werden inklusive Fehlermeldung angezeigt.
+- **Sync-Zuordnungen:** In der Synchronisationsansicht erscheinen die Zuordnungen als rechte Seitenleiste neben der Terminliste und lassen sich parallel pflegen.
 
 ## Datenpersistenz
 
