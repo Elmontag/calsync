@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useForm, useFieldArray } from 'react-hook-form';
+import { useForm } from 'react-hook-form';
 import { runConnectionTest } from '../api/hooks';
 import { Account, AccountCreateInput, ConnectionTestResult } from '../types/api';
 
@@ -10,7 +10,19 @@ interface Props {
   loading?: boolean;
 }
 
+type FolderOption = {
+  name: string;
+  include_subfolders: boolean;
+  selected: boolean;
+};
+
 const createDefaultFolder = () => ({ name: 'INBOX', include_subfolders: true });
+
+const createDefaultFolderOption = (): FolderOption => ({
+  name: 'INBOX',
+  include_subfolders: true,
+  selected: true,
+});
 
 function toFormDefaults(account?: Account | null): AccountCreateInput {
   if (!account) {
@@ -59,24 +71,75 @@ function toFormDefaults(account?: Account | null): AccountCreateInput {
 
 export default function AccountForm({ account, onSubmit, onCancel, loading }: Props) {
   const defaultValues = toFormDefaults(account);
-  const { register, control, handleSubmit, watch, reset, getValues } = useForm<AccountCreateInput>({
+  const { register, handleSubmit, watch, reset, getValues, setValue } = useForm<AccountCreateInput>({
     defaultValues,
   });
-  const { fields, append, remove } = useFieldArray({ control, name: 'imap_folders' });
+  const [folderOptions, setFolderOptions] = useState<FolderOption[]>(
+    defaultValues.type === 'imap'
+      ? defaultValues.imap_folders.map((folder) => ({
+          name: folder.name,
+          include_subfolders: folder.include_subfolders,
+          selected: true,
+        }))
+      : [],
+  );
+  const [newFolderName, setNewFolderName] = useState('');
   const accountType = watch('type');
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   const [testing, setTesting] = useState(false);
 
   useEffect(() => {
-    reset(toFormDefaults(account));
+    register('imap_folders');
+  }, [register]);
+
+  useEffect(() => {
+    const defaults = toFormDefaults(account);
+    reset(defaults);
     setTestResult(null);
+    if (defaults.type === 'imap') {
+      setFolderOptions(
+        defaults.imap_folders.length > 0
+          ? defaults.imap_folders.map((folder) => ({
+              name: folder.name,
+              include_subfolders: folder.include_subfolders,
+              selected: true,
+            }))
+          : [createDefaultFolderOption()],
+      );
+    } else {
+      setFolderOptions([]);
+    }
+    setNewFolderName('');
   }, [account, reset]);
 
   useEffect(() => {
-    if (accountType === 'imap' && fields.length === 0) {
-      append(createDefaultFolder());
+    if (accountType !== 'imap') {
+      setFolderOptions([]);
+      setValue('imap_folders', []);
+      return;
     }
-  }, [accountType, fields.length, append]);
+    setFolderOptions((current) => {
+      if (current.length === 0) {
+        return [createDefaultFolderOption()];
+      }
+      return current;
+    });
+  }, [accountType, setValue]);
+
+  useEffect(() => {
+    if (accountType !== 'imap') {
+      return;
+    }
+    setValue(
+      'imap_folders',
+      folderOptions
+        .filter((option) => option.selected)
+        .map((option) => ({
+          name: option.name,
+          include_subfolders: option.include_subfolders,
+        })),
+    );
+  }, [folderOptions, accountType, setValue]);
 
   useEffect(() => {
     setTestResult(null);
@@ -86,7 +149,10 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
     const payload = buildAccountPayload(values);
     await onSubmit(payload);
     if (!account) {
-      reset(toFormDefaults());
+      const defaults = toFormDefaults();
+      reset(defaults);
+      setFolderOptions([createDefaultFolderOption()]);
+      setNewFolderName('');
     }
     setTestResult(null);
   });
@@ -141,6 +207,61 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
       setTesting(false);
     }
   }
+
+  function toggleFolderSelection(name: string) {
+    setFolderOptions((current) =>
+      current.map((folder) =>
+        folder.name === name ? { ...folder, selected: !folder.selected } : folder,
+      ),
+    );
+  }
+
+  function toggleIncludeSubfolders(name: string) {
+    setFolderOptions((current) =>
+      current.map((folder) =>
+        folder.name === name
+          ? { ...folder, include_subfolders: !folder.include_subfolders }
+          : folder,
+      ),
+    );
+  }
+
+  function removeFolder(name: string) {
+    setFolderOptions((current) => {
+      if (current.length <= 1) {
+        return current;
+      }
+      return current.filter((folder) => folder.name !== name);
+    });
+  }
+
+  function handleAddFolder() {
+    const trimmed = newFolderName.trim();
+    if (!trimmed) {
+      return;
+    }
+    setFolderOptions((current) => {
+      const existsIndex = current.findIndex(
+        (folder) => folder.name.toLowerCase() === trimmed.toLowerCase(),
+      );
+      if (existsIndex >= 0) {
+        return current.map((folder, index) =>
+          index === existsIndex ? { ...folder, selected: true } : folder,
+        );
+      }
+      return [
+        ...current,
+        {
+          name: trimmed,
+          include_subfolders: true,
+          selected: true,
+        },
+      ];
+    });
+    setNewFolderName('');
+  }
+
+  const selectedFolderCount = folderOptions.filter((option) => option.selected).length;
 
   return (
     <form className="space-y-6" onSubmit={submit}>
@@ -202,45 +323,71 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
             </div>
           </div>
 
-          <div>
-            <div className="flex items-center justify-between">
-              <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Zu überwachende Ordner
-              </h4>
-              <button
-                type="button"
-                onClick={() => append(createDefaultFolder())}
-                className="text-xs font-medium text-emerald-400 hover:text-emerald-300"
-              >
-                Ordner hinzufügen
-              </button>
-            </div>
-            <div className="mt-2 space-y-2">
-              {fields.map((field, index) => (
-                <div key={field.id} className="flex gap-2">
-                  <input
-                    {...register(`imap_folders.${index}.name` as const, { required: true })}
-                    className="flex-1 rounded border border-slate-700 bg-slate-950 p-2"
-                    placeholder="INBOX/Calendar"
-                  />
-                  <label className="flex items-center gap-2 rounded border border-slate-700 bg-slate-950 px-3">
-                    <input
-                      type="checkbox"
-                      {...register(`imap_folders.${index}.include_subfolders` as const)}
-                    />
-                    <span className="text-xs text-slate-300">inkl. Unterordner</span>
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => remove(index)}
-                    className="rounded bg-rose-900 px-3 text-xs font-semibold text-rose-200 hover:bg-rose-800"
+          <details className="rounded-lg border border-slate-800 bg-slate-950/60">
+            <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold text-slate-200">
+              Zu überwachende Ordner ({selectedFolderCount}/{Math.max(folderOptions.length, 1)})
+            </summary>
+            <div className="space-y-3 border-t border-slate-800 px-4 py-4 text-sm text-slate-200">
+              <p className="text-xs text-slate-400">
+                Wähle die Ordner aus, die für den Scan berücksichtigt werden sollen.
+              </p>
+              <div className="space-y-2">
+                {folderOptions.map((folder) => (
+                  <div
+                    key={folder.name}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2"
                   >
-                    Entfernen
-                  </button>
-                </div>
-              ))}
+                    <div>
+                      <label className="flex items-center gap-2 text-sm text-slate-200">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                          checked={folder.selected}
+                          onChange={() => toggleFolderSelection(folder.name)}
+                        />
+                        <span>{folder.name}</span>
+                      </label>
+                      <label className="mt-2 flex items-center gap-2 text-xs text-slate-400">
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5 rounded border-slate-600 bg-slate-950"
+                          checked={folder.include_subfolders}
+                          onChange={() => toggleIncludeSubfolders(folder.name)}
+                          disabled={!folder.selected}
+                        />
+                        <span>inkl. Unterordner</span>
+                      </label>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeFolder(folder.name)}
+                      className="text-xs font-semibold text-rose-300 transition hover:text-rose-200"
+                    >
+                      Entfernen
+                    </button>
+                  </div>
+                ))}
+                {folderOptions.length === 0 && (
+                  <p className="text-xs text-slate-400">Noch keine Ordner hinzugefügt.</p>
+                )}
+              </div>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <input
+                  value={newFolderName}
+                  onChange={(event) => setNewFolderName(event.target.value)}
+                  className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-emerald-400 focus:outline-none sm:flex-1"
+                  placeholder="INBOX/Calendar"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddFolder}
+                  className="rounded-lg bg-slate-800 px-4 py-2 text-xs font-semibold text-slate-100 transition hover:bg-slate-700"
+                >
+                  Ordner hinzufügen
+                </button>
+              </div>
             </div>
-          </div>
+          </details>
         </div>
       ) : (
         <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900 p-4">

@@ -45,13 +45,22 @@ export interface TrackedEvent {
   start?: string;
   end?: string;
   status: 'new' | 'updated' | 'cancelled' | 'synced';
+  response_status: 'none' | 'accepted' | 'tentative' | 'declined';
   history: EventHistoryEntry[];
+  conflicts: CalendarConflict[];
 }
 
 export interface EventHistoryEntry {
   timestamp: string;
   action: string;
   description: string;
+}
+
+export interface CalendarConflict {
+  uid: string;
+  summary?: string;
+  start?: string;
+  end?: string;
 }
 
 export interface ManualSyncRequest {
@@ -91,6 +100,7 @@ export interface SyncMappingCreateInput {
 export interface AutoSyncStatus {
   enabled: boolean;
   interval_minutes?: number;
+  auto_response: 'none' | 'accepted' | 'tentative' | 'declined';
 }
 
 export interface CalendarInfo {

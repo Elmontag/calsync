@@ -11,7 +11,17 @@ type ActiveView = 'sync' | 'accounts' | 'settings';
 function App() {
   const [activeView, setActiveView] = useState<ActiveView>('sync');
   const { accounts, addAccount, updateAccount, removeAccount } = useAccounts();
-  const { events, scan, manualSync, syncAll, autoSync, toggleAutoSync } = useEvents();
+  const {
+    events,
+    loading: eventsLoading,
+    scan,
+    manualSync,
+    syncAll,
+    autoSync,
+    toggleAutoSync,
+    setAutoResponse,
+    respondToEvent,
+  } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [savingAccount, setSavingAccount] = useState(false);
@@ -99,7 +109,11 @@ function App() {
               onScan={scan}
               onSyncAll={syncAll}
               autoSyncEnabled={autoSync.enabled}
+              autoSyncResponse={autoSync.auto_response}
               onAutoSyncToggle={toggleAutoSync}
+              onAutoSyncResponseChange={setAutoResponse}
+              onRespondToEvent={respondToEvent}
+              loading={eventsLoading}
             />
           </div>
         )}

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +12,15 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, engine
-from .models import Account, AccountType, EventStatus, ImapFolder, SyncMapping, TrackedEvent
+from .models import (
+    Account,
+    AccountType,
+    EventResponseStatus,
+    EventStatus,
+    ImapFolder,
+    SyncMapping,
+    TrackedEvent,
+)
 from .schemas import (
     AccountCreate,
     AccountRead,
@@ -21,6 +30,7 @@ from .schemas import (
     ManualSyncMissingDetail,
     ManualSyncRequest,
     ManualSyncResponse,
+    EventResponseUpdate,
     AutoSyncRequest,
     AutoSyncStatus,
     SyncJobStatus,
@@ -30,10 +40,15 @@ from .schemas import (
     TrackedEventRead,
 )
 from .services import event_processor
-from .services.caldav_client import CalDavSettings, list_calendars
+from .services.caldav_client import (
+    CalDavConnection,
+    CalDavSettings,
+    find_conflicting_events,
+    list_calendars,
+)
 from .services.imap_client import ImapSettings, fetch_calendar_candidates
 from .services.scheduler import scheduler
-from .utils.ics_parser import parse_ics_payload
+from .utils.ics_parser import merge_histories, parse_ics_payload
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,7 +61,91 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="CalSync", version="0.1.0")
 
 AUTO_SYNC_JOB_ID = "auto-sync"
+auto_sync_preferences: Dict[str, Any] = {
+    "auto_response": EventResponseStatus.NONE,
+    "interval_minutes": 5,
+}
 
+
+def _ensure_timezone(value: Optional[datetime]) -> Optional[datetime]:
+    """Ensure datetimes are timezone aware to keep CalDAV searches stable."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _event_search_window(event: TrackedEvent) -> tuple[Optional[datetime], Optional[datetime]]:
+    """Calculate a safe search window for conflict detection."""
+    start = event.start or event.end
+    end = event.end or event.start
+    start = _ensure_timezone(start)
+    end = _ensure_timezone(end)
+    if start is None:
+        return None, None
+    if end is None or end <= start:
+        end = start + timedelta(minutes=30)
+    return start, end
+
+
+def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
+    """Enrich tracked events with CalDAV conflict information."""
+    if not events:
+        return
+    for event in events:
+        setattr(event, "conflicts", [])
+
+    mappings = db.execute(select(SyncMapping)).scalars().all()
+    mapping_index = {
+        (mapping.imap_account_id, mapping.imap_folder): mapping for mapping in mappings
+    }
+    grouped: Dict[int, Dict[str, Any]] = {}
+    for event in events:
+        if event.source_account_id is None or not event.source_folder:
+            continue
+        mapping = mapping_index.get((event.source_account_id, event.source_folder))
+        if mapping is None:
+            continue
+        group = grouped.setdefault(mapping.id, {"mapping": mapping, "events": []})
+        group["events"].append(event)
+
+    if not grouped:
+        return
+
+    account_cache: Dict[int, Account] = {}
+    for group in grouped.values():
+        mapping: SyncMapping = group["mapping"]
+        events_for_mapping: List[TrackedEvent] = group["events"]
+        account = account_cache.get(mapping.caldav_account_id)
+        if account is None:
+            account = db.get(Account, mapping.caldav_account_id)
+            if account is None:
+                logger.warning(
+                    "CalDAV account %s not found for mapping %s",
+                    mapping.caldav_account_id,
+                    mapping.id,
+                )
+                continue
+            account_cache[mapping.caldav_account_id] = account
+        try:
+            settings = CalDavSettings(**account.settings)
+        except TypeError:
+            logger.exception(
+                "Ungültige CalDAV Einstellungen für Konto %s", account.id
+            )
+            continue
+        with CalDavConnection(settings) as client:
+            calendar = client.principal().calendar(cal_url=mapping.calendar_url)
+            for event in events_for_mapping:
+                start, end = _event_search_window(event)
+                if start is None or end is None:
+                    continue
+                conflicts = find_conflicting_events(
+                    calendar, start, end, exclude_uid=event.uid
+                )
+                if conflicts:
+                    setattr(event, "conflicts", conflicts)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -205,6 +304,7 @@ def test_connection(payload: ConnectionTestRequest) -> ConnectionTestResult:
 @app.get("/events", response_model=List[TrackedEventRead])
 def list_events(db: Session = Depends(get_db)):
     events = db.execute(select(TrackedEvent)).scalars().all()
+    _attach_conflicts(events, db)
     return events
 
 
@@ -330,6 +430,86 @@ def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> Ma
     return ManualSyncResponse(uploaded=uploaded, missing=missing_events)
 
 
+@app.post("/events/{event_id}/response", response_model=TrackedEventRead)
+def update_event_response(
+    event_id: int, payload: EventResponseUpdate, db: Session = Depends(get_db)
+) -> TrackedEvent:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+
+    response = payload.response
+    event.response_status = response
+    if event.status != EventStatus.CANCELLED:
+        event.status = EventStatus.UPDATED
+    description_map = {
+        EventResponseStatus.ACCEPTED: "Teilnahme zugesagt",
+        EventResponseStatus.TENTATIVE: "Teilnahme auf vielleicht gesetzt",
+        EventResponseStatus.DECLINED: "Teilnahme abgesagt",
+        EventResponseStatus.NONE: "Antwort zurückgesetzt",
+    }
+    event_processor.annotate_response(event)
+    event.history = merge_histories(
+        event.history or [],
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "action": "response",
+            "description": description_map.get(response, "Teilnahmestatus aktualisiert"),
+        },
+    )
+    mapping: Optional[SyncMapping] = None
+    caldav_settings: Optional[CalDavSettings] = None
+    if event.source_account_id and event.source_folder:
+        mapping = (
+            db.execute(
+                select(SyncMapping)
+                .where(SyncMapping.imap_account_id == event.source_account_id)
+                .where(SyncMapping.imap_folder == event.source_folder)
+            )
+            .scalars()
+            .first()
+        )
+        if mapping is not None:
+            caldav_account = db.get(Account, mapping.caldav_account_id)
+            if caldav_account is None:
+                logger.warning(
+                    "CalDAV account %s nicht gefunden für Mapping %s",
+                    mapping.caldav_account_id,
+                    mapping.id,
+                )
+            else:
+                try:
+                    caldav_settings = CalDavSettings(**caldav_account.settings)
+                except TypeError:
+                    logger.exception(
+                        "Ungültige CalDAV Einstellungen für Konto %s", caldav_account.id
+                    )
+                    caldav_settings = None
+
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    logger.info("Updated response for event %s to %s", event.uid, response.value)
+    if mapping and caldav_settings:
+        try:
+            event_processor.sync_events_to_calendar(
+                [event], mapping.calendar_url, caldav_settings
+            )
+        except Exception:
+            logger.exception(
+                "Failed to sync event %s after response update", event.uid
+            )
+        finally:
+            db.refresh(event)
+    else:
+        logger.info(
+            "Kalendersync für Termin %s übersprungen (fehlendes Mapping oder Einstellungen)",
+            event.uid,
+        )
+    _attach_conflicts([event], db)
+    return event
+
+
 @app.post("/events/schedule")
 def schedule_sync(minutes: int = 5, db: Session = Depends(get_db)) -> SyncJobStatus:
     def job():
@@ -340,7 +520,7 @@ def schedule_sync(minutes: int = 5, db: Session = Depends(get_db)) -> SyncJobSta
     return SyncJobStatus(job_id=AUTO_SYNC_JOB_ID, status="scheduled", total=minutes)
 
 
-def perform_sync_all(db: Session) -> int:
+def perform_sync_all(db: Session, apply_auto_response: bool = False) -> int:
     """Synchronize all pending events based on the configured mappings."""
     total_uploaded = 0
     mappings = db.execute(select(SyncMapping)).scalars().all()
@@ -358,8 +538,30 @@ def perform_sync_all(db: Session) -> int:
         ).scalars().all()
         if not events:
             continue
-        uploaded = event_processor.sync_events_to_calendar(events, mapping.calendar_url, settings)
-        total_uploaded += len(uploaded)
+        uploaded_uids = event_processor.sync_events_to_calendar(events, mapping.calendar_url, settings)
+        total_uploaded += len(uploaded_uids)
+        if (
+            apply_auto_response
+            and auto_sync_preferences.get("auto_response") == EventResponseStatus.ACCEPTED
+            and uploaded_uids
+        ):
+            for event in events:
+                if event.uid not in uploaded_uids:
+                    continue
+                current = db.get(TrackedEvent, event.id)
+                if current is None:
+                    continue
+                current.response_status = EventResponseStatus.ACCEPTED
+                current.history = merge_histories(
+                    current.history or [],
+                    {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "action": "response",
+                        "description": "Automatisch zugesagt (AutoSync)",
+                    },
+                )
+                db.add(current)
+            db.commit()
     return total_uploaded
 
 
@@ -371,7 +573,11 @@ def sync_all_events(db: Session = Depends(get_db)) -> SyncJobStatus:
 
 @app.get("/events/auto-sync", response_model=AutoSyncStatus)
 def auto_sync_status() -> AutoSyncStatus:
-    return AutoSyncStatus(enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID))
+    return AutoSyncStatus(
+        enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID),
+        interval_minutes=auto_sync_preferences.get("interval_minutes"),
+        auto_response=auto_sync_preferences.get("auto_response", EventResponseStatus.NONE),
+    )
 
 
 @app.post("/events/auto-sync", response_model=AutoSyncStatus)
@@ -379,7 +585,14 @@ def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db))
     def job():
         with SessionLocal() as job_db:
             scan_mailboxes(job_db)
-            perform_sync_all(job_db)
+            perform_sync_all(job_db, apply_auto_response=True)
+
+    auto_response = payload.auto_response
+    if auto_response not in (EventResponseStatus.NONE, EventResponseStatus.ACCEPTED):
+        logger.warning("Unsupported auto response %s, falling back to NONE", auto_response)
+        auto_response = EventResponseStatus.NONE
+    auto_sync_preferences["auto_response"] = auto_response
+    auto_sync_preferences["interval_minutes"] = payload.interval_minutes
 
     if payload.enabled:
         scheduler.schedule_job(AUTO_SYNC_JOB_ID, job, minutes=payload.interval_minutes)
@@ -387,7 +600,11 @@ def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db))
     else:
         scheduler.cancel_job(AUTO_SYNC_JOB_ID)
         logger.info("Auto sync disabled")
-    return AutoSyncStatus(enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID), interval_minutes=payload.interval_minutes)
+    return AutoSyncStatus(
+        enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID),
+        interval_minutes=auto_sync_preferences.get("interval_minutes"),
+        auto_response=auto_sync_preferences.get("auto_response", EventResponseStatus.NONE),
+    )
 
 
 @app.get("/accounts/{account_id}/calendars")
