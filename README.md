@@ -24,6 +24,7 @@ CalSync ist ein leichtgewichtiger Service, der definierbare IMAP-Ordner nach Kal
    ```bash
    docker compose up --build
    ```
+   > 💡 **Hinweis:** Der Backend-Container setzt `PIP_DEFAULT_TIMEOUT=120`, damit `pip install` auch bei langsamer Netzwerkverbindung zuverlässig durchläuft. Falls Sie eigene Dockerfiles ableiten, übernehmen Sie diese Umgebungsvariable.
 
 3. **Zugriff**
    - Backend API: http://localhost:8000/docs
