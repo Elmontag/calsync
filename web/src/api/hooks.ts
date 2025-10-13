@@ -63,7 +63,11 @@ export async function runConnectionTest(payload: ConnectionTestRequest) {
 export function useEvents() {
   const [events, setEvents] = useState<TrackedEvent[]>([]);
   const [loading, setLoading] = useState(true);
-  const [autoSync, setAutoSync] = useState<AutoSyncStatus>({ enabled: false });
+  const [autoSync, setAutoSync] = useState<AutoSyncStatus>({
+    enabled: false,
+    interval_minutes: 5,
+    auto_response: 'none',
+  });
 
   async function refresh() {
     setLoading(true);
@@ -74,7 +78,11 @@ export function useEvents() {
 
   async function loadAutoSync() {
     const { data } = await api.get<AutoSyncStatus>('/events/auto-sync');
-    setAutoSync(data);
+    setAutoSync({
+      enabled: data.enabled,
+      interval_minutes: data.interval_minutes ?? autoSync.interval_minutes ?? 5,
+      auto_response: data.auto_response ?? 'none',
+    });
   }
 
   useEffect(() => {
@@ -98,14 +106,47 @@ export function useEvents() {
     await refresh();
   }
 
-  async function toggleAutoSync(enabled: boolean) {
+  async function configureAutoSync(config: {
+    enabled: boolean;
+    auto_response?: AutoSyncStatus['auto_response'];
+    interval_minutes?: number;
+  }) {
     const { data } = await api.post<AutoSyncStatus>('/events/auto-sync', {
-      enabled,
+      enabled: config.enabled,
+      interval_minutes: config.interval_minutes ?? autoSync.interval_minutes ?? 5,
+      auto_response: config.auto_response ?? autoSync.auto_response ?? 'none',
     });
     setAutoSync(data);
+    return data;
   }
 
-  return { events, loading, refresh, scan, manualSync, syncAll, autoSync, toggleAutoSync, loadAutoSync };
+  async function toggleAutoSync(enabled: boolean) {
+    await configureAutoSync({ enabled });
+  }
+
+  async function setAutoResponse(autoResponse: AutoSyncStatus['auto_response']) {
+    await configureAutoSync({ enabled: autoSync.enabled, auto_response: autoResponse });
+  }
+
+  async function respondToEvent(eventId: number, response: TrackedEvent['response_status']) {
+    const { data } = await api.post<TrackedEvent>(`/events/${eventId}/response`, { response });
+    setEvents((prev) => prev.map((event) => (event.id === eventId ? data : event)));
+    return data;
+  }
+
+  return {
+    events,
+    loading,
+    refresh,
+    scan,
+    manualSync,
+    syncAll,
+    autoSync,
+    toggleAutoSync,
+    setAutoResponse,
+    respondToEvent,
+    loadAutoSync,
+  };
 }
 
 export function useSyncMappings() {

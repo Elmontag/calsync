@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
-from .models import AccountType, EventStatus
+from .models import AccountType, EventResponseStatus, EventStatus
 
 
 class ImapFolderBase(BaseModel):
@@ -66,6 +66,13 @@ class EventHistoryEntry(BaseModel):
     description: str
 
 
+class CalendarConflict(BaseModel):
+    uid: str
+    summary: Optional[str] = None
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+
+
 class TrackedEventRead(BaseModel):
     id: int
     uid: str
@@ -76,13 +83,19 @@ class TrackedEventRead(BaseModel):
     start: Optional[datetime] = None
     end: Optional[datetime] = None
     status: EventStatus
+    response_status: EventResponseStatus
     history: List[EventHistoryEntry] = Field(default_factory=list)
+    conflicts: List[CalendarConflict] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class ManualSyncRequest(BaseModel):
     event_ids: List[int]
+
+
+class EventResponseUpdate(BaseModel):
+    response: EventResponseStatus
 
 
 class ManualSyncMissingDetail(BaseModel):
@@ -131,8 +144,10 @@ class SyncMappingRead(SyncMappingBase):
 class AutoSyncStatus(BaseModel):
     enabled: bool
     interval_minutes: Optional[int] = None
+    auto_response: EventResponseStatus = EventResponseStatus.NONE
 
 
 class AutoSyncRequest(BaseModel):
     enabled: bool
     interval_minutes: int = 5
+    auto_response: EventResponseStatus = EventResponseStatus.NONE

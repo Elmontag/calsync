@@ -1,6 +1,7 @@
 """Database configuration module."""
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -16,6 +17,32 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+logger = logging.getLogger(__name__)
+
+
+def apply_schema_upgrades() -> None:
+    """Perform lightweight, in-app schema migrations for SQLite deployments."""
+
+    with engine.begin() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql("PRAGMA table_info('tracked_events')").fetchall()
+        }
+
+    if not columns:
+        # Table does not exist yet; the regular metadata.create_all call will create it.
+        return
+
+    if "response_status" not in columns:
+        logger.info("Adding response_status column to tracked_events table")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                ALTER TABLE tracked_events
+                ADD COLUMN response_status VARCHAR NOT NULL DEFAULT 'none'
+                """
+            )
 
 
 @contextmanager

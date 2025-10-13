@@ -63,6 +63,15 @@ class EventStatus(str, Enum):
     SYNCED = "synced"
 
 
+class EventResponseStatus(str, Enum):
+    """Possible participation responses for a tracked event."""
+
+    NONE = "none"
+    ACCEPTED = "accepted"
+    TENTATIVE = "tentative"
+    DECLINED = "declined"
+
+
 class TrackedEvent(Base):
     """State of events extracted from IMAP sources."""
 
@@ -78,6 +87,19 @@ class TrackedEvent(Base):
     start = Column(DateTime, nullable=True)
     end = Column(DateTime, nullable=True)
     status = Column(SqlEnum(EventStatus), default=EventStatus.NEW)
+    response_status = Column(
+        SqlEnum(
+            EventResponseStatus,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+            native_enum=False,
+            validate_strings=True,
+        ),
+        # SQLite stores Enum values as strings; using the value list keeps
+        # existing lower-case payloads readable while still mapping to the
+        # Enum instances in Python.
+        default=EventResponseStatus.NONE,
+        nullable=False,
+    )
     payload = Column(JSON, nullable=True)
     last_synced = Column(DateTime, nullable=True)
     history = Column(JSON, default=list)

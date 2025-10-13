@@ -52,15 +52,24 @@ export default function AccountList({
               </span>
             )}
           </div>
-          {account.type === 'imap' && account.imap_folders.length > 0 && (
-            <ul className="mt-3 space-y-1 text-sm text-slate-300">
-              {account.imap_folders.map((folder) => (
-                <li key={folder.name}>
-                  {folder.name}
-                  {folder.include_subfolders ? ' (inkl. Unterordner)' : ''}
-                </li>
-              ))}
-            </ul>
+          {account.type === 'imap' && (
+            <details className="mt-3 rounded-lg border border-slate-800 bg-slate-950/60">
+              <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                Ordnerübersicht ({account.imap_folders.length})
+              </summary>
+              <ul className="space-y-1 border-t border-slate-800 px-3 py-3 text-sm text-slate-300">
+                {account.imap_folders.length > 0 ? (
+                  account.imap_folders.map((folder) => (
+                    <li key={folder.name}>
+                      {folder.name}
+                      {folder.include_subfolders ? ' (inkl. Unterordner)' : ''}
+                    </li>
+                  ))
+                ) : (
+                  <li className="text-xs text-slate-500">Keine Ordner ausgewählt.</li>
+                )}
+              </ul>
+            </details>
           )}
           <div className="mt-4 flex flex-wrap gap-2">
             <button

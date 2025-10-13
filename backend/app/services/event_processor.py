@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from sqlalchemy import select
 
 from ..database import session_scope
-from ..models import EventStatus, TrackedEvent
+from ..models import EventResponseStatus, EventStatus, TrackedEvent
 from ..utils.ics_parser import ParsedEvent, merge_histories
-from .caldav_client import CalDavSettings, upload_ical
+from .caldav_client import CalDavSettings, delete_event_by_uid, upload_ical
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ def upsert_events(
                     start=parsed.start,
                     end=parsed.end,
                     status=parsed.status,
+                    response_status=EventResponseStatus.NONE,
                     mailbox_message_id=source_message_id,
                     payload=parsed.event.to_ical().decode(),
                     history=[history_entry],
@@ -96,7 +97,12 @@ def sync_events_to_calendar(
     uploaded_uids: List[str] = []
     events_list = list(events)
     successfully_uploaded: List[TrackedEvent] = []
+    cancellation_results: Dict[int, bool] = {}
     for event in events_list:
+        if event.status == EventStatus.CANCELLED:
+            removed = delete_event_by_uid(calendar_url, event.uid, settings)
+            cancellation_results[event.id] = removed
+            continue
         try:
             upload_ical(calendar_url, event_payload_to_ical(event), settings)
             uploaded_uids.append(event.uid)
@@ -106,8 +112,10 @@ def sync_events_to_calendar(
             continue
     if successfully_uploaded:
         mark_as_synced(successfully_uploaded)
-    else:
+    elif not cancellation_results:
         logger.warning("No events could be synced to %s", calendar_url)
+    if cancellation_results:
+        mark_as_cancelled(cancellation_results)
     return uploaded_uids
 
 
@@ -116,3 +124,42 @@ def event_payload_to_ical(event: TrackedEvent):
 
     cal = Calendar.from_ical(event.payload)
     return cal
+
+
+def annotate_response(event: TrackedEvent) -> None:
+    """Embed the stored response status within the ICS payload for CalDAV."""
+    from icalendar import Calendar
+
+    calendar = Calendar.from_ical(event.payload)
+    updated = False
+    for component in calendar.walk("VEVENT"):
+        component["X-CALSYNC-RESPONSE"] = event.response_status.value.upper()
+        updated = True
+    if updated:
+        event.payload = calendar.to_ical().decode()
+
+
+def mark_as_cancelled(results: Dict[int, bool]) -> None:
+    """Update cancellation attempts with a history entry and timestamp."""
+    with session_scope() as session:
+        for event_id, removed in results.items():
+            event = session.get(TrackedEvent, event_id)
+            if event is None:
+                continue
+            event.status = EventStatus.CANCELLED
+            event.last_synced = datetime.utcnow()
+            description = (
+                "Termin im Kalender entfernt"
+                if removed
+                else "Kein Kalendereintrag zum Entfernen gefunden"
+            )
+            event.history = merge_histories(
+                event.history or [],
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "action": EventStatus.CANCELLED.value,
+                    "description": description,
+                },
+            )
+            session.add(event)
+    logger.info("Processed %s cancellation updates", len(results))
