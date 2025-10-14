@@ -44,6 +44,41 @@ def apply_schema_upgrades() -> None:
                 """
             )
 
+    added_timestamp_column = False
+
+    if "created_at" not in columns:
+        logger.info("Adding created_at column to tracked_events table")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                ALTER TABLE tracked_events
+                ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                """
+            )
+        added_timestamp_column = True
+
+    if "updated_at" not in columns:
+        logger.info("Adding updated_at column to tracked_events table")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                ALTER TABLE tracked_events
+                ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                """
+            )
+        added_timestamp_column = True
+
+    if added_timestamp_column:
+        logger.info("Backfilling timestamp metadata on existing tracked events")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                UPDATE tracked_events
+                SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP),
+                    updated_at = COALESCE(updated_at, created_at)
+                """
+            )
+
 
 @contextmanager
 def session_scope() -> Iterator[sessionmaker]:
