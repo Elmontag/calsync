@@ -90,9 +90,10 @@ export default function SyncMappingConfigurator({ accounts, mappings, onCreate, 
   return (
     <div className="space-y-6 rounded-xl border border-slate-800 bg-slate-900 p-6">
       <div>
-        <h2 className="text-lg font-semibold text-slate-100">Sync-Zuordnungen</h2>
+        <h2 className="text-lg font-semibold text-slate-100">Sync-Zuordnungen verwalten</h2>
         <p className="text-sm text-slate-400">
-          Bestimme hier, welcher IMAP-Ordner mit welchem CalDAV-Kalender verknüpft wird.
+          Definiere hier, welcher IMAP-Ordner in welchen CalDAV-Kalender exportiert wird. Die Einstellungen
+          gelten sowohl für manuelle Exporte als auch für AutoSync.
         </p>
       </div>
 

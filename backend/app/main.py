@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime, timedelta, timezone
+from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -90,6 +92,80 @@ def _event_search_window(event: TrackedEvent) -> tuple[Optional[datetime], Optio
     if end is None or end <= start:
         end = start + timedelta(minutes=30)
     return start, end
+
+
+def _normalize_history(event: TrackedEvent) -> Tuple[List[Dict[str, str]], bool]:
+    """Ensure history entries are returned as clean dictionaries."""
+
+    raw_history = getattr(event, "history", [])
+    changed = False
+
+    if isinstance(raw_history, str):
+        try:
+            raw_history = json.loads(raw_history)
+        except JSONDecodeError:
+            logger.warning("History for event %s is not valid JSON, dropping.", event.id)
+            return [], True
+        changed = True
+
+    if not isinstance(raw_history, list):
+        if raw_history not in (None, []):
+            logger.warning(
+                "History for event %s has unexpected type %s, resetting.",
+                event.id,
+                type(raw_history).__name__,
+            )
+        return [], raw_history not in (None, [])
+
+    normalized: List[Dict[str, str]] = []
+    for entry in raw_history:
+        if not isinstance(entry, dict):
+            logger.warning(
+                "Skipping non-dict history entry for event %s: %r",
+                event.id,
+                entry,
+            )
+            changed = True
+            continue
+        timestamp = entry.get("timestamp")
+        action = entry.get("action")
+        description = entry.get("description")
+        if not isinstance(timestamp, str) or not isinstance(action, str) or not isinstance(description, str):
+            logger.warning(
+                "Skipping malformed history entry for event %s: %r",
+                event.id,
+                entry,
+            )
+            changed = True
+            continue
+        normalized.append({
+            "timestamp": timestamp,
+            "action": action,
+            "description": description,
+        })
+
+    if len(normalized) != len(raw_history):
+        changed = True
+
+    return normalized, changed
+
+
+def _normalize_histories(events: List[TrackedEvent], db: Session) -> None:
+    """Coerce legacy or malformed history payloads to the expected structure."""
+
+    dirty = False
+    for event in events:
+        history, changed = _normalize_history(event)
+        if changed:
+            event.history = history
+            db.add(event)
+            dirty = True
+    if dirty:
+        try:
+            db.commit()
+        except Exception:
+            logger.exception("Failed to persist normalized history entries")
+            db.rollback()
 
 
 def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
@@ -556,6 +632,7 @@ def test_connection(payload: ConnectionTestRequest) -> ConnectionTestResult:
 @app.get("/events", response_model=List[TrackedEventRead])
 def list_events(db: Session = Depends(get_db)):
     events = db.execute(select(TrackedEvent)).scalars().all()
+    _normalize_histories(events, db)
     _attach_conflicts(events, db)
     return events
 

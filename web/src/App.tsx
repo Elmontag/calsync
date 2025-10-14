@@ -159,25 +159,14 @@ function App() {
         )}
 
         {activeView === 'settings' && (
-          <div className="grid gap-8 lg:grid-cols-2">
-            <section className="space-y-6">
-              <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
-                <h2 className="text-lg font-semibold text-slate-100">Sync-Zuordnungen verwalten</h2>
-                <p className="mt-1 text-sm text-slate-400">
-                  Definiere hier, welcher IMAP-Ordner in welchen CalDAV-Kalender exportiert wird. Die
-                  Einstellungen werden sowohl für manuelle Exporte als auch für AutoSync verwendet.
-                </p>
-                <div className="mt-6">
-                  <SyncMappingConfigurator
-                    accounts={accounts}
-                    mappings={mappings}
-                    onCreate={addMapping}
-                    onDelete={removeMapping}
-                  />
-                </div>
-              </div>
-            </section>
-          </div>
+          <section>
+            <SyncMappingConfigurator
+              accounts={accounts}
+              mappings={mappings}
+              onCreate={addMapping}
+              onDelete={removeMapping}
+            />
+          </section>
         )}
       </main>
     </div>
