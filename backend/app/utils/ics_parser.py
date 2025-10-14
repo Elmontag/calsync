@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime, time
 from typing import Iterable, List, Optional
 
 from icalendar import Calendar, Event
@@ -92,6 +92,10 @@ def merge_histories(existing: Iterable[dict], new_entry: dict) -> List[dict]:
 def _normalize_date(value) -> datetime:
     if isinstance(value, datetime):
         return value
+    if isinstance(value, date):
+        # All-day events are represented as date objects in ICS payloads. Normalize
+        # them to datetimes at midnight to ensure consistent handling downstream.
+        return datetime.combine(value, time.min)
     if hasattr(value, "to_datetime"):
         return value.to_datetime()
     raise TypeError(f"Unsupported date value: {value!r}")
