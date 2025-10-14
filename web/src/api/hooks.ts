@@ -71,9 +71,15 @@ export function useEvents() {
 
   async function refresh() {
     setLoading(true);
-    const { data } = await api.get<TrackedEvent[]>('/events');
-    setEvents(data);
-    setLoading(false);
+    try {
+      const { data } = await api.get<TrackedEvent[]>('/events');
+      setEvents(data);
+    } catch (error) {
+      // Keep the previous list of events visible so users are not left with an empty view.
+      console.error('Konnte Termine nicht aktualisieren.', error);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function loadAutoSync() {

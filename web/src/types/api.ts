@@ -48,6 +48,8 @@ export interface TrackedEvent {
   response_status: 'none' | 'accepted' | 'tentative' | 'declined';
   history: EventHistoryEntry[];
   conflicts: CalendarConflict[];
+  created_at: string;
+  updated_at: string;
 }
 
 export interface EventHistoryEntry {

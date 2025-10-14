@@ -41,6 +41,13 @@ const statusStyleMap: Record<TrackedEvent['status'], string> = {
   synced: 'bg-emerald-500/10 text-emerald-300',
 };
 
+const statusFilterOptions: Array<{ value: TrackedEvent['status']; label: string }> = [
+  { value: 'new', label: statusLabelMap.new },
+  { value: 'updated', label: statusLabelMap.updated },
+  { value: 'cancelled', label: statusLabelMap.cancelled },
+  { value: 'synced', label: statusLabelMap.synced },
+];
+
 const responseLabelMap: Record<TrackedEvent['response_status'], string> = {
   none: 'Keine Antwort',
   accepted: 'Zusage',
@@ -63,6 +70,16 @@ const responseActions: Array<{
   { value: 'accepted', label: 'Zusage', className: 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400' },
   { value: 'tentative', label: 'Vielleicht', className: 'bg-amber-500 text-amber-950 hover:bg-amber-400' },
   { value: 'declined', label: 'Absagen', className: 'bg-rose-500 text-rose-100 hover:bg-rose-400' },
+];
+
+type SortOption = 'email-desc' | 'email-asc' | 'event-asc' | 'event-desc' | 'none';
+
+const sortOptionItems: Array<{ value: SortOption; label: string }> = [
+  { value: 'email-desc', label: 'E-Mail-Datum (neueste zuerst)' },
+  { value: 'email-asc', label: 'E-Mail-Datum (älteste zuerst)' },
+  { value: 'event-asc', label: 'Termindatum (früheste zuerst)' },
+  { value: 'event-desc', label: 'Termindatum (späteste zuerst)' },
+  { value: 'none', label: 'Keine Sortierung' },
 ];
 
 function formatDateTime(value?: string) {
@@ -94,6 +111,49 @@ function formatConflictRange(conflict: TrackedEvent['conflicts'][number]) {
   return start ?? end ?? 'Keine Zeitangabe';
 }
 
+function parseIsoDate(value?: string | null): Date | null {
+  if (!value) {
+    return null;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date;
+}
+
+function getEmailDate(event: TrackedEvent): Date | null {
+  return parseIsoDate(event.created_at) ?? parseIsoDate(event.history[0]?.timestamp ?? null);
+}
+
+function getEventDate(event: TrackedEvent): Date | null {
+  return parseIsoDate(event.start) ?? parseIsoDate(event.end);
+}
+
+type SortDirection = 'asc' | 'desc';
+
+function compareByDate(
+  a: TrackedEvent,
+  b: TrackedEvent,
+  getter: (event: TrackedEvent) => Date | null,
+  direction: SortDirection,
+): number {
+  const dateA = getter(a);
+  const dateB = getter(b);
+  if (dateA && dateB) {
+    const diff = dateA.getTime() - dateB.getTime();
+    if (diff !== 0) {
+      return direction === 'asc' ? diff : -diff;
+    }
+  } else if (dateA) {
+    return -1;
+  } else if (dateB) {
+    return 1;
+  }
+  // Fallback to a deterministic ordering to keep the UI stable when dates are equal.
+  return direction === 'asc' ? a.id - b.id : b.id - a.id;
+}
+
 export default function EventTable({
   events,
   onManualSync,
@@ -122,6 +182,8 @@ export default function EventTable({
   const [busy, setBusy] = useState(false);
   const [respondingId, setRespondingId] = useState<number | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [sortOption, setSortOption] = useState<SortOption>('email-desc');
+  const [statusFilters, setStatusFilters] = useState<TrackedEvent['status'][]>([]);
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
   const pollersRef = useRef<Record<string, number>>({});
 
@@ -140,16 +202,28 @@ export default function EventTable({
   }, [events]);
 
   useEffect(() => {
+    setStatusFilters((prev) =>
+      prev.filter((status) => events.some((event) => event.status === status)),
+    );
+  }, [events]);
+
+  useEffect(() => {
     setIntervalInput(String(autoSyncIntervalMinutes));
   }, [autoSyncIntervalMinutes]);
 
-  // Derive filtered event list based on search input for responsive UI updates.
+  // Compose the visible event list by applying search, status filters and sorting preferences.
   const filteredEvents = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
-    if (!term) {
-      return events;
-    }
-    return events.filter((event) => {
+    const hasTerm = term.length > 0;
+    const statusSet = new Set(statusFilters);
+
+    const filtered = events.filter((event) => {
+      if (statusSet.size > 0 && !statusSet.has(event.status)) {
+        return false;
+      }
+      if (!hasTerm) {
+        return true;
+      }
       const haystack = [
         event.summary ?? '',
         event.uid,
@@ -164,7 +238,28 @@ export default function EventTable({
         .toLowerCase();
       return haystack.includes(term);
     });
-  }, [events, searchTerm]);
+
+    const sorted = [...filtered];
+    switch (sortOption) {
+      case 'email-asc':
+        sorted.sort((a, b) => compareByDate(a, b, getEmailDate, 'asc'));
+        break;
+      case 'event-asc':
+        sorted.sort((a, b) => compareByDate(a, b, getEventDate, 'asc'));
+        break;
+      case 'event-desc':
+        sorted.sort((a, b) => compareByDate(a, b, getEventDate, 'desc'));
+        break;
+      case 'none':
+        break;
+      case 'email-desc':
+      default:
+        sorted.sort((a, b) => compareByDate(a, b, getEmailDate, 'desc'));
+        break;
+    }
+
+    return sorted;
+  }, [events, searchTerm, statusFilters, sortOption]);
 
   // Aggregate key performance indicators for the overview widgets.
   const metrics = useMemo(() => {
@@ -201,6 +296,20 @@ export default function EventTable({
     setOpenItems((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
     );
+  }
+
+  function handleSortChange(event: ChangeEvent<HTMLSelectElement>) {
+    setSortOption(event.target.value as SortOption);
+  }
+
+  function toggleStatusFilter(status: TrackedEvent['status']) {
+    setStatusFilters((prev) =>
+      prev.includes(status) ? prev.filter((item) => item !== status) : [...prev, status],
+    );
+  }
+
+  function resetStatusFilters() {
+    setStatusFilters([]);
   }
 
   function asNumber(value: unknown, fallback = 0): number {
@@ -629,11 +738,11 @@ export default function EventTable({
         </div>
       </div>
 
-      <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              onClick={handleScan}
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={handleScan}
               disabled={busy}
               className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-700 disabled:opacity-40"
             >
@@ -698,15 +807,62 @@ export default function EventTable({
                 onChange={(event) => setSearchTerm(event.target.value)}
                 className="w-64 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-emerald-400 focus:outline-none"
                 placeholder="Termine suchen…"
-              />
+                />
+              </div>
+            </div>
+          </div>
+          <div className="mt-3 flex flex-col gap-3 border-t border-slate-800 pt-3 md:flex-row md:items-center md:justify-between">
+            <label className="flex items-center gap-2 text-xs text-slate-300">
+              <span className="font-semibold uppercase tracking-wide text-slate-400">Sortierung</span>
+              <select
+                value={sortOption}
+                onChange={handleSortChange}
+                className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+              >
+                {sortOptionItems.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Statusfilter</span>
+              <button
+                type="button"
+                onClick={resetStatusFilters}
+                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                  statusFilters.length === 0
+                    ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                    : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
+                }`}
+              >
+                Alle Stati
+              </button>
+              {statusFilterOptions.map((option) => {
+                const active = statusFilters.includes(option.value);
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => toggleStatusFilter(option.value)}
+                    className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                      active
+                        ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                        : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
             </div>
           </div>
         </div>
-      </div>
 
-      {(scanJob || syncAllJob || selectionJob) && (
-        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-          {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
+        {(scanJob || syncAllJob || selectionJob) && (
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+            {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
           {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
           {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
         </div>

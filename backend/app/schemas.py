@@ -86,6 +86,8 @@ class TrackedEventRead(BaseModel):
     response_status: EventResponseStatus
     history: List[EventHistoryEntry] = Field(default_factory=list)
     conflicts: List[CalendarConflict] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
