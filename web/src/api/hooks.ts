@@ -78,11 +78,11 @@ export function useEvents() {
 
   async function loadAutoSync() {
     const { data } = await api.get<AutoSyncStatus>('/events/auto-sync');
-    setAutoSync({
+    setAutoSync((prev) => ({
       enabled: data.enabled,
-      interval_minutes: data.interval_minutes ?? autoSync.interval_minutes ?? 5,
-      auto_response: data.auto_response ?? 'none',
-    });
+      interval_minutes: data.interval_minutes ?? prev.interval_minutes ?? 5,
+      auto_response: data.auto_response ?? prev.auto_response ?? 'none',
+    }));
   }
 
   useEffect(() => {
@@ -116,7 +116,11 @@ export function useEvents() {
       interval_minutes: config.interval_minutes ?? autoSync.interval_minutes ?? 5,
       auto_response: config.auto_response ?? autoSync.auto_response ?? 'none',
     });
-    setAutoSync(data);
+    setAutoSync((prev) => ({
+      enabled: data.enabled,
+      interval_minutes: data.interval_minutes ?? prev.interval_minutes ?? 5,
+      auto_response: data.auto_response ?? prev.auto_response ?? 'none',
+    }));
     return data;
   }
 
@@ -126,6 +130,10 @@ export function useEvents() {
 
   async function setAutoResponse(autoResponse: AutoSyncStatus['auto_response']) {
     await configureAutoSync({ enabled: autoSync.enabled, auto_response: autoResponse });
+  }
+
+  async function setAutoSyncInterval(intervalMinutes: number) {
+    await configureAutoSync({ enabled: autoSync.enabled, interval_minutes: intervalMinutes });
   }
 
   async function respondToEvent(eventId: number, response: TrackedEvent['response_status']) {
@@ -144,6 +152,7 @@ export function useEvents() {
     autoSync,
     toggleAutoSync,
     setAutoResponse,
+    setAutoSyncInterval,
     respondToEvent,
     loadAutoSync,
   };

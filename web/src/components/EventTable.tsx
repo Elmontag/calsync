@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { ChangeEvent, KeyboardEvent, useEffect, useMemo, useState } from 'react';
 import {
   ManualSyncMissingDetail,
   ManualSyncRequest,
@@ -12,9 +12,11 @@ interface Props {
   onScan: () => Promise<void>;
   onSyncAll: () => Promise<void>;
   autoSyncEnabled: boolean;
+  autoSyncIntervalMinutes: number;
   autoSyncResponse: TrackedEvent['response_status'];
   onAutoSyncToggle: (enabled: boolean) => Promise<void>;
   onAutoSyncResponseChange: (response: TrackedEvent['response_status']) => Promise<void>;
+  onAutoSyncIntervalChange: (intervalMinutes: number) => Promise<void>;
   onRespondToEvent: (
     eventId: number,
     response: TrackedEvent['response_status'],
@@ -95,9 +97,11 @@ export default function EventTable({
   onScan,
   onSyncAll,
   autoSyncEnabled,
+  autoSyncIntervalMinutes,
   autoSyncResponse,
   onAutoSyncToggle,
   onAutoSyncResponseChange,
+  onAutoSyncIntervalChange,
   onRespondToEvent,
   loading = false,
 }: Props) {
@@ -110,12 +114,17 @@ export default function EventTable({
   const [busy, setBusy] = useState(false);
   const [respondingId, setRespondingId] = useState<number | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
 
   // Remove selections for events that disappeared after refresh.
   useEffect(() => {
     setSelected((prev) => prev.filter((id) => events.some((event) => event.id === id)));
     setOpenItems((prev) => prev.filter((id) => events.some((event) => event.id === id)));
   }, [events]);
+
+  useEffect(() => {
+    setIntervalInput(String(autoSyncIntervalMinutes));
+  }, [autoSyncIntervalMinutes]);
 
   // Derive filtered event list based on search input for responsive UI updates.
   const filteredEvents = useMemo(() => {
@@ -276,6 +285,74 @@ export default function EventTable({
     }
   }
 
+  async function applyAutoSyncIntervalChange() {
+    const trimmed = intervalInput.trim();
+    if (trimmed === '') {
+      setIntervalInput(String(autoSyncIntervalMinutes));
+      return;
+    }
+
+    const next = Number(trimmed);
+    if (!Number.isFinite(next)) {
+      setIntervalInput(String(autoSyncIntervalMinutes));
+      setSyncError('Bitte eine gültige Zahl für das AutoSync-Intervall eingeben.');
+      setSyncResult([]);
+      setMissing([]);
+      setSyncNotice(null);
+      return;
+    }
+
+    const normalized = Math.round(next);
+    if (normalized < 1 || normalized > 720) {
+      setIntervalInput(String(autoSyncIntervalMinutes));
+      setSyncError('Das AutoSync-Intervall muss zwischen 1 und 720 Minuten liegen.');
+      setSyncResult([]);
+      setMissing([]);
+      setSyncNotice(null);
+      return;
+    }
+
+    if (normalized === autoSyncIntervalMinutes) {
+      setIntervalInput(String(normalized));
+      return;
+    }
+
+    setBusy(true);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      await onAutoSyncIntervalChange(normalized);
+      const label = normalized === 1 ? 'Minute' : 'Minuten';
+      setIntervalInput(String(normalized));
+      setSyncNotice(`AutoSync läuft jetzt alle ${normalized} ${label}.`);
+    } catch (error) {
+      setIntervalInput(String(autoSyncIntervalMinutes));
+      setSyncError('AutoSync-Intervall konnte nicht gespeichert werden.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleAutoSyncIntervalInput(event: ChangeEvent<HTMLInputElement>) {
+    setIntervalInput(event.target.value);
+  }
+
+  function handleAutoSyncIntervalBlur() {
+    void applyAutoSyncIntervalChange();
+  }
+
+  function handleAutoSyncIntervalKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void applyAutoSyncIntervalChange();
+    }
+    if (event.key === 'Escape') {
+      setIntervalInput(String(autoSyncIntervalMinutes));
+      setSyncError(null);
+    }
+  }
+
   async function handleResponse(event: TrackedEvent, response: TrackedEvent['response_status']) {
     if (respondingId !== null) {
       return;
@@ -381,6 +458,22 @@ export default function EventTable({
                 disabled={busy}
               />
               <span>AutoSync sagt Termine automatisch zu</span>
+            </label>
+            <label className="flex items-center gap-2 text-xs text-slate-300">
+              <span>AutoSync-Intervall (Minuten)</span>
+              <input
+                type="number"
+                min={1}
+                max={720}
+                step={1}
+                value={intervalInput}
+                onChange={handleAutoSyncIntervalInput}
+                onBlur={handleAutoSyncIntervalBlur}
+                onKeyDown={handleAutoSyncIntervalKeyDown}
+                disabled={busy}
+                className="w-24 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none disabled:opacity-50"
+                aria-label="AutoSync-Intervall in Minuten"
+              />
             </label>
             <div className="relative">
               <input

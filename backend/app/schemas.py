@@ -149,5 +149,5 @@ class AutoSyncStatus(BaseModel):
 
 class AutoSyncRequest(BaseModel):
     enabled: bool
-    interval_minutes: int = 5
+    interval_minutes: int = Field(default=5, ge=1, le=720)
     auto_response: EventResponseStatus = EventResponseStatus.NONE

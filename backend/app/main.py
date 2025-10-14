@@ -598,7 +598,7 @@ def sync_all_events(db: Session = Depends(get_db)) -> SyncJobStatus:
 def auto_sync_status() -> AutoSyncStatus:
     return AutoSyncStatus(
         enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID),
-        interval_minutes=auto_sync_preferences.get("interval_minutes"),
+        interval_minutes=auto_sync_preferences.get("interval_minutes", 5),
         auto_response=auto_sync_preferences.get("auto_response", EventResponseStatus.NONE),
     )
 
@@ -615,17 +615,31 @@ def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db))
         logger.warning("Unsupported auto response %s, falling back to NONE", auto_response)
         auto_response = EventResponseStatus.NONE
     auto_sync_preferences["auto_response"] = auto_response
-    auto_sync_preferences["interval_minutes"] = payload.interval_minutes
+
+    # Normalize the interval to stay within reasonable scheduler boundaries.
+    interval_minutes = payload.interval_minutes
+    if interval_minutes < 1:
+        logger.warning("Interval %s is below minimum, normalizing to 1 minute", interval_minutes)
+        interval_minutes = 1
+    elif interval_minutes > 720:
+        logger.warning("Interval %s exceeds maximum, normalizing to 720 minutes", interval_minutes)
+        interval_minutes = 720
+
+    previous_interval = auto_sync_preferences.get("interval_minutes")
+    if previous_interval != interval_minutes:
+        logger.info("Updating auto sync interval from %s to %s minutes", previous_interval, interval_minutes)
+
+    auto_sync_preferences["interval_minutes"] = interval_minutes
 
     if payload.enabled:
-        scheduler.schedule_job(AUTO_SYNC_JOB_ID, job, minutes=payload.interval_minutes)
+        scheduler.schedule_job(AUTO_SYNC_JOB_ID, job, minutes=interval_minutes)
         logger.info("Auto sync enabled")
     else:
         scheduler.cancel_job(AUTO_SYNC_JOB_ID)
         logger.info("Auto sync disabled")
     return AutoSyncStatus(
         enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID),
-        interval_minutes=auto_sync_preferences.get("interval_minutes"),
+        interval_minutes=auto_sync_preferences.get("interval_minutes", 5),
         auto_response=auto_sync_preferences.get("auto_response", EventResponseStatus.NONE),
     )
 

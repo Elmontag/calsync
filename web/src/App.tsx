@@ -20,6 +20,7 @@ function App() {
     autoSync,
     toggleAutoSync,
     setAutoResponse,
+    setAutoSyncInterval,
     respondToEvent,
   } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
@@ -109,9 +110,11 @@ function App() {
               onScan={scan}
               onSyncAll={syncAll}
               autoSyncEnabled={autoSync.enabled}
+              autoSyncIntervalMinutes={autoSync.interval_minutes ?? 5}
               autoSyncResponse={autoSync.auto_response}
               onAutoSyncToggle={toggleAutoSync}
               onAutoSyncResponseChange={setAutoResponse}
+              onAutoSyncIntervalChange={setAutoSyncInterval}
               onRespondToEvent={respondToEvent}
               loading={eventsLoading}
             />
