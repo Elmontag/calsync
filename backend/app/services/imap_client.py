@@ -76,6 +76,9 @@ def fetch_calendar_candidates(
             logger.info("Scanning IMAP folder %s", folder)
             client.select_folder(folder)
             message_ids = client.search("ALL")
+            if not message_ids:
+                logger.debug("No messages found in folder %s", folder)
+                continue
             for uid, message_data in client.fetch(message_ids, ["RFC822"]).items():
                 raw_message: bytes = message_data[b"RFC822"]
                 message: Message = email.message_from_bytes(raw_message)
