@@ -48,6 +48,8 @@ export interface TrackedEvent {
   response_status: 'none' | 'accepted' | 'tentative' | 'declined';
   history: EventHistoryEntry[];
   conflicts: CalendarConflict[];
+  created_at: string;
+  updated_at: string;
 }
 
 export interface EventHistoryEntry {
@@ -78,6 +80,15 @@ export interface ManualSyncMissingDetail {
 export interface ManualSyncResponse {
   uploaded: string[];
   missing: ManualSyncMissingDetail[];
+}
+
+export interface SyncJobStatus {
+  job_id: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  processed: number;
+  total?: number | null;
+  detail?: Record<string, unknown> | null;
+  message?: string | null;
 }
 
 export interface SyncMapping {

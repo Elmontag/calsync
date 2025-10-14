@@ -9,9 +9,9 @@ import {
   ConnectionTestRequest,
   ConnectionTestResult,
   ManualSyncRequest,
-  ManualSyncResponse,
   SyncMapping,
   SyncMappingCreateInput,
+  SyncJobStatus,
   TrackedEvent,
 } from '../types/api';
 
@@ -71,18 +71,24 @@ export function useEvents() {
 
   async function refresh() {
     setLoading(true);
-    const { data } = await api.get<TrackedEvent[]>('/events');
-    setEvents(data);
-    setLoading(false);
+    try {
+      const { data } = await api.get<TrackedEvent[]>('/events');
+      setEvents(data);
+    } catch (error) {
+      // Keep the previous list of events visible so users are not left with an empty view.
+      console.error('Konnte Termine nicht aktualisieren.', error);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function loadAutoSync() {
     const { data } = await api.get<AutoSyncStatus>('/events/auto-sync');
-    setAutoSync({
+    setAutoSync((prev) => ({
       enabled: data.enabled,
-      interval_minutes: data.interval_minutes ?? autoSync.interval_minutes ?? 5,
-      auto_response: data.auto_response ?? 'none',
-    });
+      interval_minutes: data.interval_minutes ?? prev.interval_minutes ?? 5,
+      auto_response: data.auto_response ?? prev.auto_response ?? 'none',
+    }));
   }
 
   useEffect(() => {
@@ -91,19 +97,18 @@ export function useEvents() {
   }, []);
 
   async function scan() {
-    await api.post('/events/scan');
-    await refresh();
+    const { data } = await api.post<SyncJobStatus>('/events/scan');
+    return data;
   }
 
   async function manualSync(payload: ManualSyncRequest) {
-    const { data } = await api.post<ManualSyncResponse>('/events/manual-sync', payload);
-    await refresh();
+    const { data } = await api.post<SyncJobStatus>('/events/manual-sync', payload);
     return data;
   }
 
   async function syncAll() {
-    await api.post('/events/sync-all');
-    await refresh();
+    const { data } = await api.post<SyncJobStatus>('/events/sync-all');
+    return data;
   }
 
   async function configureAutoSync(config: {
@@ -116,7 +121,11 @@ export function useEvents() {
       interval_minutes: config.interval_minutes ?? autoSync.interval_minutes ?? 5,
       auto_response: config.auto_response ?? autoSync.auto_response ?? 'none',
     });
-    setAutoSync(data);
+    setAutoSync((prev) => ({
+      enabled: data.enabled,
+      interval_minutes: data.interval_minutes ?? prev.interval_minutes ?? 5,
+      auto_response: data.auto_response ?? prev.auto_response ?? 'none',
+    }));
     return data;
   }
 
@@ -126,6 +135,15 @@ export function useEvents() {
 
   async function setAutoResponse(autoResponse: AutoSyncStatus['auto_response']) {
     await configureAutoSync({ enabled: autoSync.enabled, auto_response: autoResponse });
+  }
+
+  async function setAutoSyncInterval(intervalMinutes: number) {
+    await configureAutoSync({ enabled: autoSync.enabled, interval_minutes: intervalMinutes });
+  }
+
+  async function getJobStatus(jobId: string) {
+    const { data } = await api.get<SyncJobStatus>(`/jobs/${jobId}`);
+    return data;
   }
 
   async function respondToEvent(eventId: number, response: TrackedEvent['response_status']) {
@@ -141,9 +159,11 @@ export function useEvents() {
     scan,
     manualSync,
     syncAll,
+    getJobStatus,
     autoSync,
     toggleAutoSync,
     setAutoResponse,
+    setAutoSyncInterval,
     respondToEvent,
     loadAutoSync,
   };

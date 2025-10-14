@@ -5,7 +5,7 @@ import email
 import logging
 from dataclasses import dataclass
 from email.message import Message
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Sequence
 
 from imapclient import IMAPClient
 
@@ -38,6 +38,12 @@ class CalendarCandidate:
     links: List[str]
 
 
+@dataclass
+class FolderSelection:
+    name: str
+    include_subfolders: bool = True
+
+
 class ImapConnection:
     """Context manager for IMAP operations."""
 
@@ -66,19 +72,27 @@ class ImapConnection:
 
 def fetch_calendar_candidates(
     settings: ImapSettings,
-    folders: Iterable[str],
+    folders: Iterable[FolderSelection | str],
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[CalendarCandidate]:
     """Collect calendar candidates from the configured folders."""
     candidates: List[CalendarCandidate] = []
 
     with ImapConnection(settings) as client:
-        for folder in folders:
-            logger.info("Scanning IMAP folder %s", folder)
-            client.select_folder(folder)
+        available = client.list_folders()
+        for folder_name in _expand_folders(folders, available):
+            logger.info("Scanning IMAP folder %s", folder_name)
+            try:
+                client.select_folder(folder_name)
+            except Exception:
+                logger.exception("Konnte IMAP Ordner %s nicht öffnen", folder_name)
+                continue
             message_ids = client.search("ALL")
             if not message_ids:
-                logger.debug("No messages found in folder %s", folder)
+                logger.debug("No messages found in folder %s", folder_name)
                 continue
+            if progress_callback is not None:
+                progress_callback(0, len(message_ids))
             for uid, message_data in client.fetch(message_ids, ["RFC822"]).items():
                 raw_message: bytes = message_data[b"RFC822"]
                 message: Message = email.message_from_bytes(raw_message)
@@ -87,11 +101,15 @@ def fetch_calendar_candidates(
                 for part in message.walk():
                     content_type = part.get_content_type()
                     filename = part.get_filename()
-                    if filename and filename.lower().endswith(".ics"):
+                    is_calendar_part = content_type == "text/calendar" or (
+                        filename and filename.lower().endswith(".ics")
+                    )
+                    if is_calendar_part:
                         payload = part.get_payload(decode=True) or b""
+                        attachment_name = filename or "calendar.ics"
                         attachments.append(
                             MailAttachment(
-                                filename=filename,
+                                filename=attachment_name,
                                 content_type=content_type,
                                 payload=payload,
                             )
@@ -99,17 +117,58 @@ def fetch_calendar_candidates(
                     if content_type == "text/plain":
                         payload_text = part.get_payload(decode=True) or b""
                         links.extend(extract_calendar_links(payload_text.decode(errors="ignore")))
+                if progress_callback is not None:
+                    progress_callback(1, 0)
                 candidates.append(
                     CalendarCandidate(
                         message_id=str(uid),
                         subject=message.get("Subject", "(no subject)"),
                         sender=message.get("From", "unknown"),
-                        folder=folder,
+                        folder=folder_name,
                         attachments=attachments,
                         links=links,
                     )
                 )
     return candidates
+
+
+def _expand_folders(
+    folders: Iterable[FolderSelection | str],
+    available: Sequence[tuple[Sequence[str], str, str]],
+) -> List[str]:
+    """Resolve folder selections into a concrete list of mailbox folders."""
+
+    normalized: List[FolderSelection] = []
+    for entry in folders:
+        if isinstance(entry, FolderSelection):
+            normalized.append(entry)
+        else:
+            normalized.append(FolderSelection(name=entry))
+
+    available_names = [(delim or "/", name) for _, delim, name in available]
+    resolved: List[str] = []
+    seen = set()
+
+    for selection in normalized:
+        base = selection.name
+        if base not in seen:
+            resolved.append(base)
+            seen.add(base)
+        if not selection.include_subfolders:
+            continue
+        matched_subfolders = False
+        for delim, candidate in available_names:
+            if candidate == base:
+                matched_subfolders = True
+                continue
+            prefix = f"{base}{delim}"
+            if candidate.startswith(prefix) and candidate not in seen:
+                resolved.append(candidate)
+                seen.add(candidate)
+                matched_subfolders = True
+        if not matched_subfolders and base not in {name for _, _, name in available}:
+            logger.warning("IMAP Ordner %s wurde nicht gefunden", base)
+    return resolved
 
 
 def extract_calendar_links(text: str) -> List[str]:

@@ -86,6 +86,8 @@ class TrackedEventRead(BaseModel):
     response_status: EventResponseStatus
     history: List[EventHistoryEntry] = Field(default_factory=list)
     conflicts: List[CalendarConflict] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -116,6 +118,8 @@ class SyncJobStatus(BaseModel):
     status: str
     processed: int = 0
     total: Optional[int] = None
+    detail: Optional[dict[str, Any]] = None
+    message: Optional[str] = None
 
 
 class SyncMappingBase(BaseModel):
@@ -149,5 +153,5 @@ class AutoSyncStatus(BaseModel):
 
 class AutoSyncRequest(BaseModel):
     enabled: bool
-    interval_minutes: int = 5
+    interval_minutes: int = Field(default=5, ge=1, le=720)
     auto_response: EventResponseStatus = EventResponseStatus.NONE
