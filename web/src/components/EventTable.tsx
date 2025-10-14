@@ -1,16 +1,18 @@
-import { ChangeEvent, KeyboardEvent, useEffect, useMemo, useState } from 'react';
+import { ChangeEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ManualSyncMissingDetail,
   ManualSyncRequest,
   ManualSyncResponse,
+  SyncJobStatus,
   TrackedEvent,
 } from '../types/api';
 
 interface Props {
   events: TrackedEvent[];
-  onManualSync: (payload: ManualSyncRequest) => Promise<ManualSyncResponse>;
-  onScan: () => Promise<void>;
-  onSyncAll: () => Promise<void>;
+  onManualSync: (payload: ManualSyncRequest) => Promise<SyncJobStatus>;
+  onScan: () => Promise<SyncJobStatus>;
+  onSyncAll: () => Promise<SyncJobStatus>;
+  fetchJobStatus: (jobId: string) => Promise<SyncJobStatus>;
   autoSyncEnabled: boolean;
   autoSyncIntervalMinutes: number;
   autoSyncResponse: TrackedEvent['response_status'];
@@ -22,6 +24,7 @@ interface Props {
     response: TrackedEvent['response_status'],
   ) => Promise<TrackedEvent>;
   loading?: boolean;
+  onRefresh: () => Promise<void>;
 }
 
 const statusLabelMap: Record<TrackedEvent['status'], string> = {
@@ -96,6 +99,7 @@ export default function EventTable({
   onManualSync,
   onScan,
   onSyncAll,
+  fetchJobStatus,
   autoSyncEnabled,
   autoSyncIntervalMinutes,
   autoSyncResponse,
@@ -104,6 +108,7 @@ export default function EventTable({
   onAutoSyncIntervalChange,
   onRespondToEvent,
   loading = false,
+  onRefresh,
 }: Props) {
   const [selected, setSelected] = useState<number[]>([]);
   const [openItems, setOpenItems] = useState<number[]>([]);
@@ -111,10 +116,22 @@ export default function EventTable({
   const [syncError, setSyncError] = useState<string | null>(null);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
   const [missing, setMissing] = useState<ManualSyncMissingDetail[]>([]);
+  const [scanJob, setScanJob] = useState<SyncJobStatus | null>(null);
+  const [syncAllJob, setSyncAllJob] = useState<SyncJobStatus | null>(null);
+  const [selectionJob, setSelectionJob] = useState<SyncJobStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [respondingId, setRespondingId] = useState<number | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
+  const pollersRef = useRef<Record<string, number>>({});
+
+  useEffect(() => {
+    return () => {
+      Object.values(pollersRef.current).forEach((id) => {
+        window.clearInterval(id);
+      });
+    };
+  }, []);
 
   // Remove selections for events that disappeared after refresh.
   useEffect(() => {
@@ -186,6 +203,170 @@ export default function EventTable({
     );
   }
 
+  function asNumber(value: unknown, fallback = 0): number {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === 'string') {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return fallback;
+  }
+
+  function clearPoller(key: string) {
+    const existing = pollersRef.current[key];
+    if (existing) {
+      window.clearInterval(existing);
+      delete pollersRef.current[key];
+    }
+  }
+
+  function trackJob(
+    key: 'scan' | 'syncAll' | 'selection',
+    initial: SyncJobStatus,
+    setter: (status: SyncJobStatus) => void,
+    onComplete?: (status: SyncJobStatus) => void,
+  ) {
+    setter(initial);
+    if (initial.status === 'completed' || initial.status === 'failed') {
+      onComplete?.(initial);
+      return;
+    }
+    clearPoller(key);
+    const poll = async () => {
+      try {
+        const next = await fetchJobStatus(initial.job_id);
+        setter(next);
+        if (next.status === 'completed' || next.status === 'failed') {
+          clearPoller(key);
+          onComplete?.(next);
+        }
+      } catch (error) {
+        clearPoller(key);
+        setBusy(false);
+        setSyncError('Fortschritt konnte nicht geladen werden.');
+      }
+    };
+    void poll();
+    pollersRef.current[key] = window.setInterval(() => {
+      void poll();
+    }, 1500);
+  }
+
+  function parseManualSyncDetail(
+    detail: SyncJobStatus['detail'] | null | undefined,
+  ): ManualSyncResponse | null {
+    if (!detail || typeof detail !== 'object') {
+      return null;
+    }
+    const record = detail as Record<string, unknown>;
+    const uploadedRaw = record.uploaded;
+    const missingRaw = record.missing;
+    const uploaded = Array.isArray(uploadedRaw)
+      ? uploadedRaw.map((item) => String(item))
+      : [];
+    const missingList: ManualSyncMissingDetail[] = Array.isArray(missingRaw)
+      ? missingRaw
+          .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+          .map((item) => {
+            const accountCandidate =
+              typeof item.account_id === 'number'
+                ? item.account_id
+                : typeof item.account_id === 'string' && item.account_id.trim() !== ''
+                ? Number(item.account_id)
+                : undefined;
+            return {
+              event_id: asNumber(item.event_id, 0),
+              uid: typeof item.uid === 'string' ? item.uid : undefined,
+              account_id:
+                typeof accountCandidate === 'number' && Number.isFinite(accountCandidate)
+                  ? accountCandidate
+                  : undefined,
+              folder: typeof item.folder === 'string' ? item.folder : undefined,
+              reason:
+                typeof item.reason === 'string' ? item.reason : 'Keine Zuordnung gefunden',
+            };
+          })
+      : [];
+
+    return {
+      uploaded,
+      missing: missingList,
+    };
+  }
+
+  function handleScanJobComplete(status: SyncJobStatus) {
+    setBusy(false);
+    setScanJob(null);
+    if (status.status === 'failed') {
+      setSyncError(status.message ?? 'Postfach-Scan fehlgeschlagen.');
+      return;
+    }
+    const detail = (status.detail ?? {}) as Record<string, unknown>;
+    const messages = asNumber(detail.messages_processed ?? status.processed, status.processed);
+    const eventsImported = asNumber(detail.events_imported ?? 0, 0);
+    setSyncNotice(
+      `Postfächer gescannt (${messages} Nachrichten geprüft, ${eventsImported} Termine verarbeitet).`,
+    );
+    setSyncError(null);
+    void onRefresh();
+  }
+
+  function handleManualJobComplete(status: SyncJobStatus) {
+    setBusy(false);
+    setSelectionJob(null);
+    if (status.status === 'failed') {
+      setSyncResult([]);
+      setMissing([]);
+      setSyncNotice(null);
+      setSyncError(status.message ?? 'Synchronisation fehlgeschlagen.');
+      return;
+    }
+    const detail = parseManualSyncDetail(status.detail);
+    const uploaded = detail?.uploaded ?? [];
+    const missingDetails = detail?.missing ?? [];
+    setSyncResult(uploaded);
+    setMissing(missingDetails);
+    if (missingDetails.length > 0) {
+      setSyncError('Für einige Termine existiert keine Sync-Zuordnung.');
+      setSelected(
+        missingDetails
+          .map((item) => item.event_id)
+          .filter((id) => Number.isFinite(id) && id > 0),
+      );
+      setSyncNotice(null);
+    } else if (uploaded.length === 0) {
+      setSyncError('Keine Termine konnten synchronisiert werden.');
+      setSyncNotice(null);
+    } else {
+      setSyncError(null);
+      setSyncNotice('Ausgewählte Termine wurden synchronisiert.');
+      setSelected([]);
+    }
+    void onRefresh();
+  }
+
+  function handleSyncAllJobComplete(status: SyncJobStatus) {
+    setBusy(false);
+    setSyncAllJob(null);
+    if (status.status === 'failed') {
+      setSyncError(status.message ?? 'Synchronisation fehlgeschlagen.');
+      return;
+    }
+    const detail = (status.detail ?? {}) as Record<string, unknown>;
+    const uploadedCount = asNumber(detail.uploaded ?? status.processed, status.processed);
+    if (uploadedCount > 0) {
+      setSyncNotice(`${uploadedCount} Termine wurden synchronisiert.`);
+    } else {
+      setSyncNotice('Alle Zuordnungen wurden synchronisiert, es gab keine Änderungen.');
+    }
+    setSyncError(null);
+    void onRefresh();
+  }
+
   async function handleSyncSelection() {
     if (selected.length === 0) {
       return;
@@ -194,66 +375,102 @@ export default function EventTable({
     setSyncError(null);
     setSyncNotice(null);
     setMissing([]);
+    setSyncResult([]);
     try {
       const payload: ManualSyncRequest = { event_ids: selected };
-      const result = await onManualSync(payload);
-      setSyncResult(result.uploaded);
-      setMissing(result.missing ?? []);
-      if (result.missing && result.missing.length > 0) {
-        setSyncError('Für einige Termine existiert keine Sync-Zuordnung.');
-        setSelected(result.missing.map((item) => item.event_id));
-      } else {
-        setSyncError(null);
-        setSelected([]);
-      }
-      if (result.uploaded.length > 0) {
-        setSyncNotice('Ausgewählte Termine wurden synchronisiert.');
-      } else if (!result.missing?.length) {
-        setSyncError('Keine Termine konnten synchronisiert werden.');
-      }
+      const job = await onManualSync(payload);
+      trackJob('selection', job, setSelectionJob, handleManualJobComplete);
     } catch (error: any) {
-      setSyncResult([]);
-      setSyncNotice(null);
       const detail = error?.response?.data?.detail;
       if (typeof detail === 'string') {
         setSyncError(detail);
       } else if (detail && typeof detail.message === 'string') {
         setSyncError(detail.message);
-        if (Array.isArray(detail.missing)) {
-          setMissing(
-            detail.missing.map((item: any) => ({
-              uid: item?.uid,
-              reason: item?.reason,
-              account_id: item?.account_id,
-              folder: item?.folder,
-              event_id: Number(item?.event_id ?? 0),
-            })),
-          );
-        }
       } else {
-        setSyncError('Synchronisation fehlgeschlagen.');
+        setSyncError('Synchronisation konnte nicht gestartet werden.');
       }
-    } finally {
       setBusy(false);
     }
   }
 
   async function handleSyncAll() {
     setBusy(true);
+    setSyncError(null);
+    setSyncNotice(null);
     try {
-      await onSyncAll();
-    } finally {
+      const job = await onSyncAll();
+      trackJob('syncAll', job, setSyncAllJob, handleSyncAllJobComplete);
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      setSyncError(
+        typeof detail === 'string'
+          ? detail
+          : 'Synchronisation aller Termine konnte nicht gestartet werden.',
+      );
       setBusy(false);
     }
   }
 
   async function handleScan() {
     setBusy(true);
+    setSyncError(null);
+    setSyncNotice(null);
     try {
-      await onScan();
-    } finally {
+      const job = await onScan();
+      trackJob('scan', job, setScanJob, handleScanJobComplete);
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      setSyncError(
+        typeof detail === 'string'
+          ? detail
+          : 'Postfach-Scan konnte nicht gestartet werden.',
+      );
       setBusy(false);
     }
+  }
+
+  function renderJobProgress(
+    job: SyncJobStatus | null,
+    label: string,
+    accentClass: string,
+  ) {
+    if (!job) {
+      return null;
+    }
+    const total = job.total ?? 0;
+    const processed = job.processed ?? 0;
+    const normalizedTotal = total > 0 ? total : 0;
+    const normalizedProcessed =
+      normalizedTotal > 0 ? Math.min(processed, normalizedTotal) : processed;
+    const percent =
+      normalizedTotal > 0
+        ? Math.min(100, Math.round((normalizedProcessed / normalizedTotal) * 100))
+        : job.status === 'completed'
+        ? 100
+        : 0;
+    const statusLabel =
+      job.status === 'failed'
+        ? 'Fehlgeschlagen'
+        : job.status === 'completed'
+        ? 'Abgeschlossen'
+        : 'Läuft…';
+    return (
+      <div className="rounded-lg border border-slate-800 bg-slate-950/80 p-4" key={label}>
+        <div className="flex items-center justify-between text-xs text-slate-300">
+          <span className="font-semibold text-slate-100">{label}</span>
+          <span>
+            {statusLabel}
+            {normalizedTotal > 0 ? ` · ${normalizedProcessed}/${normalizedTotal}` : ''}
+          </span>
+        </div>
+        <div className="mt-2 h-2 rounded-full bg-slate-800">
+          <div
+            className={`h-2 rounded-full transition-all ${accentClass}`}
+            style={{ width: `${percent}%` }}
+          />
+        </div>
+      </div>
+    );
   }
 
   async function handleAutoSyncToggle() {
@@ -486,6 +703,14 @@ export default function EventTable({
           </div>
         </div>
       </div>
+
+      {(scanJob || syncAllJob || selectionJob) && (
+        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+          {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
+          {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
+          {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
+        </div>
+      )}
 
       {syncError && (
         <div className="rounded-lg border border-rose-700 bg-rose-500/10 p-4 text-sm text-rose-200">

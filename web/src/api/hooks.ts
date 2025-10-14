@@ -9,9 +9,9 @@ import {
   ConnectionTestRequest,
   ConnectionTestResult,
   ManualSyncRequest,
-  ManualSyncResponse,
   SyncMapping,
   SyncMappingCreateInput,
+  SyncJobStatus,
   TrackedEvent,
 } from '../types/api';
 
@@ -91,19 +91,18 @@ export function useEvents() {
   }, []);
 
   async function scan() {
-    await api.post('/events/scan');
-    await refresh();
+    const { data } = await api.post<SyncJobStatus>('/events/scan');
+    return data;
   }
 
   async function manualSync(payload: ManualSyncRequest) {
-    const { data } = await api.post<ManualSyncResponse>('/events/manual-sync', payload);
-    await refresh();
+    const { data } = await api.post<SyncJobStatus>('/events/manual-sync', payload);
     return data;
   }
 
   async function syncAll() {
-    await api.post('/events/sync-all');
-    await refresh();
+    const { data } = await api.post<SyncJobStatus>('/events/sync-all');
+    return data;
   }
 
   async function configureAutoSync(config: {
@@ -136,6 +135,11 @@ export function useEvents() {
     await configureAutoSync({ enabled: autoSync.enabled, interval_minutes: intervalMinutes });
   }
 
+  async function getJobStatus(jobId: string) {
+    const { data } = await api.get<SyncJobStatus>(`/jobs/${jobId}`);
+    return data;
+  }
+
   async function respondToEvent(eventId: number, response: TrackedEvent['response_status']) {
     const { data } = await api.post<TrackedEvent>(`/events/${eventId}/response`, { response });
     setEvents((prev) => prev.map((event) => (event.id === eventId ? data : event)));
@@ -149,6 +153,7 @@ export function useEvents() {
     scan,
     manualSync,
     syncAll,
+    getJobStatus,
     autoSync,
     toggleAutoSync,
     setAutoResponse,

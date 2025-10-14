@@ -17,6 +17,8 @@ function App() {
     scan,
     manualSync,
     syncAll,
+    refresh,
+    getJobStatus,
     autoSync,
     toggleAutoSync,
     setAutoResponse,
@@ -109,6 +111,7 @@ function App() {
               onManualSync={manualSync}
               onScan={scan}
               onSyncAll={syncAll}
+              fetchJobStatus={getJobStatus}
               autoSyncEnabled={autoSync.enabled}
               autoSyncIntervalMinutes={autoSync.interval_minutes ?? 5}
               autoSyncResponse={autoSync.auto_response}
@@ -116,6 +119,7 @@ function App() {
               onAutoSyncResponseChange={setAutoResponse}
               onAutoSyncIntervalChange={setAutoSyncInterval}
               onRespondToEvent={respondToEvent}
+              onRefresh={refresh}
               loading={eventsLoading}
             />
           </div>

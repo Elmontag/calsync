@@ -116,6 +116,8 @@ class SyncJobStatus(BaseModel):
     status: str
     processed: int = 0
     total: Optional[int] = None
+    detail: Optional[dict[str, Any]] = None
+    message: Optional[str] = None
 
 
 class SyncMappingBase(BaseModel):

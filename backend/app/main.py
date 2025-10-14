@@ -4,9 +4,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -46,7 +46,8 @@ from .services.caldav_client import (
     find_conflicting_events,
     list_calendars,
 )
-from .services.imap_client import ImapSettings, fetch_calendar_candidates
+from .services.imap_client import FolderSelection, ImapSettings, fetch_calendar_candidates
+from .services.job_tracker import job_tracker
 from .services.scheduler import scheduler
 from .utils.ics_parser import merge_histories, parse_ics_payload
 
@@ -154,6 +155,249 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
                 "Konfliktprüfung für Mapping %s fehlgeschlagen", mapping.id
             )
             continue
+
+
+def _folder_selections(account: Account) -> List[FolderSelection]:
+    """Build the folder selection list for an IMAP account."""
+
+    selections = [
+        FolderSelection(name=folder.name, include_subfolders=folder.include_subfolders)
+        for folder in account.imap_folders
+    ]
+    if not selections:
+        selections.append(FolderSelection(name="INBOX"))
+    return selections
+
+
+def perform_mail_scan(
+    db: Session, progress_callback: Optional[Callable[[int, int], None]] = None
+) -> tuple[int, int]:
+    """Scan configured IMAP folders and store discovered events."""
+
+    accounts = (
+        db.execute(select(Account).where(Account.type == AccountType.IMAP)).scalars().all()
+    )
+    messages_processed = 0
+    events_imported = 0
+
+    for account in accounts:
+        try:
+            settings = ImapSettings(**account.settings)
+        except TypeError:
+            logger.exception("Ungültige IMAP Einstellungen für Konto %s", account.id)
+            continue
+
+        folder_configs = _folder_selections(account)
+
+        def folder_progress(processed_delta: int, total_delta: int) -> None:
+            if progress_callback is not None:
+                progress_callback(processed_delta, total_delta)
+
+        candidates = fetch_calendar_candidates(
+            settings, folder_configs, progress_callback=folder_progress
+        )
+        for candidate in candidates:
+            messages_processed += 1
+            for attachment in candidate.attachments:
+                parsed_events = parse_ics_payload(attachment.payload)
+                stored = event_processor.upsert_events(
+                    parsed_events,
+                    candidate.message_id,
+                    source_account_id=account.id,
+                    source_folder=candidate.folder,
+                )
+                events_imported += len(stored)
+
+    return messages_processed, events_imported
+
+
+def _execute_scan_job(job_id: str) -> None:
+    """Background execution for mailbox scans with progress updates."""
+
+    logger.info("Starting mailbox scan job %s", job_id)
+    job_tracker.update(job_id, status="running", processed=0, total=0)
+
+    try:
+        with SessionLocal() as session:
+            def progress(processed_delta: int, total_delta: int) -> None:
+                if total_delta:
+                    job_tracker.increment(job_id, total_delta=total_delta)
+                if processed_delta:
+                    job_tracker.increment(job_id, processed_delta=processed_delta)
+
+            messages, events = perform_mail_scan(session, progress_callback=progress)
+
+        job_tracker.update(job_id, processed=messages)
+        job_tracker.finish(
+            job_id,
+            detail={
+                "messages_processed": messages,
+                "events_imported": events,
+            },
+        )
+    except Exception:
+        logger.exception("Mailbox scan job %s failed", job_id)
+        job_tracker.fail(job_id, "Postfach-Scan fehlgeschlagen.")
+
+
+def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
+    """Background execution for manual sync requests."""
+
+    logger.info("Starting manual sync job %s", job_id)
+    total = len(event_ids)
+    job_tracker.update(job_id, status="running", processed=0, total=total)
+
+    processed = 0
+    missing: List[ManualSyncMissingDetail] = []
+    uploaded: List[str] = []
+
+    try:
+        if total == 0:
+            result = ManualSyncResponse(uploaded=[], missing=[])
+            job_tracker.finish(job_id, detail=result.model_dump())
+            return
+
+        with SessionLocal() as session:
+            events = (
+                session.execute(
+                    select(TrackedEvent).where(TrackedEvent.id.in_(event_ids))
+                )
+                .scalars()
+                .all()
+            )
+
+            if not events:
+                job_tracker.fail(job_id, "Keine passenden Termine gefunden")
+                return
+
+            sync_groups: Dict[int, Dict[str, Any]] = {}
+
+            for event in events:
+                if event.source_account_id is None or not event.source_folder:
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason="Keine Quellinformationen vorhanden",
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(job_id, processed=processed)
+                    continue
+
+                mapping = (
+                    session.execute(
+                        select(SyncMapping)
+                        .where(SyncMapping.imap_account_id == event.source_account_id)
+                        .where(SyncMapping.imap_folder == event.source_folder)
+                    )
+                    .scalars()
+                    .first()
+                )
+
+                if mapping is None:
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason="Keine Sync-Zuordnung für Konto und Ordner",
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(job_id, processed=processed)
+                    continue
+
+                caldav_account = session.get(Account, mapping.caldav_account_id)
+                if caldav_account is None or caldav_account.type != AccountType.CALDAV:
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason="Zugeordnetes CalDAV-Konto nicht gefunden",
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(job_id, processed=processed)
+                    continue
+
+                try:
+                    settings = CalDavSettings(**caldav_account.settings)
+                except TypeError as exc:
+                    logger.exception(
+                        "CalDAV settings invalid for account %s", caldav_account.id
+                    )
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason=f"Ungültige CalDAV Einstellungen: {exc}",
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(job_id, processed=processed)
+                    continue
+
+                group = sync_groups.setdefault(
+                    mapping.id,
+                    {"events": [], "mapping": mapping, "settings": settings},
+                )
+                group["events"].append(event)
+
+            def progress(event: TrackedEvent, success: bool) -> None:
+                nonlocal processed
+                processed += 1
+                job_tracker.update(job_id, processed=processed)
+
+            for group in sync_groups.values():
+                mapping: SyncMapping = group["mapping"]
+                settings: CalDavSettings = group["settings"]
+                events_for_mapping: List[TrackedEvent] = group["events"]
+                uploaded.extend(
+                    event_processor.sync_events_to_calendar(
+                        events_for_mapping,
+                        mapping.calendar_url,
+                        settings,
+                        progress_callback=progress,
+                    )
+                )
+
+        result = ManualSyncResponse(uploaded=uploaded, missing=missing)
+        job_tracker.finish(job_id, detail=result.model_dump())
+    except Exception:
+        logger.exception("Manual sync job %s failed", job_id)
+        job_tracker.fail(job_id, "Synchronisation fehlgeschlagen.")
+
+
+def _execute_sync_all_job(job_id: str) -> None:
+    """Background execution for syncing all pending events."""
+
+    logger.info("Starting sync-all job %s", job_id)
+    job_tracker.update(job_id, status="running", processed=0, total=0)
+    processed = 0
+
+    def progress(processed_delta: int, total_delta: int) -> None:
+        nonlocal processed
+        if total_delta:
+            job_tracker.increment(job_id, total_delta=total_delta)
+        if processed_delta:
+            processed += processed_delta
+            job_tracker.update(job_id, processed=processed)
+
+    try:
+        with SessionLocal() as session:
+            uploaded = perform_sync_all(session, progress_callback=progress)
+        job_tracker.finish(job_id, detail={"uploaded": uploaded})
+    except Exception:
+        logger.exception("Sync-all job %s failed", job_id)
+        job_tracker.fail(job_id, "Synchronisation fehlgeschlagen.")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -317,125 +561,30 @@ def list_events(db: Session = Depends(get_db)):
 
 
 @app.post("/events/scan", response_model=SyncJobStatus)
-def scan_mailboxes(db: Session = Depends(get_db)):
-    accounts = db.execute(select(Account).where(Account.type == AccountType.IMAP)).scalars().all()
-    total_processed = 0
-    for account in accounts:
-        folders = [folder.name for folder in account.imap_folders] or ["INBOX"]
-        settings = ImapSettings(**account.settings)
-        candidates = fetch_calendar_candidates(settings, folders)
-        for candidate in candidates:
-            for attachment in candidate.attachments:
-                parsed_events = parse_ics_payload(attachment.payload)
-                stored = event_processor.upsert_events(
-                    parsed_events,
-                    candidate.message_id,
-                    source_account_id=account.id,
-                    source_folder=candidate.folder,
-                )
-                total_processed += len(stored)
-    return SyncJobStatus(job_id="manual-scan", status="completed", processed=total_processed)
+def scan_mailboxes(background_tasks: BackgroundTasks):
+    state = job_tracker.create("scan", total=0)
+    job_tracker.update(state.job_id, status="running", processed=0, total=0)
+    background_tasks.add_task(_execute_scan_job, state.job_id)
+    return state.to_status()
 
 
-@app.post("/events/manual-sync", response_model=ManualSyncResponse)
-def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db)) -> ManualSyncResponse:
+@app.post("/events/manual-sync", response_model=SyncJobStatus)
+def manual_sync(
+    payload: ManualSyncRequest, background_tasks: BackgroundTasks
+) -> SyncJobStatus:
+    state = job_tracker.create("manual-sync", total=len(payload.event_ids))
     if not payload.event_ids:
-        return ManualSyncResponse(uploaded=[])
+        job_tracker.finish(state.job_id, detail=ManualSyncResponse(uploaded=[], missing=[]).model_dump())
+        return state.to_status()
 
-    events = (
-        db.execute(select(TrackedEvent).where(TrackedEvent.id.in_(payload.event_ids)))
-        .scalars()
-        .all()
+    job_tracker.update(
+        state.job_id,
+        status="running",
+        processed=0,
+        total=len(payload.event_ids),
     )
-    if not events:
-        raise HTTPException(status_code=404, detail="Keine passenden Termine gefunden")
-
-    missing_events: list[ManualSyncMissingDetail] = []
-    sync_groups: Dict[int, Dict[str, Any]] = {}
-
-    for event in events:
-        if event.source_account_id is None or not event.source_folder:
-            missing_events.append(
-                ManualSyncMissingDetail(
-                    event_id=event.id,
-                    uid=event.uid,
-                    reason="Keine Quellinformationen vorhanden",
-                )
-            )
-            continue
-
-        mapping = (
-            db.execute(
-                select(SyncMapping)
-                .where(SyncMapping.imap_account_id == event.source_account_id)
-                .where(SyncMapping.imap_folder == event.source_folder)
-            )
-            .scalars()
-            .first()
-        )
-        if mapping is None:
-            missing_events.append(
-                ManualSyncMissingDetail(
-                    event_id=event.id,
-                    uid=event.uid,
-                    account_id=event.source_account_id,
-                    folder=event.source_folder,
-                    reason="Keine Sync-Zuordnung für Konto und Ordner",
-                )
-            )
-            continue
-
-        caldav_account = db.get(Account, mapping.caldav_account_id)
-        if caldav_account is None or caldav_account.type != AccountType.CALDAV:
-            missing_events.append(
-                ManualSyncMissingDetail(
-                    event_id=event.id,
-                    uid=event.uid,
-                    account_id=event.source_account_id,
-                    folder=event.source_folder,
-                    reason="Zugeordnetes CalDAV-Konto nicht gefunden",
-                )
-            )
-            continue
-
-        try:
-            settings = CalDavSettings(**caldav_account.settings)
-        except TypeError as exc:
-            logger.exception("CalDAV settings invalid for account %s", caldav_account.id)
-            missing_events.append(
-                ManualSyncMissingDetail(
-                    event_id=event.id,
-                    uid=event.uid,
-                    account_id=event.source_account_id,
-                    folder=event.source_folder,
-                    reason=f"Ungültige CalDAV Einstellungen: {exc}",
-                )
-            )
-            continue
-
-        group = sync_groups.setdefault(
-            mapping.id,
-            {"events": [], "mapping": mapping, "settings": settings},
-        )
-        group["events"].append(event)
-
-    if missing_events:
-        logger.warning("Manual sync completed with missing mappings: %s", missing_events)
-
-    uploaded: list[str] = []
-    for group in sync_groups.values():
-        mapping: SyncMapping = group["mapping"]
-        settings: CalDavSettings = group["settings"]
-        events_for_mapping: List[TrackedEvent] = group["events"]
-        uploaded.extend(
-            event_processor.sync_events_to_calendar(
-                events_for_mapping,
-                mapping.calendar_url,
-                settings,
-            )
-        )
-
-    return ManualSyncResponse(uploaded=uploaded, missing=missing_events)
+    background_tasks.add_task(_execute_manual_sync_job, state.job_id, payload.event_ids)
+    return state.to_status()
 
 
 @app.post("/events/{event_id}/response", response_model=TrackedEventRead)
@@ -528,7 +677,11 @@ def schedule_sync(minutes: int = 5, db: Session = Depends(get_db)) -> SyncJobSta
     return SyncJobStatus(job_id=AUTO_SYNC_JOB_ID, status="scheduled", total=minutes)
 
 
-def perform_sync_all(db: Session, apply_auto_response: bool = False) -> int:
+def perform_sync_all(
+    db: Session,
+    apply_auto_response: bool = False,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> int:
     """Synchronize all pending events based on the configured mappings."""
     total_uploaded = 0
     mappings = db.execute(select(SyncMapping)).scalars().all()
@@ -546,8 +699,17 @@ def perform_sync_all(db: Session, apply_auto_response: bool = False) -> int:
         ).scalars().all()
         if not events:
             continue
+        if progress_callback is not None:
+            progress_callback(0, len(events))
         uploaded_uids = event_processor.sync_events_to_calendar(
-            events, mapping.calendar_url, settings
+            events,
+            mapping.calendar_url,
+            settings,
+            progress_callback=(
+                (lambda event, success: progress_callback(1, 0))
+                if progress_callback is not None
+                else None
+            ),
         )
         total_uploaded += len(uploaded_uids)
         if (
@@ -589,9 +751,19 @@ def perform_sync_all(db: Session, apply_auto_response: bool = False) -> int:
 
 
 @app.post("/events/sync-all", response_model=SyncJobStatus)
-def sync_all_events(db: Session = Depends(get_db)) -> SyncJobStatus:
-    processed = perform_sync_all(db)
-    return SyncJobStatus(job_id="manual-sync-all", status="completed", processed=processed)
+def sync_all_events(background_tasks: BackgroundTasks) -> SyncJobStatus:
+    state = job_tracker.create("sync-all", total=0)
+    job_tracker.update(state.job_id, status="running", processed=0, total=0)
+    background_tasks.add_task(_execute_sync_all_job, state.job_id)
+    return state.to_status()
+
+
+@app.get("/jobs/{job_id}", response_model=SyncJobStatus)
+def get_job_status(job_id: str) -> SyncJobStatus:
+    state = job_tracker.get(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+    return state.to_status()
 
 
 @app.get("/events/auto-sync", response_model=AutoSyncStatus)
@@ -607,7 +779,7 @@ def auto_sync_status() -> AutoSyncStatus:
 def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db)) -> AutoSyncStatus:
     def job():
         with SessionLocal() as job_db:
-            scan_mailboxes(job_db)
+            perform_mail_scan(job_db)
             perform_sync_all(job_db, apply_auto_response=True)
 
     auto_response = payload.auto_response

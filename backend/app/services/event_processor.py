@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 from sqlalchemy import select
 
@@ -33,6 +33,10 @@ def upsert_events(
                 "action": parsed.status.value,
                 "description": f"Event processed from message {source_message_id}",
             }
+            if parsed.response_status is not None:
+                history_entry["description"] = (
+                    f"{history_entry['description']} · Antwort: {parsed.response_status.value}"
+                )
             if event is None:
                 event = TrackedEvent(
                     uid=parsed.uid,
@@ -43,11 +47,13 @@ def upsert_events(
                     start=parsed.start,
                     end=parsed.end,
                     status=parsed.status,
-                    response_status=EventResponseStatus.NONE,
+                    response_status=parsed.response_status or EventResponseStatus.NONE,
                     mailbox_message_id=source_message_id,
                     payload=parsed.event.to_ical().decode(),
                     history=[history_entry],
                 )
+                if parsed.response_status is not None:
+                    annotate_response(event)
                 session.add(event)
                 logger.info("Stored new event %s", parsed.uid)
             else:
@@ -59,6 +65,9 @@ def upsert_events(
                 event.status = parsed.status if parsed.status != EventStatus.NEW else EventStatus.UPDATED
                 event.source_account_id = source_account_id or event.source_account_id
                 event.source_folder = source_folder or event.source_folder
+                if parsed.response_status is not None:
+                    event.response_status = parsed.response_status
+                    annotate_response(event)
                 event.history = merge_histories(event.history or [], history_entry)
                 event.updated_at = datetime.utcnow()
                 logger.info("Updated event %s", parsed.uid)
@@ -92,6 +101,7 @@ def sync_events_to_calendar(
     events: Iterable[TrackedEvent],
     calendar_url: str,
     settings: CalDavSettings,
+    progress_callback: Optional[Callable[[TrackedEvent, bool], None]] = None,
 ) -> List[str]:
     """Upload a batch of events to the configured CalDAV calendar."""
     uploaded_uids: List[str] = []
@@ -102,14 +112,21 @@ def sync_events_to_calendar(
         if event.status == EventStatus.CANCELLED:
             removed = delete_event_by_uid(calendar_url, event.uid, settings)
             cancellation_results[event.id] = removed
+            if progress_callback is not None:
+                progress_callback(event, removed)
             continue
+        success = False
         try:
             upload_ical(calendar_url, event_payload_to_ical(event), settings)
             uploaded_uids.append(event.uid)
             successfully_uploaded.append(event)
+            success = True
         except Exception:
             logger.exception("Failed to upload event %s", event.uid)
             continue
+        finally:
+            if progress_callback is not None:
+                progress_callback(event, success)
     if successfully_uploaded:
         mark_as_synced(successfully_uploaded)
     elif not cancellation_results:

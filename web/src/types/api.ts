@@ -80,6 +80,15 @@ export interface ManualSyncResponse {
   missing: ManualSyncMissingDetail[];
 }
 
+export interface SyncJobStatus {
+  job_id: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  processed: number;
+  total?: number | null;
+  detail?: Record<string, unknown> | null;
+  message?: string | null;
+}
+
 export interface SyncMapping {
   id: number;
   imap_account_id: number;
