@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sys
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
+from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:  # pragma: no cover - test bootstrap code
     sys.path.insert(0, str(ROOT))
 
 from backend.app.database import Base, SessionLocal, engine
-from backend.app.main import list_events
+from backend.app.main import app, list_events
 from backend.app.models import (
     Account,
     AccountType,
@@ -22,6 +24,7 @@ from backend.app.models import (
     SyncMapping,
     TrackedEvent,
 )
+from sqlalchemy import select
 
 
 @pytest.fixture(autouse=True)
@@ -154,3 +157,65 @@ def test_list_events_survives_conflict_lookup_failure(monkeypatch: pytest.Monkey
 
     assert [event.uid for event in events] == ["uid-err"]
     assert getattr(events[0], "conflicts", []) == []
+
+
+def test_events_endpoint_handles_multiple_folders_with_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The API returns all events when conflict detection runs across multiple folders."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    session.add_all(
+        [
+            SyncMapping(
+                imap_account_id=imap.id,
+                imap_folder="INBOX",
+                caldav_account_id=caldav.id,
+                calendar_url="https://cal.example.com/shared",
+            ),
+            SyncMapping(
+                imap_account_id=imap.id,
+                imap_folder="Team",
+                caldav_account_id=caldav.id,
+                calendar_url="https://cal.example.com/team",
+            ),
+        ]
+    )
+    session.commit()
+
+    _store_event(session, uid="uid-1", account=imap, folder="INBOX")
+    _store_event(session, uid="uid-2", account=imap, folder="Team")
+
+    # Force legacy payload cleanup during the request to reproduce the regression conditions.
+    legacy_event = session.execute(
+        select(TrackedEvent).where(TrackedEvent.uid == "uid-1")
+    ).scalar_one()
+    legacy_event.history = json.dumps({"broken": True})
+    session.commit()
+    session.close()
+
+    def _conflicts(_: Any, __: datetime, ___: datetime, exclude_uid: str | None = None):
+        if exclude_uid == "uid-1":
+            return [
+                {
+                    "uid": "conflict-1",
+                    "summary": "Überschneidung",
+                    "start": datetime.now(tz=timezone.utc).isoformat(),
+                    "end": (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat(),
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("backend.app.main.CalDavConnection", lambda settings: _FakeConnection())
+    monkeypatch.setattr("backend.app.main.find_conflicting_events", _conflicts)
+
+    client = TestClient(app)
+    response = client.get("/events")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert {event["uid"] for event in payload} == {"uid-1", "uid-2"}
+    mapped = {event["uid"]: event for event in payload}
+    assert mapped["uid-1"]["conflicts"][0]["uid"] == "conflict-1"
+    assert mapped["uid-2"]["conflicts"] == []
