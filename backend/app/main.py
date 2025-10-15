@@ -6,11 +6,12 @@ import json
 from datetime import datetime, timedelta, timezone
 from json import JSONDecodeError
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from .database import Base, SessionLocal, apply_schema_upgrades, engine
@@ -70,6 +71,21 @@ auto_sync_preferences: Dict[str, Any] = {
     "auto_response": EventResponseStatus.NONE,
     "interval_minutes": 5,
 }
+_auto_sync_state: Dict[str, Optional[str]] = {"job_id": None}
+_auto_sync_lock = Lock()
+
+
+def _active_auto_sync_job() -> Optional[SyncJobStatus]:
+    """Return the status of the currently running auto-sync job, if any."""
+
+    with _auto_sync_lock:
+        job_id = _auto_sync_state.get("job_id")
+    if not job_id:
+        return None
+    state = job_tracker.get(job_id)
+    if state is None:
+        return None
+    return state.to_status()
 
 
 def _ensure_timezone(value: Optional[datetime]) -> Optional[datetime]:
@@ -826,7 +842,18 @@ def perform_sync_all(
             select(TrackedEvent)
             .where(TrackedEvent.source_account_id == mapping.imap_account_id)
             .where(TrackedEvent.source_folder == mapping.imap_folder)
-            .where(TrackedEvent.status != EventStatus.SYNCED)
+            .where(
+                or_(
+                    TrackedEvent.status.in_([EventStatus.NEW, EventStatus.UPDATED]),
+                    and_(
+                        TrackedEvent.status == EventStatus.CANCELLED,
+                        or_(
+                            TrackedEvent.cancelled_by_organizer.is_(None),
+                            TrackedEvent.cancelled_by_organizer.is_(True),
+                        ),
+                    ),
+                )
+            )
         ).scalars().all()
         if not events:
             continue
@@ -903,15 +930,57 @@ def auto_sync_status() -> AutoSyncStatus:
         enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID),
         interval_minutes=auto_sync_preferences.get("interval_minutes", 5),
         auto_response=auto_sync_preferences.get("auto_response", EventResponseStatus.NONE),
+        active_job=_active_auto_sync_job(),
     )
 
 
 @app.post("/events/auto-sync", response_model=AutoSyncStatus)
 def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db)) -> AutoSyncStatus:
     def job():
-        with SessionLocal() as job_db:
-            perform_mail_scan(job_db)
-            perform_sync_all(job_db, apply_auto_response=True)
+        with _auto_sync_lock:
+            if _auto_sync_state.get("job_id"):
+                logger.info("Auto sync job already running, skipping invocation")
+                return
+            state = job_tracker.create(AUTO_SYNC_JOB_ID, total=0)
+            _auto_sync_state["job_id"] = state.job_id
+        job_tracker.update(state.job_id, status="running", processed=0, total=0)
+
+        try:
+            with SessionLocal() as job_db:
+                def scan_progress(processed_delta: int, total_delta: int) -> None:
+                    if total_delta:
+                        job_tracker.increment(state.job_id, total_delta=total_delta)
+                    if processed_delta:
+                        job_tracker.increment(state.job_id, processed_delta=processed_delta)
+
+                messages, events = perform_mail_scan(job_db, progress_callback=scan_progress)
+
+                def sync_progress(processed_delta: int, total_delta: int) -> None:
+                    if total_delta:
+                        job_tracker.increment(state.job_id, total_delta=total_delta)
+                    if processed_delta:
+                        job_tracker.increment(state.job_id, processed_delta=processed_delta)
+
+                uploaded = perform_sync_all(
+                    job_db,
+                    apply_auto_response=True,
+                    progress_callback=sync_progress,
+                )
+
+            job_tracker.finish(
+                state.job_id,
+                detail={
+                    "messages_processed": messages,
+                    "events_imported": events,
+                    "uploaded": uploaded,
+                },
+            )
+        except Exception:
+            logger.exception("Auto sync job %s failed", state.job_id)
+            job_tracker.fail(state.job_id, "AutoSync fehlgeschlagen.")
+        finally:
+            with _auto_sync_lock:
+                _auto_sync_state["job_id"] = None
 
     auto_response = payload.auto_response
     if auto_response not in (EventResponseStatus.NONE, EventResponseStatus.ACCEPTED):
@@ -944,6 +1013,7 @@ def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db))
         enabled=scheduler.is_job_active(AUTO_SYNC_JOB_ID),
         interval_minutes=auto_sync_preferences.get("interval_minutes", 5),
         auto_response=auto_sync_preferences.get("auto_response", EventResponseStatus.NONE),
+        active_job=_active_auto_sync_job(),
     )
 
 

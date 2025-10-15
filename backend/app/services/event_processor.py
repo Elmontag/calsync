@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional
 
 from sqlalchemy import select
@@ -25,6 +25,9 @@ def upsert_events(
     stored_events: List[TrackedEvent] = []
     with session_scope() as session:
         for parsed in parsed_events:
+            cancelled_by_organizer: Optional[bool] = None
+            if parsed.status == EventStatus.CANCELLED:
+                cancelled_by_organizer = (parsed.method or "").upper() == "CANCEL"
             event: TrackedEvent | None = session.execute(
                 select(TrackedEvent).where(TrackedEvent.uid == parsed.uid)
             ).scalar_one_or_none()
@@ -48,6 +51,7 @@ def upsert_events(
                     end=parsed.end,
                     status=parsed.status,
                     response_status=parsed.response_status or EventResponseStatus.NONE,
+                    cancelled_by_organizer=cancelled_by_organizer,
                     mailbox_message_id=source_message_id,
                     payload=parsed.event.to_ical().decode(),
                     history=[history_entry],
@@ -57,20 +61,92 @@ def upsert_events(
                 session.add(event)
                 logger.info("Stored new event %s", parsed.uid)
             else:
-                event.summary = parsed.summary
-                event.organizer = parsed.organizer
-                event.start = parsed.start
-                event.end = parsed.end
-                event.payload = parsed.event.to_ical().decode()
-                event.status = parsed.status if parsed.status != EventStatus.NEW else EventStatus.UPDATED
-                event.source_account_id = source_account_id or event.source_account_id
-                event.source_folder = source_folder or event.source_folder
-                if parsed.response_status is not None:
+                new_payload = parsed.event.to_ical().decode()
+                previous_status = event.status
+                content_changed = False
+                metadata_changed = False
+                response_changed = False
+
+                def _normalize_datetime(value: datetime) -> datetime:
+                    if value.tzinfo is not None:
+                        return value.astimezone(timezone.utc).replace(tzinfo=None)
+                    return value
+
+                def _update(attr: str, value, *, track_content: bool = True) -> None:
+                    nonlocal content_changed, metadata_changed
+                    current = getattr(event, attr)
+                    new_value = value
+                    if isinstance(current, datetime) and isinstance(value, datetime):
+                        current_normalized = _normalize_datetime(current)
+                        new_normalized = _normalize_datetime(value)
+                        if current_normalized == new_normalized:
+                            return
+                        new_value = new_normalized
+                    elif isinstance(value, datetime) and current is None:
+                        new_value = _normalize_datetime(value)
+                    if current == new_value:
+                        return
+                    setattr(event, attr, new_value)
+                    if track_content:
+                        content_changed = True
+                    else:
+                        metadata_changed = True
+
+                _update("summary", parsed.summary)
+                _update("organizer", parsed.organizer)
+                _update("start", parsed.start)
+                _update("end", parsed.end)
+                _update("payload", new_payload)
+
+                reopened = previous_status == EventStatus.CANCELLED and parsed.status != EventStatus.CANCELLED
+                if reopened:
+                    content_changed = True
+
+                if parsed.status == EventStatus.CANCELLED:
+                    _update("cancelled_by_organizer", cancelled_by_organizer)
+                else:
+                    _update("cancelled_by_organizer", None)
+
+                if source_account_id is not None:
+                    _update("source_account_id", source_account_id, track_content=False)
+                if source_folder is not None:
+                    _update("source_folder", source_folder, track_content=False)
+                _update("mailbox_message_id", source_message_id, track_content=False)
+
+                if parsed.response_status is not None and parsed.response_status != event.response_status:
                     event.response_status = parsed.response_status
                     annotate_response(event)
-                event.history = merge_histories(event.history or [], history_entry)
-                event.updated_at = datetime.utcnow()
-                logger.info("Updated event %s", parsed.uid)
+                    content_changed = True
+                    response_changed = True
+
+                status_changed = False
+                if parsed.status == EventStatus.CANCELLED:
+                    if event.status != EventStatus.CANCELLED:
+                        event.status = EventStatus.CANCELLED
+                        status_changed = True
+                else:
+                    if content_changed and event.status != EventStatus.NEW:
+                        if event.status != EventStatus.UPDATED:
+                            event.status = EventStatus.UPDATED
+                            status_changed = True
+                    elif reopened:
+                        if event.status != EventStatus.UPDATED:
+                            event.status = EventStatus.UPDATED
+                            status_changed = True
+
+                should_append_history = content_changed or status_changed or response_changed
+                if should_append_history:
+                    event.history = merge_histories(event.history or [], history_entry)
+                if content_changed or metadata_changed or status_changed:
+                    event.updated_at = datetime.utcnow()
+                    session.add(event)
+
+                if content_changed or status_changed or response_changed:
+                    logger.info("Updated event %s", parsed.uid)
+                elif metadata_changed:
+                    logger.debug("Updated metadata for event %s without content changes", parsed.uid)
+                else:
+                    logger.debug("No changes detected for event %s", parsed.uid)
             stored_events.append(event)
     return stored_events
 
@@ -108,8 +184,18 @@ def sync_events_to_calendar(
     events_list = list(events)
     successfully_uploaded: List[TrackedEvent] = []
     cancellation_results: Dict[int, bool] = {}
+    ignored_cancellations: List[TrackedEvent] = []
     for event in events_list:
         if event.status == EventStatus.CANCELLED:
+            if getattr(event, "cancelled_by_organizer", None) is False:
+                logger.info(
+                    "Skipping calendar removal for %s because cancellation was not initiated by the organizer",
+                    event.uid,
+                )
+                ignored_cancellations.append(event)
+                if progress_callback is not None:
+                    progress_callback(event, True)
+                continue
             removed = delete_event_by_uid(calendar_url, event.uid, settings)
             cancellation_results[event.id] = removed
             if progress_callback is not None:
@@ -133,6 +219,8 @@ def sync_events_to_calendar(
         logger.warning("No events could be synced to %s", calendar_url)
     if cancellation_results:
         mark_as_cancelled(cancellation_results)
+    if ignored_cancellations:
+        mark_cancellations_ignored(ignored_cancellations)
     return uploaded_uids
 
 
@@ -180,3 +268,27 @@ def mark_as_cancelled(results: Dict[int, bool]) -> None:
             )
             session.add(event)
     logger.info("Processed %s cancellation updates", len(results))
+
+
+def mark_cancellations_ignored(events: Iterable[TrackedEvent]) -> None:
+    """Record ignored cancellation requests triggered by attendees."""
+
+    events_list = list(events)
+    if not events_list:
+        return
+    with session_scope() as session:
+        for event in events_list:
+            db_event = session.get(TrackedEvent, event.id)
+            if db_event is None:
+                continue
+            db_event.last_synced = datetime.utcnow()
+            db_event.history = merge_histories(
+                db_event.history or [],
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "action": EventStatus.CANCELLED.value,
+                    "description": "Absage ignoriert (nicht vom Ersteller)",
+                },
+            )
+            session.add(db_event)
+    logger.info("Ignored %s attendee cancellations", len(events_list))

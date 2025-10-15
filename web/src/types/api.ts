@@ -112,6 +112,7 @@ export interface AutoSyncStatus {
   enabled: boolean;
   interval_minutes?: number;
   auto_response: 'none' | 'accepted' | 'tentative' | 'declined';
+  active_job?: SyncJobStatus | null;
 }
 
 export interface CalendarInfo {

@@ -24,6 +24,7 @@ function App() {
     setAutoResponse,
     setAutoSyncInterval,
     respondToEvent,
+    loadAutoSync,
   } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -120,6 +121,8 @@ function App() {
               onAutoSyncIntervalChange={setAutoSyncInterval}
               onRespondToEvent={respondToEvent}
               onRefresh={refresh}
+              autoSyncJob={autoSync.active_job ?? null}
+              onLoadAutoSync={loadAutoSync}
               loading={eventsLoading}
             />
           </div>

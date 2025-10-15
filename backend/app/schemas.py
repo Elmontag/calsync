@@ -149,6 +149,7 @@ class AutoSyncStatus(BaseModel):
     enabled: bool
     interval_minutes: Optional[int] = None
     auto_response: EventResponseStatus = EventResponseStatus.NONE
+    active_job: Optional[SyncJobStatus] = None
 
 
 class AutoSyncRequest(BaseModel):
