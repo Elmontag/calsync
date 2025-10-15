@@ -5,6 +5,7 @@ import {
   ManualSyncResponse,
   SyncJobStatus,
   ConflictDifference,
+  ConflictResolutionOption,
   TrackedEvent,
 } from '../types/api';
 
@@ -144,8 +145,8 @@ function formatSyncTimestamp(value?: string | null) {
 }
 
 const syncSourceLabels: Record<string, string> = {
-  local: 'Lokal',
-  remote: 'CalDAV',
+  local: 'E-Mail-Import',
+  remote: 'Kalenderdaten',
 };
 
 function parseIsoDate(value?: string | null): Date | null {
@@ -242,6 +243,7 @@ export default function EventTable({
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
   const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
+  const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
   const pollersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -881,6 +883,28 @@ export default function EventTable({
     }
   }
 
+  function toggleDifferences(eventId: number) {
+    setExpandedDifferences((prev) => ({
+      ...prev,
+      [eventId]: !prev[eventId],
+    }));
+  }
+
+  function handleSuggestionClick(
+    event: TrackedEvent,
+    suggestion: ConflictResolutionOption,
+  ) {
+    if (suggestion.action === 'disable-tracking') {
+      void handleDisableTracking(event);
+      return;
+    }
+
+    setExpandedDifferences((prev) => ({
+      ...prev,
+      [event.id]: true,
+    }));
+  }
+
   const showInitialLoading = loading && events.length === 0;
   const showEmptyState = !loading && filteredEvents.length === 0;
 
@@ -1139,6 +1163,7 @@ export default function EventTable({
             const hasSyncConflict = syncState?.has_conflict ?? false;
             const differences = syncState?.conflict_details?.differences ?? [];
             const suggestions = syncState?.conflict_details?.suggestions ?? [];
+            const differencesExpanded = expandedDifferences[event.id] ?? false;
             const isSelectable = !hasSyncConflict;
             const historyEntries = sortHistoryEntries(event.history ?? []);
             return (
@@ -1257,36 +1282,50 @@ export default function EventTable({
                           <p className="text-sm font-semibold text-rose-200">Synchronisationskonflikt</p>
                           <p className="mt-1 text-rose-100/80">
                             {syncState?.conflict_reason ??
-                              'Server- und lokale Version unterscheiden sich. Bitte Termin prüfen.'}
+                              'Kalenderdaten und E-Mail-Import unterscheiden sich. Bitte Termin prüfen.'}
                           </p>
                         </div>
                         {differences.length > 0 && (
                           <div>
-                            <p className="text-[11px] uppercase tracking-wide text-rose-300/80">Unterschiede</p>
-                            <div className="mt-2 space-y-2">
-                              {differences.map((difference) => (
-                                <div
-                                  key={difference.field}
-                                  className="rounded-lg border border-rose-400/30 bg-rose-950/20 p-2"
-                                >
-                                  <p className="text-xs font-semibold text-rose-200">{difference.label}</p>
-                                  <div className="mt-2 grid gap-3 text-[11px] text-rose-100/80 sm:grid-cols-2">
-                                    <div>
-                                      <span className="font-semibold text-rose-300">Lokal</span>
-                                      <p className="mt-1 whitespace-pre-wrap break-words">
-                                        {formatDifferenceValue(difference, 'local')}
-                                      </p>
-                                    </div>
-                                    <div>
-                                      <span className="font-semibold text-rose-300">Server</span>
-                                      <p className="mt-1 whitespace-pre-wrap break-words">
-                                        {formatDifferenceValue(difference, 'remote')}
-                                      </p>
+                            <button
+                              type="button"
+                              onClick={() => toggleDifferences(event.id)}
+                              className="flex w-full items-center justify-between rounded-lg border border-rose-400/30 bg-rose-950/20 px-3 py-2 text-left text-xs font-semibold text-rose-200 transition hover:bg-rose-950/40 focus:outline-none focus:ring-2 focus:ring-rose-400/50"
+                              aria-expanded={differencesExpanded}
+                            >
+                              <span>
+                                Unterschiede zwischen E-Mail-Import und Kalenderdaten ({differences.length})
+                              </span>
+                              <span className={`text-base transition-transform ${differencesExpanded ? 'rotate-180' : ''}`}>
+                                ▾
+                              </span>
+                            </button>
+                            {differencesExpanded && (
+                              <div className="mt-2 space-y-2">
+                                {differences.map((difference) => (
+                                  <div
+                                    key={difference.field}
+                                    className="rounded-lg border border-rose-400/30 bg-rose-950/20 p-2"
+                                  >
+                                    <p className="text-xs font-semibold text-rose-200">{difference.label}</p>
+                                    <div className="mt-2 grid gap-3 text-[11px] text-rose-100/80 sm:grid-cols-2">
+                                      <div>
+                                        <span className="font-semibold text-rose-300">E-Mail-Import</span>
+                                        <p className="mt-1 whitespace-pre-wrap break-words">
+                                          {formatDifferenceValue(difference, 'local')}
+                                        </p>
+                                      </div>
+                                      <div>
+                                        <span className="font-semibold text-rose-300">Kalenderdaten</span>
+                                        <p className="mt-1 whitespace-pre-wrap break-words">
+                                          {formatDifferenceValue(difference, 'remote')}
+                                        </p>
+                                      </div>
                                     </div>
                                   </div>
-                                </div>
-                              ))}
-                            </div>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         )}
                         {suggestions.length > 0 && (
@@ -1294,30 +1333,31 @@ export default function EventTable({
                             <p className="text-[11px] uppercase tracking-wide text-rose-300/80">Lösungsvorschläge</p>
                             <div className="mt-2 space-y-2">
                               {suggestions.map((suggestion) => {
-                                const isDisableAction =
-                                  suggestion.interactive && suggestion.action === 'disable-tracking';
+                                const disableInProgress =
+                                  suggestion.action === 'disable-tracking' &&
+                                  resolvingConflictId === event.id;
                                 return (
-                                  <div
+                                  <button
                                     key={suggestion.action}
-                                    className="rounded-lg border border-rose-400/30 bg-rose-950/15 p-2"
+                                    type="button"
+                                    onClick={() => handleSuggestionClick(event, suggestion)}
+                                    disabled={disableInProgress}
+                                    className={`w-full rounded-lg border border-rose-400/30 bg-rose-950/15 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-rose-400/50 ${
+                                      disableInProgress
+                                        ? 'cursor-progress opacity-60'
+                                        : 'cursor-pointer hover:bg-rose-900/40'
+                                    }`}
                                   >
                                     <p className="text-xs font-semibold text-rose-200">{suggestion.label}</p>
                                     <p className="mt-1 whitespace-pre-wrap break-words text-rose-100/80">
                                       {suggestion.description}
                                     </p>
-                                    {isDisableAction && (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleDisableTracking(event)}
-                                        disabled={resolvingConflictId === event.id}
-                                        className="mt-2 inline-flex items-center rounded-lg bg-rose-500 px-3 py-1 text-xs font-semibold text-rose-950 transition hover:bg-rose-400 disabled:opacity-60"
-                                      >
-                                        {resolvingConflictId === event.id
-                                          ? 'Wird entfernt…'
-                                          : 'Termin nicht mehr verfolgen'}
-                                      </button>
+                                    {disableInProgress && (
+                                      <p className="mt-2 text-[11px] font-semibold text-rose-200">
+                                        Wird entfernt…
+                                      </p>
                                     )}
-                                  </div>
+                                  </button>
                                 );
                               })}
                             </div>
@@ -1327,13 +1367,13 @@ export default function EventTable({
                     )}
                     <div className="mt-4 grid gap-3 text-xs text-slate-400 sm:grid-cols-2">
                       <div>
-                        <p className="uppercase tracking-wide text-slate-500">Letzte lokale Änderung</p>
+                        <p className="uppercase tracking-wide text-slate-500">Letzte Änderung (E-Mail-Import)</p>
                         <p className="mt-1 text-slate-300">
                           {formatSyncTimestamp(syncState?.local_last_modified)}
                         </p>
                       </div>
                       <div>
-                        <p className="uppercase tracking-wide text-slate-500">Letzte Serveränderung</p>
+                        <p className="uppercase tracking-wide text-slate-500">Letzte Änderung (Kalenderdaten)</p>
                         <p className="mt-1 text-slate-300">
                           {formatSyncTimestamp(syncState?.remote_last_modified)}
                         </p>

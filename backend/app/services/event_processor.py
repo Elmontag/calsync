@@ -250,7 +250,7 @@ def sync_events_to_calendar(
                 conflicts_detected += 1
                 _record_sync_conflict(
                     event,
-                    "Kalendereintrag wurde auf dem Server verändert. Lokale Änderungen wurden nicht überschrieben.",
+                    "Kalendereintrag wurde in den Kalenderdaten verändert. Anpassungen aus dem E-Mail-Import wurden nicht überschrieben.",
                     remote_state,
                 )
                 if progress_callback is not None:

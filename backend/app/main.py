@@ -380,17 +380,17 @@ def _build_conflict_details(event: TrackedEvent) -> Optional[SyncConflictDetails
     suggestions: List[ConflictResolutionOption] = [
         ConflictResolutionOption(
             action="retry-sync",
-            label="Lokale Version erneut synchronisieren",
-            description="Prüfe die lokalen Änderungen und starte anschließend eine neue Synchronisation, sobald der Konflikt behoben ist.",
+            label="E-Mail-Import erneut synchronisieren",
+            description="Prüfe die Daten aus dem E-Mail-Import und starte anschließend eine neue Synchronisation, sobald der Konflikt behoben ist.",
         ),
         ConflictResolutionOption(
             action="apply-remote",
-            label="Server-Version übernehmen",
-            description="Übernehme die Anpassungen aus CalDAV manuell oder importiere die ICS-Daten, um beide Stände anzugleichen.",
+            label="Kalenderdaten übernehmen",
+            description="Übernehme die Anpassungen aus den Kalenderdaten manuell oder importiere die ICS-Daten, um beide Stände anzugleichen.",
         ),
         ConflictResolutionOption(
             action="disable-tracking",
-            label="Termin aus Tracking entfernen",
+            label="Termin nicht mehr verfolgen",
             description="Blendet den Termin dauerhaft in CalSync aus und stoppt die automatische Synchronisation.",
             interactive=True,
             requires_confirmation=True,
