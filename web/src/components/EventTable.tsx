@@ -154,6 +154,18 @@ function getEventDate(event: TrackedEvent): Date | null {
   return parseIsoDate(event.start) ?? parseIsoDate(event.end);
 }
 
+function sortHistoryEntries(entries: TrackedEvent['history']): TrackedEvent['history'] {
+  const copy = [...entries];
+  copy.sort((a, b) => {
+    const timeA = a?.timestamp ? new Date(a.timestamp).getTime() : Number.NaN;
+    const timeB = b?.timestamp ? new Date(b.timestamp).getTime() : Number.NaN;
+    const normalizedA = Number.isNaN(timeA) ? 0 : timeA;
+    const normalizedB = Number.isNaN(timeB) ? 0 : timeB;
+    return normalizedB - normalizedA;
+  });
+  return copy;
+}
+
 type SortDirection = 'asc' | 'desc';
 
 function compareByDate(
@@ -226,8 +238,17 @@ export default function EventTable({
 
   // Remove selections for events that disappeared after refresh.
   useEffect(() => {
-    setSelected((prev) => prev.filter((id) => events.some((event) => event.id === id)));
-    setOpenItems((prev) => prev.filter((id) => events.some((event) => event.id === id)));
+    const eventMap = new Map(events.map((event) => [event.id, event]));
+    setSelected((prev) =>
+      prev.filter((id) => {
+        const match = eventMap.get(id);
+        if (!match) {
+          return false;
+        }
+        return !(match.sync_state?.has_conflict ?? false);
+      }),
+    );
+    setOpenItems((prev) => prev.filter((id) => eventMap.has(id)));
   }, [events]);
 
   useEffect(() => {
@@ -513,7 +534,7 @@ export default function EventTable({
     setSyncResult(uploaded);
     setMissing(missingDetails);
     if (missingDetails.length > 0) {
-      setSyncError('Für einige Termine existiert keine Sync-Zuordnung.');
+      setSyncError('Einige Termine konnten nicht synchronisiert werden.');
       setSelected(
         missingDetails
           .map((item) => item.event_id)
@@ -1058,6 +1079,8 @@ export default function EventTable({
             const conflictCount = event.conflicts?.length ?? 0;
             const syncState = event.sync_state;
             const hasSyncConflict = syncState?.has_conflict ?? false;
+            const isSelectable = !hasSyncConflict;
+            const historyEntries = sortHistoryEntries(event.history ?? []);
             return (
               <div
                 key={event.id}
@@ -1067,9 +1090,17 @@ export default function EventTable({
                   <div className="flex flex-1 items-start gap-3">
                     <input
                       type="checkbox"
-                      className="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950"
+                      className={`mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950 ${
+                        isSelectable ? '' : 'cursor-not-allowed opacity-50'
+                      }`}
                       checked={selected.includes(event.id)}
                       onChange={() => toggleSelection(event.id)}
+                      disabled={!isSelectable}
+                      title={
+                        isSelectable
+                          ? undefined
+                          : 'Synchronisation gesperrt: Konflikt muss zuerst gelöst werden.'
+                      }
                     />
                     <button
                       type="button"
@@ -1197,17 +1228,31 @@ export default function EventTable({
                     </div>
                     <div className="mt-4">
                       <p className="text-xs uppercase tracking-wide text-slate-500">Historie</p>
-                      {event.history.length > 0 ? (
-                        <ul className="mt-2 space-y-1 text-xs text-slate-300">
-                          {event.history.map((entry, index) => (
-                            <li key={`${entry.timestamp}-${index}`}>
-                              <span className="font-semibold text-slate-200">
-                                {new Date(entry.timestamp).toLocaleString()}:
-                              </span>{' '}
-                              {entry.description}
-                            </li>
-                          ))}
-                        </ul>
+                      {historyEntries.length > 0 ? (
+                        <>
+                          <div className="mt-2 max-h-48 overflow-y-auto pr-2">
+                            <ul className="space-y-1 text-xs text-slate-300">
+                              {historyEntries.map((entry, index) => {
+                                const parsed = entry.timestamp ? new Date(entry.timestamp) : null;
+                                const formatted =
+                                  parsed && !Number.isNaN(parsed.getTime())
+                                    ? parsed.toLocaleString()
+                                    : 'Unbekannter Zeitpunkt';
+                                return (
+                                  <li key={`${entry.timestamp}-${index}`}>
+                                    <span className="font-semibold text-slate-200">{formatted}:</span>{' '}
+                                    {entry.description}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+                          {historyEntries.length > 10 && (
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              Neueste Einträge zuerst – ältere Einträge per Scroll erreichbar.
+                            </p>
+                          )}
+                        </>
                       ) : (
                         <p className="mt-2 text-xs text-slate-400">Keine Historie vorhanden.</p>
                       )}

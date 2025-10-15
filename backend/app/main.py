@@ -476,6 +476,31 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
             sync_groups: Dict[int, Dict[str, Any]] = {}
 
             for event in events:
+                if event.sync_conflict:
+                    logger.info(
+                        "Skipping manual sync for %s due to existing conflict", event.uid
+                    )
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason="Synchronisationskonflikt muss zuerst gelöst werden",
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
+                    continue
                 if event.source_account_id is None or not event.source_folder:
                     missing.append(
                         ManualSyncMissingDetail(
