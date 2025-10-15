@@ -232,6 +232,10 @@ def sync_events_to_calendar(
 
         known_etag = getattr(event, "caldav_etag", None)
         has_local_changes = (event.local_version or 0) > (event.synced_version or 0)
+        is_organizer_cancellation = (
+            event.status == EventStatus.CANCELLED
+            and getattr(event, "cancelled_by_organizer", None) is not False
+        )
 
         if (
             remote_state
@@ -239,7 +243,14 @@ def sync_events_to_calendar(
             and known_etag
             and remote_state.etag != known_etag
         ):
-            if has_local_changes:
+            if is_organizer_cancellation:
+                logger.debug(
+                    "Skipping conflict handling for organizer cancellation of %s", event.uid
+                )
+                # Allow the cancellation flow below to remove the event instead of
+                # flagging an unnecessary sync conflict.
+                
+            elif has_local_changes:
                 conflicts_detected += 1
                 _record_sync_conflict(
                     event,
@@ -249,10 +260,11 @@ def sync_events_to_calendar(
                 if progress_callback is not None:
                     progress_callback(event, False)
                 continue
-            _apply_remote_snapshot(event, remote_state)
-            if progress_callback is not None:
-                progress_callback(event, True)
-            continue
+            else:
+                _apply_remote_snapshot(event, remote_state)
+                if progress_callback is not None:
+                    progress_callback(event, True)
+                continue
 
         if event.status == EventStatus.CANCELLED:
             if getattr(event, "cancelled_by_organizer", None) is False:
