@@ -8,4 +8,5 @@ node_modules/
 build/
 web/dist/
 backend/data/
+data/
 .DS_Store
