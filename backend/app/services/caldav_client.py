@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
 from caldav import DAVClient
+from caldav.elements import dav
 from caldav.objects import Calendar
 from icalendar import Calendar as ICalendar
 
@@ -128,9 +129,41 @@ def _fetch_event_state(
         except Exception:  # pragma: no cover - parsing resilience
             logger.exception("Failed to parse CalDAV payload for %s", uid)
 
-    etag = getattr(event, "etag", None)
-    etag_text = str(etag) if etag is not None else None
+    etag_text = _resolve_event_etag(event)
     return RemoteEventState(uid=uid, etag=etag_text, last_modified=last_modified, payload=payload_text)
+
+
+def _resolve_event_etag(event) -> Optional[str]:
+    """Best-effort lookup of an event's ETag value.
+
+    The CalDAV library does not expose an ``etag`` attribute on calendar objects.
+    Instead, the value is exposed through the object's property store which only
+    gets populated when explicitly queried.  We therefore attempt the following
+    strategies in order:
+
+    1. Reuse a cached ``getetag`` entry on the object.
+    2. Trigger a lightweight PROPFIND for ``getetag`` to populate the cache.
+    3. Fall back to any attribute named ``etag`` should future library versions
+       expose one.
+    """
+
+    raw_props = getattr(event, "props", {}) or {}
+    cached = raw_props.get(dav.GetEtag.tag)
+    if cached is not None:
+        return str(cached)
+
+    if hasattr(event, "get_properties"):
+        try:
+            event.get_properties([dav.GetEtag()])
+        except Exception:  # pragma: no cover - depends on caldav implementation
+            logger.warning("Failed to query ETag properties for %s", getattr(event, "url", "<unknown>"))
+        else:
+            refreshed = getattr(event, "props", {}) or {}
+            if dav.GetEtag.tag in refreshed:
+                return str(refreshed[dav.GetEtag.tag])
+
+    etag_attr = getattr(event, "etag", None)
+    return str(etag_attr) if etag_attr is not None else None
 
 
 def _ensure_datetime(value: datetime | date) -> datetime:
