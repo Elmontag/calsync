@@ -153,27 +153,26 @@ def _normalize_history(event: TrackedEvent) -> Tuple[List[Dict[str, str]], bool]
 def _normalize_histories(events: List[TrackedEvent], db: Session) -> None:
     """Coerce legacy or malformed history payloads to the expected structure."""
 
-    changed_events: List[TrackedEvent] = []
+    changed_histories: Dict[int, List[Dict[str, str]]] = {}
     for event in events:
         history, changed = _normalize_history(event)
         if changed:
             event.history = history
-            changed_events.append(event)
-            db.add(event)
-    if changed_events:
+            if event.id is not None:
+                changed_histories[event.id] = history
+    if changed_histories:
         try:
-            db.commit()
+            with SessionLocal() as writer:
+                writer.bulk_update_mappings(
+                    TrackedEvent,
+                    [
+                        {"id": event_id, "history": history}
+                        for event_id, history in changed_histories.items()
+                    ],
+                )
+                writer.commit()
         except Exception:
             logger.exception("Failed to persist normalized history entries")
-            db.rollback()
-            return
-        for event in changed_events:
-            try:
-                # Refresh normalized events so attributes remain accessible even after the
-                # session is closed by the dependency helper.
-                db.refresh(event)
-            except Exception:
-                logger.exception("Failed to refresh event %s after normalizing history", event.id)
 
 
 def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
