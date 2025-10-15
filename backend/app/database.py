@@ -98,6 +98,8 @@ def apply_schema_upgrades() -> None:
         "last_modified_source": "ALTER TABLE tracked_events ADD COLUMN last_modified_source VARCHAR NULL",
         "sync_conflict": "ALTER TABLE tracked_events ADD COLUMN sync_conflict BOOLEAN NOT NULL DEFAULT 0",
         "sync_conflict_reason": "ALTER TABLE tracked_events ADD COLUMN sync_conflict_reason TEXT NULL",
+        "sync_conflict_snapshot": "ALTER TABLE tracked_events ADD COLUMN sync_conflict_snapshot JSON NULL",
+        "tracking_disabled": "ALTER TABLE tracked_events ADD COLUMN tracking_disabled BOOLEAN NOT NULL DEFAULT 0",
     }
 
     for column_name, ddl in new_columns.items():

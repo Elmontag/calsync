@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from typing import Iterable, List, Optional
 
 from icalendar import Calendar, Event
@@ -23,6 +23,8 @@ class ParsedEvent(BaseModel):
     event: Event
     method: Optional[str] = None
     response_status: Optional[EventResponseStatus] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -76,6 +78,8 @@ def parse_ics_payload(payload: bytes) -> List[ParsedEvent]:
                 event=component,
                 method=method,
                 response_status=response_status,
+                location=str(component.get("LOCATION")) if component.get("LOCATION") else None,
+                description=str(component.get("DESCRIPTION")) if component.get("DESCRIPTION") else None,
             )
         )
     logger.debug("Parsed %s events from ICS", len(events))
@@ -99,3 +103,41 @@ def _normalize_date(value) -> datetime:
     if hasattr(value, "to_datetime"):
         return value.to_datetime()
     raise TypeError(f"Unsupported date value: {value!r}")
+
+
+def extract_event_snapshot(payload: bytes | str, uid: Optional[str] = None) -> Optional[dict]:
+    """Create a comparable snapshot from an ICS payload for conflict rendering."""
+
+    if isinstance(payload, str):
+        raw = payload.encode()
+    else:
+        raw = payload
+    parsed = parse_ics_payload(raw)
+    if not parsed:
+        return None
+    if uid:
+        selected = next((item for item in parsed if item.uid == uid), None)
+        if selected is None:
+            selected = parsed[0]
+    else:
+        selected = parsed[0]
+
+    def _serialize(value: Optional[datetime]) -> Optional[str]:
+        if value is None:
+            return None
+        target = value
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        else:
+            target = target.astimezone(timezone.utc)
+        return target.isoformat()
+
+    return {
+        "uid": selected.uid,
+        "summary": selected.summary,
+        "organizer": selected.organizer,
+        "start": _serialize(selected.start),
+        "end": _serialize(selected.end),
+        "location": selected.location,
+        "description": selected.description,
+    }

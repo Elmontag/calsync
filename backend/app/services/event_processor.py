@@ -9,7 +9,12 @@ from sqlalchemy import select
 
 from ..database import session_scope
 from ..models import EventResponseStatus, EventStatus, TrackedEvent
-from ..utils.ics_parser import ParsedEvent, merge_histories, parse_ics_payload
+from ..utils.ics_parser import (
+    ParsedEvent,
+    extract_event_snapshot,
+    merge_histories,
+    parse_ics_payload,
+)
 from .caldav_client import (
     CalDavSettings,
     RemoteEventState,
@@ -158,6 +163,7 @@ def upsert_events(
                         event.last_modified_source = "local"
                         event.sync_conflict = False
                         event.sync_conflict_reason = None
+                        event.sync_conflict_snapshot = None
                     session.add(event)
 
                 if content_changed or status_changed or response_changed:
@@ -196,6 +202,7 @@ def mark_as_synced(
             if remote_state is not None:
                 db_event.caldav_etag = remote_state.etag
                 db_event.remote_last_modified = remote_state.last_modified
+            db_event.sync_conflict_snapshot = None
             db_event.history = merge_histories(
                 db_event.history or [],
                 {
@@ -355,6 +362,15 @@ def _record_sync_conflict(
             if remote_state.etag:
                 db_event.caldav_etag = remote_state.etag
             db_event.remote_last_modified = remote_state.last_modified
+            snapshot = None
+            if remote_state.payload:
+                try:
+                    snapshot = extract_event_snapshot(remote_state.payload, uid=event.uid)
+                except Exception:
+                    logger.exception("Failed to capture conflict snapshot for %s", event.uid)
+            db_event.sync_conflict_snapshot = snapshot
+        else:
+            db_event.sync_conflict_snapshot = None
         db_event.history = merge_histories(
             db_event.history or [],
             {
@@ -414,6 +430,7 @@ def _apply_remote_snapshot(
         db_event.last_modified_source = "remote"
         db_event.sync_conflict = False
         db_event.sync_conflict_reason = None
+        db_event.sync_conflict_snapshot = None
         db_event.history = merge_histories(
             db_event.history or [],
             {
@@ -459,6 +476,7 @@ def mark_as_cancelled(results: Dict[int, tuple[bool, Optional[RemoteEventState]]
             event.synced_version = event.local_version or 0
             event.sync_conflict = False
             event.sync_conflict_reason = None
+            event.sync_conflict_snapshot = None
             event.last_modified_source = "local"
             if event.local_last_modified is None:
                 event.local_last_modified = datetime.utcnow()
@@ -497,6 +515,7 @@ def mark_cancellations_ignored(events: Iterable[TrackedEvent]) -> None:
             db_event.synced_version = db_event.local_version or 0
             db_event.sync_conflict = False
             db_event.sync_conflict_reason = None
+            db_event.sync_conflict_snapshot = None
             db_event.history = merge_histories(
                 db_event.history or [],
                 {

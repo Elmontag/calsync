@@ -155,6 +155,12 @@ export function useEvents() {
     return data;
   }
 
+  async function disableTracking(eventId: number) {
+    const { data } = await api.post<TrackedEvent>(`/events/${eventId}/disable-tracking`);
+    setEvents((prev) => prev.filter((event) => event.id !== eventId));
+    return data;
+  }
+
   return {
     events,
     loading,
@@ -169,6 +175,7 @@ export function useEvents() {
     setAutoSyncInterval,
     respondToEvent,
     loadAutoSync,
+    disableTracking,
   };
 }
 

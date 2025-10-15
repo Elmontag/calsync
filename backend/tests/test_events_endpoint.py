@@ -73,6 +73,7 @@ def _build_ical(
     start: datetime,
     end: datetime,
     status: str,
+    description: Optional[str] = None,
 ) -> str:
     calendar = Calendar()
     calendar.add("PRODID", "-//CalSync Tests//DE")
@@ -87,6 +88,8 @@ def _build_ical(
     component.add("DTSTAMP", start)
     component.add("LAST-MODIFIED", end)
     component.add("STATUS", status)
+    if description:
+        component.add("DESCRIPTION", description)
     calendar.add_component(component)
     return calendar.to_ical().decode()
 
@@ -473,6 +476,77 @@ def test_perform_sync_all_ignores_sync_conflicts(monkeypatch: pytest.MonkeyPatch
 
     assert uploaded == 1
     assert captured == [["uid-pending"]]
+
+
+def test_conflict_details_and_disable_tracking() -> None:
+    """Konfliktdetails sollen Unterschiede und Deaktivierungsoption liefern."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    start = datetime(2024, 4, 10, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-diff",
+        summary="Lokaler Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Lokale Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-diff",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Lokaler Titel",
+        organizer="orga@example.com",
+        start=start,
+        end=end,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        payload=payload,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Remote-Version abweichend",
+        sync_conflict_snapshot={
+            "summary": "Server Titel",
+            "start": (start + timedelta(hours=2)).isoformat(),
+            "end": (end + timedelta(hours=2)).isoformat(),
+            "description": "Server Beschreibung",
+        },
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    client = TestClient(app)
+    response = client.get("/events")
+    assert response.status_code == 200
+    items = response.json()
+    assert len(items) == 1
+    payload_event = items[0]
+    assert payload_event["tracking_disabled"] is False
+    details = payload_event["sync_state"]["conflict_details"]
+    assert details is not None
+    differences = {item["field"]: item for item in details["differences"]}
+    assert differences["summary"]["local_value"] == "Lokaler Titel"
+    assert differences["summary"]["remote_value"] == "Server Titel"
+    assert differences["description"]["remote_value"] == "Server Beschreibung"
+    disable_option = next(
+        suggestion
+        for suggestion in details["suggestions"]
+        if suggestion["action"] == "disable-tracking"
+    )
+    assert disable_option["interactive"] is True
+
+    disable_response = client.post(f"/events/{payload_event['id']}/disable-tracking")
+    assert disable_response.status_code == 200
+    disabled_payload = disable_response.json()
+    assert disabled_payload["tracking_disabled"] is True
+    assert disabled_payload["sync_state"]["has_conflict"] is False
+    refreshed = client.get("/events")
+    assert refreshed.status_code == 200
+    assert refreshed.json() == []
 
 
 def test_attendee_cancellation_updates_history_without_deletion(monkeypatch: pytest.MonkeyPatch) -> None:

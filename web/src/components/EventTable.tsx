@@ -4,6 +4,7 @@ import {
   ManualSyncRequest,
   ManualSyncResponse,
   SyncJobStatus,
+  ConflictDifference,
   TrackedEvent,
 } from '../types/api';
 
@@ -23,6 +24,7 @@ interface Props {
     eventId: number,
     response: TrackedEvent['response_status'],
   ) => Promise<TrackedEvent>;
+  onDisableTracking: (eventId: number) => Promise<TrackedEvent>;
   loading?: boolean;
   onRefresh: () => Promise<void>;
   autoSyncJob: SyncJobStatus | null;
@@ -117,6 +119,17 @@ function formatConflictRange(conflict: TrackedEvent['conflicts'][number]) {
   return start ?? end ?? 'Keine Zeitangabe';
 }
 
+function formatDifferenceValue(difference: ConflictDifference, side: 'local' | 'remote') {
+  const value = side === 'local' ? difference.local_value : difference.remote_value;
+  if (!value) {
+    return '–';
+  }
+  if (difference.field === 'start' || difference.field === 'end') {
+    return formatDateTime(value) ?? value;
+  }
+  return value;
+}
+
 function formatSyncTimestamp(value?: string | null) {
   if (!value) {
     return 'Keine Angabe';
@@ -203,6 +216,7 @@ export default function EventTable({
   onAutoSyncResponseChange,
   onAutoSyncIntervalChange,
   onRespondToEvent,
+  onDisableTracking,
   loading = false,
   onRefresh,
   autoSyncJob,
@@ -223,9 +237,11 @@ export default function EventTable({
   const [searchTerm, setSearchTerm] = useState('');
   const [sortOption, setSortOption] = useState<SortOption>('email-desc');
   const [statusFilters, setStatusFilters] = useState<TrackedEvent['status'][]>([]);
+  const [syncConflictFilter, setSyncConflictFilter] = useState<'all' | 'sync-only'>('all');
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
+  const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
   const pollersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -263,7 +279,7 @@ export default function EventTable({
 
   useEffect(() => {
     setPage(1);
-  }, [searchTerm, statusFilters, sortOption, pageSize]);
+  }, [searchTerm, statusFilters, sortOption, pageSize, syncConflictFilter]);
 
   // Compose the visible event list by applying search, status filters and sorting preferences.
   const filteredEvents = useMemo(() => {
@@ -273,6 +289,9 @@ export default function EventTable({
 
     const filtered = events.filter((event) => {
       if (statusSet.size > 0 && !statusSet.has(event.status)) {
+        return false;
+      }
+      if (syncConflictFilter === 'sync-only' && !(event.sync_state?.has_conflict ?? false)) {
         return false;
       }
       if (!hasTerm) {
@@ -313,7 +332,7 @@ export default function EventTable({
     }
 
     return sorted;
-  }, [events, searchTerm, statusFilters, sortOption]);
+  }, [events, searchTerm, statusFilters, sortOption, syncConflictFilter]);
 
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(filteredEvents.length / pageSize));
@@ -358,6 +377,8 @@ export default function EventTable({
     return { outstanding, processed, cancelled, awaitingDecision, today, conflicts, syncConflicts };
   }, [events]);
 
+  const showOnlySyncConflicts = syncConflictFilter === 'sync-only';
+
   function toggleSelection(id: number) {
     setSelected((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
@@ -378,6 +399,10 @@ export default function EventTable({
     setStatusFilters((prev) =>
       prev.includes(status) ? prev.filter((item) => item !== status) : [...prev, status],
     );
+  }
+
+  function toggleSyncConflictFilter() {
+    setSyncConflictFilter((prev) => (prev === 'sync-only' ? 'all' : 'sync-only'));
   }
 
   function resetStatusFilters() {
@@ -835,6 +860,27 @@ export default function EventTable({
     }
   }
 
+  async function handleDisableTracking(event: TrackedEvent) {
+    if (resolvingConflictId !== null) {
+      return;
+    }
+    setResolvingConflictId(event.id);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      await onDisableTracking(event.id);
+      const title = event.summary ?? event.uid;
+      setSyncNotice(`"${title}" wird nicht mehr automatisch verfolgt.`);
+      await onRefresh();
+    } catch (error) {
+      console.error('Konnte Tracking nicht deaktivieren.', error);
+      setSyncError('Tracking konnte nicht deaktiviert werden.');
+    } finally {
+      setResolvingConflictId(null);
+    }
+  }
+
   const showInitialLoading = loading && events.length === 0;
   const showEmptyState = !loading && filteredEvents.length === 0;
 
@@ -1005,6 +1051,18 @@ export default function EventTable({
                   </button>
                 );
               })}
+              <button
+                type="button"
+                onClick={toggleSyncConflictFilter}
+                aria-pressed={showOnlySyncConflicts}
+                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                  showOnlySyncConflicts
+                    ? 'border-rose-400 bg-rose-500/20 text-rose-200'
+                    : 'border-slate-700 text-slate-300 hover:border-rose-400 hover:text-rose-200'
+                }`}
+              >
+                Nur Sync-Konflikte
+              </button>
             </div>
           </div>
         </div>
@@ -1079,6 +1137,8 @@ export default function EventTable({
             const conflictCount = event.conflicts?.length ?? 0;
             const syncState = event.sync_state;
             const hasSyncConflict = syncState?.has_conflict ?? false;
+            const differences = syncState?.conflict_details?.differences ?? [];
+            const suggestions = syncState?.conflict_details?.suggestions ?? [];
             const isSelectable = !hasSyncConflict;
             const historyEntries = sortHistoryEntries(event.history ?? []);
             return (
@@ -1192,12 +1252,77 @@ export default function EventTable({
                       </div>
                     )}
                     {hasSyncConflict && (
-                      <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-100">
-                        <p className="text-sm font-semibold text-rose-200">Synchronisationskonflikt</p>
-                        <p className="mt-1 text-rose-100/80">
-                          {syncState?.conflict_reason ??
-                            'Server- und lokale Version unterscheiden sich. Bitte Termin prüfen.'}
-                        </p>
+                      <div className="mt-4 space-y-3 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-100">
+                        <div>
+                          <p className="text-sm font-semibold text-rose-200">Synchronisationskonflikt</p>
+                          <p className="mt-1 text-rose-100/80">
+                            {syncState?.conflict_reason ??
+                              'Server- und lokale Version unterscheiden sich. Bitte Termin prüfen.'}
+                          </p>
+                        </div>
+                        {differences.length > 0 && (
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-rose-300/80">Unterschiede</p>
+                            <div className="mt-2 space-y-2">
+                              {differences.map((difference) => (
+                                <div
+                                  key={difference.field}
+                                  className="rounded-lg border border-rose-400/30 bg-rose-950/20 p-2"
+                                >
+                                  <p className="text-xs font-semibold text-rose-200">{difference.label}</p>
+                                  <div className="mt-2 grid gap-3 text-[11px] text-rose-100/80 sm:grid-cols-2">
+                                    <div>
+                                      <span className="font-semibold text-rose-300">Lokal</span>
+                                      <p className="mt-1 whitespace-pre-wrap break-words">
+                                        {formatDifferenceValue(difference, 'local')}
+                                      </p>
+                                    </div>
+                                    <div>
+                                      <span className="font-semibold text-rose-300">Server</span>
+                                      <p className="mt-1 whitespace-pre-wrap break-words">
+                                        {formatDifferenceValue(difference, 'remote')}
+                                      </p>
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {suggestions.length > 0 && (
+                          <div>
+                            <p className="text-[11px] uppercase tracking-wide text-rose-300/80">Lösungsvorschläge</p>
+                            <div className="mt-2 space-y-2">
+                              {suggestions.map((suggestion) => {
+                                const isDisableAction =
+                                  suggestion.interactive && suggestion.action === 'disable-tracking';
+                                return (
+                                  <div
+                                    key={suggestion.action}
+                                    className="rounded-lg border border-rose-400/30 bg-rose-950/15 p-2"
+                                  >
+                                    <p className="text-xs font-semibold text-rose-200">{suggestion.label}</p>
+                                    <p className="mt-1 whitespace-pre-wrap break-words text-rose-100/80">
+                                      {suggestion.description}
+                                    </p>
+                                    {isDisableAction && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDisableTracking(event)}
+                                        disabled={resolvingConflictId === event.id}
+                                        className="mt-2 inline-flex items-center rounded-lg bg-rose-500 px-3 py-1 text-xs font-semibold text-rose-950 transition hover:bg-rose-400 disabled:opacity-60"
+                                      >
+                                        {resolvingConflictId === event.id
+                                          ? 'Wird entfernt…'
+                                          : 'Termin nicht mehr verfolgen'}
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                     <div className="mt-4 grid gap-3 text-xs text-slate-400 sm:grid-cols-2">

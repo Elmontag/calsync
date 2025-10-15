@@ -30,12 +30,15 @@ from .schemas import (
     AccountUpdate,
     ConnectionTestRequest,
     ConnectionTestResult,
+    ConflictResolutionOption,
+    ConflictDifference,
     ManualSyncMissingDetail,
     ManualSyncRequest,
     ManualSyncResponse,
     EventResponseUpdate,
     AutoSyncRequest,
     AutoSyncStatus,
+    SyncConflictDetails,
     SyncJobStatus,
     SyncMappingCreate,
     SyncMappingRead,
@@ -52,7 +55,7 @@ from .services.caldav_client import (
 from .services.imap_client import FolderSelection, ImapSettings, fetch_calendar_candidates
 from .services.job_tracker import job_tracker
 from .services.scheduler import scheduler
-from .utils.ics_parser import merge_histories, parse_ics_payload
+from .utils.ics_parser import extract_event_snapshot, merge_histories, parse_ics_payload
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -303,10 +306,105 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
             continue
 
 
+def _serialize_timestamp(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    target = value
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    else:
+        target = target.astimezone(timezone.utc)
+    return target.isoformat()
+
+
+def _build_conflict_details(event: TrackedEvent) -> Optional[SyncConflictDetails]:
+    if not event.sync_conflict:
+        return None
+
+    remote_snapshot = {}
+    if isinstance(event.sync_conflict_snapshot, dict):
+        remote_snapshot = event.sync_conflict_snapshot
+
+    local_snapshot: Optional[dict] = None
+    if event.payload:
+        try:
+            local_snapshot = extract_event_snapshot(event.payload, uid=event.uid)
+        except Exception:
+            logger.exception(
+                "Konfliktdetails konnten nicht aus lokaler Payload gelesen werden: %s",
+                event.uid,
+            )
+
+    local_values: Dict[str, Optional[str]] = {
+        "summary": event.summary,
+        "organizer": event.organizer,
+        "start": _serialize_timestamp(event.start),
+        "end": _serialize_timestamp(event.end),
+        "location": None,
+        "description": None,
+    }
+
+    if local_snapshot:
+        for key in ("summary", "organizer", "start", "end", "location", "description"):
+            value = local_snapshot.get(key)
+            if value is not None:
+                local_values[key] = str(value)
+
+    differences: List[ConflictDifference] = []
+    label_map = {
+        "summary": "Titel",
+        "start": "Beginn",
+        "end": "Ende",
+        "organizer": "Organisator",
+        "location": "Ort",
+        "description": "Beschreibung",
+    }
+
+    for field, label in label_map.items():
+        local_value = local_values.get(field)
+        remote_value_raw = remote_snapshot.get(field)
+        remote_value = str(remote_value_raw) if remote_value_raw is not None else None
+        if not (local_value or remote_value):
+            continue
+        if local_value == remote_value:
+            continue
+        differences.append(
+            ConflictDifference(
+                field=field,
+                label=label,
+                local_value=local_value,
+                remote_value=remote_value,
+            )
+        )
+
+    suggestions: List[ConflictResolutionOption] = [
+        ConflictResolutionOption(
+            action="retry-sync",
+            label="Lokale Version erneut synchronisieren",
+            description="Prüfe die lokalen Änderungen und starte anschließend eine neue Synchronisation, sobald der Konflikt behoben ist.",
+        ),
+        ConflictResolutionOption(
+            action="apply-remote",
+            label="Server-Version übernehmen",
+            description="Übernehme die Anpassungen aus CalDAV manuell oder importiere die ICS-Daten, um beide Stände anzugleichen.",
+        ),
+        ConflictResolutionOption(
+            action="disable-tracking",
+            label="Termin aus Tracking entfernen",
+            description="Blendet den Termin dauerhaft in CalSync aus und stoppt die automatische Synchronisation.",
+            interactive=True,
+            requires_confirmation=True,
+        ),
+    ]
+
+    return SyncConflictDetails(differences=differences, suggestions=suggestions)
+
+
 def _attach_sync_state(events: List[TrackedEvent]) -> None:
     """Expose synchronization metadata for API responses."""
 
     for event in events:
+        conflict_details = _build_conflict_details(event)
         setattr(
             event,
             "sync_state",
@@ -319,6 +417,9 @@ def _attach_sync_state(events: List[TrackedEvent]) -> None:
                 "remote_last_modified": event.remote_last_modified,
                 "last_modified_source": event.last_modified_source,
                 "caldav_etag": event.caldav_etag,
+                "conflict_details": conflict_details.model_dump()
+                if conflict_details
+                else None,
             },
         )
 
@@ -476,6 +577,31 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
             sync_groups: Dict[int, Dict[str, Any]] = {}
 
             for event in events:
+                if event.tracking_disabled:
+                    logger.info(
+                        "Skipping manual sync for %s because tracking is disabled", event.uid
+                    )
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason="Tracking für diesen Termin wurde deaktiviert",
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
+                    continue
                 if event.sync_conflict:
                     logger.info(
                         "Skipping manual sync for %s due to existing conflict", event.uid
@@ -867,7 +993,11 @@ def test_connection(payload: ConnectionTestRequest) -> ConnectionTestResult:
 
 @app.get("/events", response_model=List[TrackedEventRead])
 def list_events(db: Session = Depends(get_db)):
-    events = db.execute(select(TrackedEvent)).scalars().all()
+    events = (
+        db.execute(select(TrackedEvent).where(TrackedEvent.tracking_disabled.is_(False)))
+        .scalars()
+        .all()
+    )
     _normalize_histories(events, db)
     _attach_conflicts(events, db)
     _attach_sync_state(events)
@@ -987,6 +1117,38 @@ def update_event_response(
     return event
 
 
+@app.post("/events/{event_id}/disable-tracking", response_model=TrackedEventRead)
+def disable_event_tracking(event_id: int, db: Session = Depends(get_db)) -> TrackedEvent:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+
+    if not event.tracking_disabled:
+        event.tracking_disabled = True
+        event.sync_conflict = False
+        event.sync_conflict_reason = "Tracking deaktiviert"
+        event.sync_conflict_snapshot = None
+        event.history = merge_histories(
+            event.history or [],
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "action": "tracking-disabled",
+                "description": "Tracking für diesen Termin wurde deaktiviert",
+            },
+        )
+        event.updated_at = datetime.utcnow()
+        db.add(event)
+        db.commit()
+        logger.info("Tracking für Termin %s wurde deaktiviert", event.uid)
+    else:
+        db.commit()
+
+    db.refresh(event)
+    setattr(event, "conflicts", [])
+    _attach_sync_state([event])
+    return event
+
+
 @app.post("/events/schedule")
 def schedule_sync(minutes: int = 5, db: Session = Depends(get_db)) -> SyncJobStatus:
     def job():
@@ -1028,6 +1190,7 @@ def perform_sync_all(
                 )
             )
             .where(TrackedEvent.sync_conflict.is_(False))
+            .where(TrackedEvent.tracking_disabled.is_(False))
         ).scalars().all()
         if not events:
             continue

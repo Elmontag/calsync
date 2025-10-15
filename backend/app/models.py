@@ -113,6 +113,8 @@ class TrackedEvent(Base):
     last_modified_source = Column(String, nullable=True)
     sync_conflict = Column(Boolean, default=False, nullable=False)
     sync_conflict_reason = Column(Text, nullable=True)
+    sync_conflict_snapshot = Column(JSON, nullable=True)
+    tracking_disabled = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

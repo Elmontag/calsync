@@ -49,6 +49,7 @@ export interface TrackedEvent {
   history: EventHistoryEntry[];
   conflicts: CalendarConflict[];
   sync_state: EventSyncState;
+  tracking_disabled: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -66,6 +67,26 @@ export interface CalendarConflict {
   end?: string;
 }
 
+export interface ConflictDifference {
+  field: string;
+  label: string;
+  local_value?: string | null;
+  remote_value?: string | null;
+}
+
+export interface ConflictResolutionOption {
+  action: string;
+  label: string;
+  description: string;
+  interactive?: boolean;
+  requires_confirmation?: boolean;
+}
+
+export interface SyncConflictDetails {
+  differences: ConflictDifference[];
+  suggestions: ConflictResolutionOption[];
+}
+
 export interface EventSyncState {
   local_version: number;
   synced_version: number;
@@ -75,6 +96,7 @@ export interface EventSyncState {
   remote_last_modified?: string | null;
   last_modified_source?: string | null;
   caldav_etag?: string | null;
+  conflict_details?: SyncConflictDetails | null;
 }
 
 export interface ManualSyncRequest {
