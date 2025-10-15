@@ -89,6 +89,24 @@ def apply_schema_upgrades() -> None:
                 """
             )
 
+    new_columns: dict[str, str] = {
+        "caldav_etag": "ALTER TABLE tracked_events ADD COLUMN caldav_etag VARCHAR NULL",
+        "local_version": "ALTER TABLE tracked_events ADD COLUMN local_version INTEGER NOT NULL DEFAULT 0",
+        "synced_version": "ALTER TABLE tracked_events ADD COLUMN synced_version INTEGER NOT NULL DEFAULT 0",
+        "remote_last_modified": "ALTER TABLE tracked_events ADD COLUMN remote_last_modified DATETIME NULL",
+        "local_last_modified": "ALTER TABLE tracked_events ADD COLUMN local_last_modified DATETIME NULL",
+        "last_modified_source": "ALTER TABLE tracked_events ADD COLUMN last_modified_source VARCHAR NULL",
+        "sync_conflict": "ALTER TABLE tracked_events ADD COLUMN sync_conflict BOOLEAN NOT NULL DEFAULT 0",
+        "sync_conflict_reason": "ALTER TABLE tracked_events ADD COLUMN sync_conflict_reason TEXT NULL",
+    }
+
+    for column_name, ddl in new_columns.items():
+        if column_name in columns:
+            continue
+        logger.info("Adding %s column to tracked_events table", column_name)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(ddl)
+
 
 @contextmanager
 def session_scope() -> Iterator[sessionmaker]:
