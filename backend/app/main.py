@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime, timedelta, timezone
+from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -92,6 +94,87 @@ def _event_search_window(event: TrackedEvent) -> tuple[Optional[datetime], Optio
     return start, end
 
 
+def _normalize_history(event: TrackedEvent) -> Tuple[List[Dict[str, str]], bool]:
+    """Ensure history entries are returned as clean dictionaries."""
+
+    raw_history = getattr(event, "history", [])
+    changed = False
+
+    if isinstance(raw_history, str):
+        try:
+            raw_history = json.loads(raw_history)
+        except JSONDecodeError:
+            logger.warning("History for event %s is not valid JSON, dropping.", event.id)
+            return [], True
+        changed = True
+
+    if not isinstance(raw_history, list):
+        if raw_history not in (None, []):
+            logger.warning(
+                "History for event %s has unexpected type %s, resetting.",
+                event.id,
+                type(raw_history).__name__,
+            )
+        return [], raw_history not in (None, [])
+
+    normalized: List[Dict[str, str]] = []
+    for entry in raw_history:
+        if not isinstance(entry, dict):
+            logger.warning(
+                "Skipping non-dict history entry for event %s: %r",
+                event.id,
+                entry,
+            )
+            changed = True
+            continue
+        timestamp = entry.get("timestamp")
+        action = entry.get("action")
+        description = entry.get("description")
+        if not isinstance(timestamp, str) or not isinstance(action, str) or not isinstance(description, str):
+            logger.warning(
+                "Skipping malformed history entry for event %s: %r",
+                event.id,
+                entry,
+            )
+            changed = True
+            continue
+        normalized.append({
+            "timestamp": timestamp,
+            "action": action,
+            "description": description,
+        })
+
+    if len(normalized) != len(raw_history):
+        changed = True
+
+    return normalized, changed
+
+
+def _normalize_histories(events: List[TrackedEvent], db: Session) -> None:
+    """Coerce legacy or malformed history payloads to the expected structure."""
+
+    changed_histories: Dict[int, List[Dict[str, str]]] = {}
+    for event in events:
+        history, changed = _normalize_history(event)
+        if changed:
+            event.history = history
+            if event.id is not None:
+                changed_histories[event.id] = history
+    if changed_histories:
+        try:
+            with SessionLocal() as writer:
+                writer.bulk_update_mappings(
+                    TrackedEvent,
+                    [
+                        {"id": event_id, "history": history}
+                        for event_id, history in changed_histories.items()
+                    ],
+                )
+                writer.commit()
+        except Exception:
+            logger.exception("Failed to persist normalized history entries")
+
+
 def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
     """Enrich tracked events with CalDAV conflict information."""
     if not events:
@@ -141,15 +224,62 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
         try:
             with CalDavConnection(settings) as client:
                 calendar = client.principal().calendar(cal_url=mapping.calendar_url)
+                windows: List[Tuple[TrackedEvent, datetime, datetime]] = []
                 for event in events_for_mapping:
                     start, end = _event_search_window(event)
                     if start is None or end is None:
                         continue
-                    conflicts = find_conflicting_events(
-                        calendar, start, end, exclude_uid=event.uid
-                    )
-                    if conflicts:
-                        setattr(event, "conflicts", conflicts)
+                    windows.append((event, start, end))
+
+                if not windows:
+                    continue
+
+                overall_start = min(start for _, start, _ in windows)
+                overall_end = max(end for _, _, end in windows)
+                logger.debug(
+                    "Prüfe Konflikte für Mapping %s (%s Events) im Zeitraum %s bis %s",
+                    mapping.id,
+                    len(windows),
+                    overall_start,
+                    overall_end,
+                )
+
+                candidates = find_conflicting_events(calendar, overall_start, overall_end)
+                parsed_candidates: List[Tuple[Dict[str, Any], datetime, datetime]] = []
+                for candidate in candidates:
+                    start_raw = candidate.get("start")
+                    end_raw = candidate.get("end")
+                    if not isinstance(start_raw, str) or not isinstance(end_raw, str):
+                        logger.warning(
+                            "Konflikt ohne gültige Zeitangaben für Mapping %s übersprungen: %s",
+                            mapping.id,
+                            candidate,
+                        )
+                        continue
+                    try:
+                        cand_start = datetime.fromisoformat(start_raw)
+                        cand_end = datetime.fromisoformat(end_raw)
+                    except ValueError:
+                        logger.warning(
+                            "Konnte Konfliktzeiten nicht parsen für Mapping %s: %s",
+                            mapping.id,
+                            candidate,
+                        )
+                        continue
+                    cand_start = _ensure_timezone(cand_start)
+                    cand_end = _ensure_timezone(cand_end)
+                    parsed_candidates.append((candidate, cand_start, cand_end))
+
+                for event, start, end in windows:
+                    conflicts_for_event: List[Dict[str, Any]] = []
+                    for candidate, cand_start, cand_end in parsed_candidates:
+                        if candidate.get("uid") == event.uid:
+                            continue
+                        if cand_start >= end or cand_end <= start:
+                            continue
+                        conflicts_for_event.append(candidate)
+                    if conflicts_for_event:
+                        setattr(event, "conflicts", conflicts_for_event)
         except Exception:
             logger.exception(
                 "Konfliktprüfung für Mapping %s fehlgeschlagen", mapping.id
@@ -556,6 +686,7 @@ def test_connection(payload: ConnectionTestRequest) -> ConnectionTestResult:
 @app.get("/events", response_model=List[TrackedEventRead])
 def list_events(db: Session = Depends(get_db)):
     events = db.execute(select(TrackedEvent)).scalars().all()
+    _normalize_histories(events, db)
     _attach_conflicts(events, db)
     return events
 
