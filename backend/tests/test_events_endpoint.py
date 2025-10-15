@@ -1,10 +1,11 @@
 """Regression tests for the /events endpoint helpers."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+from textwrap import dedent
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
@@ -26,6 +27,7 @@ from backend.app.models import (
 )
 from backend.app.services import event_processor
 from backend.app.services.caldav_client import CalDavSettings
+from backend.app.utils.ics_parser import parse_ics_payload
 from sqlalchemy import select
 
 
@@ -428,3 +430,79 @@ def test_attendee_cancellation_updates_history_without_deletion(monkeypatch: pyt
         entry.get("description") == "Absage ignoriert (nicht vom Ersteller)"
         for entry in event.history or []
     )
+
+
+def test_upsert_events_preserves_synced_status_for_identical_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-importing unchanged events must keep their synced status for AutoSync."""
+
+    ics_payload = dedent(
+        """
+        BEGIN:VCALENDAR
+        VERSION:2.0
+        PRODID:-//CalSync//Test//DE
+        BEGIN:VEVENT
+        UID:uid-sync
+        SUMMARY:Planungsmeeting
+        DTSTART:20240101T090000Z
+        DTEND:20240101T100000Z
+        ORGANIZER:mailto:orga@example.com
+        END:VEVENT
+        END:VCALENDAR
+        """
+    ).encode()
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    imap_id = imap.id
+    mapping = SyncMapping(
+        imap_account_id=imap_id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    session.close()
+
+    parsed_events = parse_ics_payload(ics_payload)
+    event_processor.upsert_events(
+        parsed_events,
+        source_message_id="msg-1",
+        source_account_id=imap_id,
+        source_folder="INBOX",
+    )
+    with SessionLocal() as session:
+        persisted = session.execute(
+            select(TrackedEvent).where(TrackedEvent.uid == "uid-sync")
+        ).scalar_one()
+        event_id = persisted.id
+    event_processor.mark_as_synced([type("EventRef", (), {"id": event_id})()])
+
+    event_processor.upsert_events(
+        parse_ics_payload(ics_payload),
+        source_message_id="msg-2",
+        source_account_id=imap_id,
+        source_folder="INBOX",
+    )
+
+    with SessionLocal() as session:
+        event = session.execute(
+            select(TrackedEvent).where(TrackedEvent.uid == "uid-sync")
+        ).scalar_one()
+        assert event.status == EventStatus.SYNCED
+        assert len(event.history or []) == 2
+        assert event.mailbox_message_id == "msg-2"
+
+    captured: List[List[str]] = []
+
+    def _fake_sync(events, calendar_url, settings, progress_callback=None):  # pragma: no cover - verification helper
+        captured.append([event.uid for event in events])
+        return []
+
+    monkeypatch.setattr(event_processor, "sync_events_to_calendar", _fake_sync)
+
+    with SessionLocal() as session:
+        uploaded = perform_sync_all(session)
+
+    assert captured == []
+    assert uploaded == 0
