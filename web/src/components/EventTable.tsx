@@ -82,6 +82,10 @@ const sortOptionItems: Array<{ value: SortOption; label: string }> = [
   { value: 'none', label: 'Keine Sortierung' },
 ];
 
+const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
+type PageSize = (typeof PAGE_SIZE_OPTIONS)[number];
+const DEFAULT_PAGE_SIZE: PageSize = 10;
+
 function formatDateTime(value?: string) {
   if (!value) {
     return null;
@@ -185,6 +189,8 @@ export default function EventTable({
   const [sortOption, setSortOption] = useState<SortOption>('email-desc');
   const [statusFilters, setStatusFilters] = useState<TrackedEvent['status'][]>([]);
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
+  const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
+  const [page, setPage] = useState(1);
   const pollersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -210,6 +216,10 @@ export default function EventTable({
   useEffect(() => {
     setIntervalInput(String(autoSyncIntervalMinutes));
   }, [autoSyncIntervalMinutes]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [searchTerm, statusFilters, sortOption, pageSize]);
 
   // Compose the visible event list by applying search, status filters and sorting preferences.
   const filteredEvents = useMemo(() => {
@@ -261,6 +271,23 @@ export default function EventTable({
     return sorted;
   }, [events, searchTerm, statusFilters, sortOption]);
 
+  const totalPages = useMemo(() => {
+    return Math.max(1, Math.ceil(filteredEvents.length / pageSize));
+  }, [filteredEvents, pageSize]);
+
+  const paginatedEvents = useMemo(() => {
+    const start = (page - 1) * pageSize;
+    return filteredEvents.slice(start, start + pageSize);
+  }, [filteredEvents, page, pageSize]);
+
+  const totalEvents = filteredEvents.length;
+  const pageStart = totalEvents === 0 ? 0 : (page - 1) * pageSize + 1;
+  const pageEnd = totalEvents === 0 ? 0 : Math.min(page * pageSize, totalEvents);
+
+  useEffect(() => {
+    setPage((prev) => Math.min(prev, totalPages));
+  }, [totalPages]);
+
   // Aggregate key performance indicators for the overview widgets.
   const metrics = useMemo(() => {
     const outstanding = events.filter(
@@ -310,6 +337,18 @@ export default function EventTable({
 
   function resetStatusFilters() {
     setStatusFilters([]);
+  }
+
+  function handlePageSizeChange(event: ChangeEvent<HTMLSelectElement>) {
+    setPageSize(Number(event.target.value) as PageSize);
+  }
+
+  function goToPreviousPage() {
+    setPage((prev) => Math.max(1, prev - 1));
+  }
+
+  function goToNextPage() {
+    setPage((prev) => Math.min(totalPages, prev + 1));
   }
 
   function asNumber(value: unknown, fallback = 0): number {
@@ -812,20 +851,36 @@ export default function EventTable({
             </div>
           </div>
           <div className="mt-3 flex flex-col gap-3 border-t border-slate-800 pt-3 md:flex-row md:items-center md:justify-between">
-            <label className="flex items-center gap-2 text-xs text-slate-300">
-              <span className="font-semibold uppercase tracking-wide text-slate-400">Sortierung</span>
-              <select
-                value={sortOption}
-                onChange={handleSortChange}
-                className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
-              >
-                {sortOptionItems.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
+              <label className="flex items-center gap-2">
+                <span className="font-semibold uppercase tracking-wide text-slate-400">Sortierung</span>
+                <select
+                  value={sortOption}
+                  onChange={handleSortChange}
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+                >
+                  {sortOptionItems.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="font-semibold uppercase tracking-wide text-slate-400">Termine pro Seite</span>
+                <select
+                  value={pageSize}
+                  onChange={handlePageSizeChange}
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+                >
+                  {PAGE_SIZE_OPTIONS.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Statusfilter</span>
               <button
@@ -917,9 +972,9 @@ export default function EventTable({
         </div>
       )}
 
-      {!showInitialLoading && filteredEvents.length > 0 && (
+      {!showInitialLoading && totalEvents > 0 && (
         <div className="space-y-3">
-          {filteredEvents.map((event) => {
+          {paginatedEvents.map((event) => {
             const isOpen = openItems.includes(event.id);
             const dateRange = formatDateRange(event);
             const sourceParts = [
@@ -1073,6 +1128,37 @@ export default function EventTable({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {!showEmptyState && totalEvents > 0 && (
+        <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <span>
+              Zeige {pageStart}–{pageEnd} von {totalEvents} Terminen
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <button
+              type="button"
+              onClick={goToPreviousPage}
+              disabled={page === 1}
+              className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+            >
+              Vorherige Seite
+            </button>
+            <span className="px-2 py-1 text-slate-400">
+              Seite {page} von {totalPages}
+            </span>
+            <button
+              type="button"
+              onClick={goToNextPage}
+              disabled={page === totalPages || totalEvents === 0}
+              className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+            >
+              Nächste Seite
+            </button>
+          </div>
         </div>
       )}
     </div>
