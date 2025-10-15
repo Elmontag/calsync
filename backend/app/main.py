@@ -224,15 +224,62 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
         try:
             with CalDavConnection(settings) as client:
                 calendar = client.principal().calendar(cal_url=mapping.calendar_url)
+                windows: List[Tuple[TrackedEvent, datetime, datetime]] = []
                 for event in events_for_mapping:
                     start, end = _event_search_window(event)
                     if start is None or end is None:
                         continue
-                    conflicts = find_conflicting_events(
-                        calendar, start, end, exclude_uid=event.uid
-                    )
-                    if conflicts:
-                        setattr(event, "conflicts", conflicts)
+                    windows.append((event, start, end))
+
+                if not windows:
+                    continue
+
+                overall_start = min(start for _, start, _ in windows)
+                overall_end = max(end for _, _, end in windows)
+                logger.debug(
+                    "Prüfe Konflikte für Mapping %s (%s Events) im Zeitraum %s bis %s",
+                    mapping.id,
+                    len(windows),
+                    overall_start,
+                    overall_end,
+                )
+
+                candidates = find_conflicting_events(calendar, overall_start, overall_end)
+                parsed_candidates: List[Tuple[Dict[str, Any], datetime, datetime]] = []
+                for candidate in candidates:
+                    start_raw = candidate.get("start")
+                    end_raw = candidate.get("end")
+                    if not isinstance(start_raw, str) or not isinstance(end_raw, str):
+                        logger.warning(
+                            "Konflikt ohne gültige Zeitangaben für Mapping %s übersprungen: %s",
+                            mapping.id,
+                            candidate,
+                        )
+                        continue
+                    try:
+                        cand_start = datetime.fromisoformat(start_raw)
+                        cand_end = datetime.fromisoformat(end_raw)
+                    except ValueError:
+                        logger.warning(
+                            "Konnte Konfliktzeiten nicht parsen für Mapping %s: %s",
+                            mapping.id,
+                            candidate,
+                        )
+                        continue
+                    cand_start = _ensure_timezone(cand_start)
+                    cand_end = _ensure_timezone(cand_end)
+                    parsed_candidates.append((candidate, cand_start, cand_end))
+
+                for event, start, end in windows:
+                    conflicts_for_event: List[Dict[str, Any]] = []
+                    for candidate, cand_start, cand_end in parsed_candidates:
+                        if candidate.get("uid") == event.uid:
+                            continue
+                        if cand_start >= end or cand_end <= start:
+                            continue
+                        conflicts_for_event.append(candidate)
+                    if conflicts_for_event:
+                        setattr(event, "conflicts", conflicts_for_event)
         except Exception:
             logger.exception(
                 "Konfliktprüfung für Mapping %s fehlgeschlagen", mapping.id

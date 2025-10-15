@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sys
-from typing import Any, Iterator
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 from fastapi.testclient import TestClient
@@ -77,8 +77,15 @@ def _store_basic_accounts(session: SessionLocal) -> tuple[Account, Account]:
     return imap, caldav
 
 
-def _store_event(session: SessionLocal, *, uid: str, account: Account, folder: str) -> None:
-    now = datetime.now(tz=timezone.utc)
+def _store_event(
+    session: SessionLocal,
+    *,
+    uid: str,
+    account: Account,
+    folder: str,
+    start: Optional[datetime] = None,
+) -> None:
+    now = start or datetime.now(tz=timezone.utc)
     session.add(
         TrackedEvent(
             uid=uid,
@@ -116,16 +123,42 @@ def test_list_events_handles_duplicate_caldav_targets(monkeypatch: pytest.Monkey
         ]
     )
     session.commit()
-    _store_event(session, uid="uid-1", account=imap, folder="INBOX")
-    _store_event(session, uid="uid-2", account=imap, folder="Team")
+    inbox_start = datetime(2024, 1, 1, 9, 0, tzinfo=timezone.utc)
+    team_start = inbox_start + timedelta(days=1)
+    _store_event(session, uid="uid-1", account=imap, folder="INBOX", start=inbox_start)
+    _store_event(session, uid="uid-2", account=imap, folder="Team", start=team_start)
 
     monkeypatch.setattr("backend.app.main.CalDavConnection", lambda settings: _FakeConnection())
+
+    calls: List[Tuple[datetime, datetime, Optional[str]]] = []
+
+    def _conflicts(
+        _calendar: Any,
+        start: datetime,
+        end: datetime,
+        exclude_uid: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        calls.append((start, end, exclude_uid))
+        if abs((start - inbox_start).total_seconds()) < 1:
+            return [
+                {
+                    "uid": "conflict-uid",
+                    "summary": "Überschneidung",
+                    "start": inbox_start.isoformat(),
+                    "end": (inbox_start + timedelta(hours=1)).isoformat(),
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("backend.app.main.find_conflicting_events", _conflicts)
 
     events = list_events(db=session)
 
     assert {event.uid for event in events} == {"uid-1", "uid-2"}
-    for event in events:
-        assert getattr(event, "conflicts", []) == []
+    mapped = {event.uid: getattr(event, "conflicts", []) for event in events}
+    assert mapped["uid-1"][0]["uid"] == "conflict-uid"
+    assert mapped["uid-2"] == []
+    assert len(calls) == 2
 
 
 class _ExplodingConnection:
@@ -159,6 +192,59 @@ def test_list_events_survives_conflict_lookup_failure(monkeypatch: pytest.Monkey
     assert getattr(events[0], "conflicts", []) == []
 
 
+def test_conflict_lookup_runs_once_per_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Conflict detection fetches CalDAV data only once per mapping regardless of event count."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    session.add(
+        SyncMapping(
+            imap_account_id=imap.id,
+            imap_folder="INBOX",
+            caldav_account_id=caldav.id,
+            calendar_url="https://cal.example.com/shared",
+        )
+    )
+    session.commit()
+
+    primary_start = datetime(2024, 2, 1, 10, 0, tzinfo=timezone.utc)
+    later_start = primary_start + timedelta(hours=4)
+    _store_event(session, uid="uid-a", account=imap, folder="INBOX", start=primary_start)
+    _store_event(session, uid="uid-b", account=imap, folder="INBOX", start=later_start)
+
+    monkeypatch.setattr("backend.app.main.CalDavConnection", lambda settings: _FakeConnection())
+
+    call_count = 0
+
+    def _conflicts(
+        _calendar: Any,
+        start: datetime,
+        end: datetime,
+        exclude_uid: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        nonlocal call_count
+        call_count += 1
+        assert exclude_uid is None
+        assert start <= primary_start <= end
+        return [
+            {
+                "uid": "conflict-shared",
+                "summary": "Paralleltermin",
+                "start": primary_start.isoformat(),
+                "end": (primary_start + timedelta(hours=1)).isoformat(),
+            }
+        ]
+
+    monkeypatch.setattr("backend.app.main.find_conflicting_events", _conflicts)
+
+    events = list_events(db=session)
+
+    conflicts_by_uid = {event.uid: getattr(event, "conflicts", []) for event in events}
+    assert conflicts_by_uid["uid-a"][0]["uid"] == "conflict-shared"
+    assert conflicts_by_uid["uid-b"] == []
+    assert call_count == 1
+
+
 def test_events_endpoint_handles_multiple_folders_with_conflicts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,8 +270,10 @@ def test_events_endpoint_handles_multiple_folders_with_conflicts(
     )
     session.commit()
 
-    _store_event(session, uid="uid-1", account=imap, folder="INBOX")
-    _store_event(session, uid="uid-2", account=imap, folder="Team")
+    inbox_start = datetime(2024, 3, 1, 8, 0, tzinfo=timezone.utc)
+    team_start = inbox_start + timedelta(days=1)
+    _store_event(session, uid="uid-1", account=imap, folder="INBOX", start=inbox_start)
+    _store_event(session, uid="uid-2", account=imap, folder="Team", start=team_start)
 
     # Force legacy payload cleanup during the request to reproduce the regression conditions.
     legacy_event = session.execute(
@@ -195,14 +283,22 @@ def test_events_endpoint_handles_multiple_folders_with_conflicts(
     session.commit()
     session.close()
 
-    def _conflicts(_: Any, __: datetime, ___: datetime, exclude_uid: str | None = None):
-        if exclude_uid == "uid-1":
+    calls: List[Tuple[datetime, datetime, Optional[str]]] = []
+
+    def _conflicts(
+        _calendar: Any,
+        start: datetime,
+        end: datetime,
+        exclude_uid: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        calls.append((start, end, exclude_uid))
+        if abs((start - inbox_start).total_seconds()) < 1:
             return [
                 {
                     "uid": "conflict-1",
                     "summary": "Überschneidung",
-                    "start": datetime.now(tz=timezone.utc).isoformat(),
-                    "end": (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat(),
+                    "start": inbox_start.isoformat(),
+                    "end": (inbox_start + timedelta(hours=1)).isoformat(),
                 }
             ]
         return []
@@ -219,3 +315,4 @@ def test_events_endpoint_handles_multiple_folders_with_conflicts(
     mapped = {event["uid"]: event for event in payload}
     assert mapped["uid-1"]["conflicts"][0]["uid"] == "conflict-1"
     assert mapped["uid-2"]["conflicts"] == []
+    assert len(calls) == 2
