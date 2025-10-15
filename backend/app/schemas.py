@@ -73,6 +73,17 @@ class CalendarConflict(BaseModel):
     end: Optional[datetime] = None
 
 
+class EventSyncState(BaseModel):
+    local_version: int = 0
+    synced_version: int = 0
+    has_conflict: bool = False
+    conflict_reason: Optional[str] = None
+    local_last_modified: Optional[datetime] = None
+    remote_last_modified: Optional[datetime] = None
+    last_modified_source: Optional[str] = None
+    caldav_etag: Optional[str] = None
+
+
 class TrackedEventRead(BaseModel):
     id: int
     uid: str
@@ -86,6 +97,7 @@ class TrackedEventRead(BaseModel):
     response_status: EventResponseStatus
     history: List[EventHistoryEntry] = Field(default_factory=list)
     conflicts: List[CalendarConflict] = Field(default_factory=list)
+    sync_state: EventSyncState = Field(default_factory=EventSyncState)
     created_at: datetime
     updated_at: datetime
 

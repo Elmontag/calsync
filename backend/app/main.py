@@ -303,6 +303,26 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
             continue
 
 
+def _attach_sync_state(events: List[TrackedEvent]) -> None:
+    """Expose synchronization metadata for API responses."""
+
+    for event in events:
+        setattr(
+            event,
+            "sync_state",
+            {
+                "local_version": event.local_version or 0,
+                "synced_version": event.synced_version or 0,
+                "has_conflict": bool(event.sync_conflict),
+                "conflict_reason": event.sync_conflict_reason,
+                "local_last_modified": event.local_last_modified,
+                "remote_last_modified": event.remote_last_modified,
+                "last_modified_source": event.last_modified_source,
+                "caldav_etag": event.caldav_etag,
+            },
+        )
+
+
 def _folder_selections(account: Account) -> List[FolderSelection]:
     """Build the folder selection list for an IMAP account."""
 
@@ -361,15 +381,39 @@ def _execute_scan_job(job_id: str) -> None:
     """Background execution for mailbox scans with progress updates."""
 
     logger.info("Starting mailbox scan job %s", job_id)
-    job_tracker.update(job_id, status="running", processed=0, total=0)
+    job_tracker.update(
+        job_id,
+        status="running",
+        processed=0,
+        total=0,
+        detail={
+            "phase": "Postfach-Scan",
+            "description": "Postfächer werden analysiert…",
+            "processed": 0,
+            "total": 0,
+        },
+    )
 
     try:
         with SessionLocal() as session:
+            progress_state = {"processed": 0, "total": 0}
+
             def progress(processed_delta: int, total_delta: int) -> None:
                 if total_delta:
                     job_tracker.increment(job_id, total_delta=total_delta)
+                    progress_state["total"] += total_delta
                 if processed_delta:
                     job_tracker.increment(job_id, processed_delta=processed_delta)
+                    progress_state["processed"] += processed_delta
+                job_tracker.update(
+                    job_id,
+                    detail={
+                        "phase": "Postfach-Scan",
+                        "description": "Postfächer werden analysiert…",
+                        "processed": progress_state["processed"],
+                        "total": progress_state["total"],
+                    },
+                )
 
             messages, events = perform_mail_scan(session, progress_callback=progress)
 
@@ -379,6 +423,8 @@ def _execute_scan_job(job_id: str) -> None:
             detail={
                 "messages_processed": messages,
                 "events_imported": events,
+                "phase": "Postfach-Scan",
+                "description": "Scan abgeschlossen",
             },
         )
     except Exception:
@@ -391,7 +437,18 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
 
     logger.info("Starting manual sync job %s", job_id)
     total = len(event_ids)
-    job_tracker.update(job_id, status="running", processed=0, total=total)
+    job_tracker.update(
+        job_id,
+        status="running",
+        processed=0,
+        total=total,
+        detail={
+            "phase": "Prüfung",
+            "description": "Terminauswahl wird geprüft…",
+            "processed": 0,
+            "total": total,
+        },
+    )
 
     processed = 0
     missing: List[ManualSyncMissingDetail] = []
@@ -430,7 +487,16 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
                         )
                     )
                     processed += 1
-                    job_tracker.update(job_id, processed=processed)
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
                     continue
 
                 mapping = (
@@ -454,7 +520,16 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
                         )
                     )
                     processed += 1
-                    job_tracker.update(job_id, processed=processed)
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
                     continue
 
                 caldav_account = session.get(Account, mapping.caldav_account_id)
@@ -469,7 +544,16 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
                         )
                     )
                     processed += 1
-                    job_tracker.update(job_id, processed=processed)
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
                     continue
 
                 try:
@@ -488,7 +572,16 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
                         )
                     )
                     processed += 1
-                    job_tracker.update(job_id, processed=processed)
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
                     continue
 
                 group = sync_groups.setdefault(
@@ -500,12 +593,31 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
             def progress(event: TrackedEvent, success: bool) -> None:
                 nonlocal processed
                 processed += 1
-                job_tracker.update(job_id, processed=processed)
+                title = event.summary or event.uid
+                job_tracker.update(
+                    job_id,
+                    processed=processed,
+                    detail={
+                        "phase": "Synchronisation",
+                        "description": f"Übertrage \"{title}\"",
+                        "processed": processed,
+                        "total": total,
+                    },
+                )
 
             for group in sync_groups.values():
                 mapping: SyncMapping = group["mapping"]
                 settings: CalDavSettings = group["settings"]
                 events_for_mapping: List[TrackedEvent] = group["events"]
+                job_tracker.update(
+                    job_id,
+                    detail={
+                        "phase": "Synchronisation",
+                        "description": f"Synchronisiere {len(events_for_mapping)} Termine mit {mapping.calendar_name or mapping.calendar_url}",
+                        "processed": processed,
+                        "total": total,
+                    },
+                )
                 uploaded.extend(
                     event_processor.sync_events_to_calendar(
                         events_for_mapping,
@@ -526,21 +638,50 @@ def _execute_sync_all_job(job_id: str) -> None:
     """Background execution for syncing all pending events."""
 
     logger.info("Starting sync-all job %s", job_id)
-    job_tracker.update(job_id, status="running", processed=0, total=0)
+    job_tracker.update(
+        job_id,
+        status="running",
+        processed=0,
+        total=0,
+        detail={
+            "phase": "Synchronisation",
+            "description": "Kalenderabgleich läuft…",
+            "processed": 0,
+            "total": 0,
+        },
+    )
     processed = 0
+    progress_state = {"total": 0}
 
     def progress(processed_delta: int, total_delta: int) -> None:
         nonlocal processed
         if total_delta:
             job_tracker.increment(job_id, total_delta=total_delta)
+            progress_state["total"] += total_delta
         if processed_delta:
             processed += processed_delta
-            job_tracker.update(job_id, processed=processed)
+            job_tracker.update(
+                job_id,
+                processed=processed,
+                detail={
+                    "phase": "Synchronisation",
+                    "description": "Kalenderabgleich läuft…",
+                    "processed": processed,
+                    "total": progress_state["total"],
+                },
+            )
 
     try:
         with SessionLocal() as session:
             uploaded = perform_sync_all(session, progress_callback=progress)
-        job_tracker.finish(job_id, detail={"uploaded": uploaded})
+        job_tracker.finish(
+            job_id,
+            detail={
+                "uploaded": uploaded,
+                "phase": "Synchronisation",
+                "description": "Kalenderabgleich abgeschlossen",
+            },
+        )
     except Exception:
         logger.exception("Sync-all job %s failed", job_id)
         job_tracker.fail(job_id, "Synchronisation fehlgeschlagen.")
@@ -704,6 +845,7 @@ def list_events(db: Session = Depends(get_db)):
     events = db.execute(select(TrackedEvent)).scalars().all()
     _normalize_histories(events, db)
     _attach_conflicts(events, db)
+    _attach_sync_state(events)
     return events
 
 
@@ -761,6 +903,11 @@ def update_event_response(
             "description": description_map.get(response, "Teilnahmestatus aktualisiert"),
         },
     )
+    event.local_version = (event.local_version or 0) + 1
+    event.local_last_modified = datetime.utcnow()
+    event.last_modified_source = "local"
+    event.sync_conflict = False
+    event.sync_conflict_reason = None
     mapping: Optional[SyncMapping] = None
     caldav_settings: Optional[CalDavSettings] = None
     if event.source_account_id and event.source_folder:
@@ -811,6 +958,7 @@ def update_event_response(
             event.uid,
         )
     _attach_conflicts([event], db)
+    _attach_sync_state([event])
     return event
 
 
@@ -854,6 +1002,7 @@ def perform_sync_all(
                     ),
                 )
             )
+            .where(TrackedEvent.sync_conflict.is_(False))
         ).scalars().all()
         if not events:
             continue
@@ -943,23 +1092,70 @@ def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db))
                 return
             state = job_tracker.create(AUTO_SYNC_JOB_ID, total=0)
             _auto_sync_state["job_id"] = state.job_id
-        job_tracker.update(state.job_id, status="running", processed=0, total=0)
+        job_tracker.update(
+            state.job_id,
+            status="running",
+            processed=0,
+            total=0,
+            detail={
+                "phase": "Postfach-Scan",
+                "description": "AutoSync: Postfächer werden analysiert…",
+                "processed": 0,
+                "total": 0,
+            },
+        )
 
         try:
             with SessionLocal() as job_db:
+                scan_state = {"processed": 0, "total": 0}
+
                 def scan_progress(processed_delta: int, total_delta: int) -> None:
                     if total_delta:
                         job_tracker.increment(state.job_id, total_delta=total_delta)
+                        scan_state["total"] += total_delta
                     if processed_delta:
                         job_tracker.increment(state.job_id, processed_delta=processed_delta)
+                        scan_state["processed"] += processed_delta
+                    job_tracker.update(
+                        state.job_id,
+                        detail={
+                            "phase": "Postfach-Scan",
+                            "description": "AutoSync: Postfächer werden analysiert…",
+                            "processed": scan_state["processed"],
+                            "total": scan_state["total"],
+                        },
+                    )
 
                 messages, events = perform_mail_scan(job_db, progress_callback=scan_progress)
+
+                job_tracker.update(
+                    state.job_id,
+                    detail={
+                        "phase": "Synchronisation",
+                        "description": "AutoSync: Kalenderabgleich läuft…",
+                        "processed": 0,
+                        "total": 0,
+                    },
+                )
+
+                sync_state = {"processed": 0, "total": 0}
 
                 def sync_progress(processed_delta: int, total_delta: int) -> None:
                     if total_delta:
                         job_tracker.increment(state.job_id, total_delta=total_delta)
+                        sync_state["total"] += total_delta
                     if processed_delta:
                         job_tracker.increment(state.job_id, processed_delta=processed_delta)
+                        sync_state["processed"] += processed_delta
+                    job_tracker.update(
+                        state.job_id,
+                        detail={
+                            "phase": "Synchronisation",
+                            "description": "AutoSync: Kalenderabgleich läuft…",
+                            "processed": sync_state["processed"],
+                            "total": sync_state["total"],
+                        },
+                    )
 
                 uploaded = perform_sync_all(
                     job_db,
@@ -973,6 +1169,8 @@ def configure_auto_sync(payload: AutoSyncRequest, db: Session = Depends(get_db))
                     "messages_processed": messages,
                     "events_imported": events,
                     "uploaded": uploaded,
+                    "phase": "Synchronisation",
+                    "description": "AutoSync abgeschlossen",
                 },
             )
         except Exception:

@@ -117,6 +117,24 @@ function formatConflictRange(conflict: TrackedEvent['conflicts'][number]) {
   return start ?? end ?? 'Keine Zeitangabe';
 }
 
+function formatSyncTimestamp(value?: string | null) {
+  if (!value) {
+    return 'Keine Angabe';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return 'Keine Angabe';
+  }
+  const datePart = date.toLocaleDateString('de-DE');
+  const timePart = date.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+  return `${datePart} ${timePart}`;
+}
+
+const syncSourceLabels: Record<string, string> = {
+  local: 'Lokal',
+  remote: 'CalDAV',
+};
+
 function parseIsoDate(value?: string | null): Date | null {
   if (!value) {
     return null;
@@ -304,6 +322,7 @@ export default function EventTable({
       (event) => event.response_status === 'none' && event.status !== 'cancelled',
     ).length;
     const conflicts = events.filter((event) => (event.conflicts?.length ?? 0) > 0).length;
+    const syncConflicts = events.filter((event) => event.sync_state?.has_conflict).length;
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
     const todayEnd = new Date();
@@ -315,7 +334,7 @@ export default function EventTable({
       const startDate = new Date(event.start);
       return startDate >= todayStart && startDate <= todayEnd;
     }).length;
-    return { outstanding, processed, cancelled, awaitingDecision, today, conflicts };
+    return { outstanding, processed, cancelled, awaitingDecision, today, conflicts, syncConflicts };
   }, [events]);
 
   function toggleSelection(id: number) {
@@ -623,9 +642,15 @@ export default function EventTable({
     const normalizedTotal = total > 0 ? total : 0;
     const normalizedProcessed =
       normalizedTotal > 0 ? Math.min(processed, normalizedTotal) : processed;
+    const detail =
+      job.detail && typeof job.detail === 'object'
+        ? (job.detail as Record<string, unknown>)
+        : null;
+    const detailProcessed = detail ? asNumber(detail.processed, normalizedProcessed) : normalizedProcessed;
+    const detailTotal = detail ? asNumber(detail.total, normalizedTotal) : normalizedTotal;
     const percent =
-      normalizedTotal > 0
-        ? Math.min(100, Math.round((normalizedProcessed / normalizedTotal) * 100))
+      detailTotal > 0
+        ? Math.min(100, Math.round((detailProcessed / detailTotal) * 100))
         : job.status === 'completed'
         ? 100
         : 0;
@@ -635,20 +660,31 @@ export default function EventTable({
         : job.status === 'completed'
         ? 'Abgeschlossen'
         : 'Läuft…';
+    const description =
+      detail && typeof detail.description === 'string'
+        ? (detail.description as string)
+        : statusLabel;
+    const phaseLabel =
+      detail && typeof detail.phase === 'string' ? (detail.phase as string) : undefined;
     return (
-      <div className="rounded-lg border border-slate-800 bg-slate-950/80 p-4" key={label}>
+      <div className="w-full rounded-xl border border-slate-800 bg-slate-950/80 p-4" key={label}>
         <div className="flex items-center justify-between text-xs text-slate-300">
-          <span className="font-semibold text-slate-100">{label}</span>
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-slate-100">{label}</span>
+            {phaseLabel && (
+              <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
+                {phaseLabel}
+              </span>
+            )}
+          </div>
           <span>
             {statusLabel}
-            {normalizedTotal > 0 ? ` · ${normalizedProcessed}/${normalizedTotal}` : ''}
+            {detailTotal > 0 ? ` · ${detailProcessed}/${detailTotal}` : ''}
           </span>
         </div>
-        <div className="mt-2 h-2 rounded-full bg-slate-800">
-          <div
-            className={`h-2 rounded-full transition-all ${accentClass}`}
-            style={{ width: `${percent}%` }}
-          />
+        <p className="mt-2 text-xs text-slate-400">{description}</p>
+        <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+          <div className={`h-full transition-all ${accentClass}`} style={{ width: `${percent}%` }} />
         </div>
       </div>
     );
@@ -805,8 +841,12 @@ export default function EventTable({
           <p className="mt-1 text-2xl font-semibold text-sky-300">{metrics.today}</p>
         </div>
         <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Konflikte</p>
+          <p className="text-xs uppercase tracking-wide text-slate-500">Kalender-Konflikte</p>
           <p className="mt-1 text-2xl font-semibold text-amber-300">{metrics.conflicts}</p>
+          <p className="mt-2 text-xs text-slate-400">
+            Sync-Konflikte:{' '}
+            <span className="font-semibold text-rose-300">{metrics.syncConflicts}</span>
+          </p>
         </div>
       </div>
 
@@ -949,7 +989,7 @@ export default function EventTable({
         </div>
 
         {(scanJob || syncAllJob || selectionJob || autoJob) && (
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+          <div className="space-y-3">
             {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
             {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
             {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
@@ -1016,6 +1056,8 @@ export default function EventTable({
               event.source_folder,
             ].filter(Boolean);
             const conflictCount = event.conflicts?.length ?? 0;
+            const syncState = event.sync_state;
+            const hasSyncConflict = syncState?.has_conflict ?? false;
             return (
               <div
                 key={event.id}
@@ -1069,6 +1111,11 @@ export default function EventTable({
                         {conflictCount === 1 ? '1 Konflikt' : `${conflictCount} Konflikte`}
                       </span>
                     )}
+                    {hasSyncConflict && (
+                      <span className="inline-flex items-center rounded-full bg-rose-500/20 px-3 py-1 text-xs font-semibold text-rose-300">
+                        Sync-Konflikt
+                      </span>
+                    )}
                   </div>
                 </div>
                 {isOpen && (
@@ -1113,6 +1160,41 @@ export default function EventTable({
                         </ul>
                       </div>
                     )}
+                    {hasSyncConflict && (
+                      <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-100">
+                        <p className="text-sm font-semibold text-rose-200">Synchronisationskonflikt</p>
+                        <p className="mt-1 text-rose-100/80">
+                          {syncState?.conflict_reason ??
+                            'Server- und lokale Version unterscheiden sich. Bitte Termin prüfen.'}
+                        </p>
+                      </div>
+                    )}
+                    <div className="mt-4 grid gap-3 text-xs text-slate-400 sm:grid-cols-2">
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">Letzte lokale Änderung</p>
+                        <p className="mt-1 text-slate-300">
+                          {formatSyncTimestamp(syncState?.local_last_modified)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">Letzte Serveränderung</p>
+                        <p className="mt-1 text-slate-300">
+                          {formatSyncTimestamp(syncState?.remote_last_modified)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">Quelle der letzten Änderung</p>
+                        <p className="mt-1 text-slate-300">
+                          {syncState?.last_modified_source
+                            ? syncSourceLabels[syncState.last_modified_source] ?? syncState.last_modified_source
+                            : 'Keine Angabe'}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">CalDAV ETag</p>
+                        <p className="mt-1 break-all text-slate-300">{syncState?.caldav_etag ?? '–'}</p>
+                      </div>
+                    </div>
                     <div className="mt-4">
                       <p className="text-xs uppercase tracking-wide text-slate-500">Historie</p>
                       {event.history.length > 0 ? (

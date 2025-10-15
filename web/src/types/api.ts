@@ -48,6 +48,7 @@ export interface TrackedEvent {
   response_status: 'none' | 'accepted' | 'tentative' | 'declined';
   history: EventHistoryEntry[];
   conflicts: CalendarConflict[];
+  sync_state: EventSyncState;
   created_at: string;
   updated_at: string;
 }
@@ -63,6 +64,17 @@ export interface CalendarConflict {
   summary?: string;
   start?: string;
   end?: string;
+}
+
+export interface EventSyncState {
+  local_version: number;
+  synced_version: number;
+  has_conflict: boolean;
+  conflict_reason?: string | null;
+  local_last_modified?: string | null;
+  remote_last_modified?: string | null;
+  last_modified_source?: string | null;
+  caldav_etag?: string | null;
 }
 
 export interface ManualSyncRequest {

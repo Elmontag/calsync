@@ -26,9 +26,10 @@ from backend.app.models import (
     TrackedEvent,
 )
 from backend.app.services import event_processor
-from backend.app.services.caldav_client import CalDavSettings
+from backend.app.services.caldav_client import CalDavSettings, RemoteEventState
 from backend.app.utils.ics_parser import parse_ics_payload
 from sqlalchemy import select
+from icalendar import Calendar, Event as ICalEvent
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +62,32 @@ class _FakeConnection:
 
     def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - nothing to clean up
         return None
+
+
+def _build_ical(
+    *,
+    method: Optional[str],
+    uid: str,
+    summary: str,
+    start: datetime,
+    end: datetime,
+    status: str,
+) -> str:
+    calendar = Calendar()
+    calendar.add("PRODID", "-//CalSync Tests//DE")
+    calendar.add("VERSION", "2.0")
+    if method:
+        calendar.add("METHOD", method)
+    component = ICalEvent()
+    component.add("UID", uid)
+    component.add("SUMMARY", summary)
+    component.add("DTSTART", start)
+    component.add("DTEND", end)
+    component.add("DTSTAMP", start)
+    component.add("LAST-MODIFIED", end)
+    component.add("STATUS", status)
+    calendar.add_component(component)
+    return calendar.to_ical().decode()
 
 
 def _store_basic_accounts(session: SessionLocal) -> tuple[Account, Account]:
@@ -506,3 +533,208 @@ def test_upsert_events_preserves_synced_status_for_identical_payload(monkeypatch
 
     assert captured == []
     assert uploaded == 0
+
+
+def test_remote_cancellation_keeps_server_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellations originating in CalDAV must not be removed during sync."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    start = datetime(2024, 5, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "remote-cancel"
+    session.add(
+        TrackedEvent(
+            uid=uid,
+            summary="Team Sync",
+            start=start,
+            end=end,
+            status=EventStatus.SYNCED,
+            response_status=EventResponseStatus.NONE,
+            source_account_id=imap.id,
+            source_folder="INBOX",
+            payload=_build_ical(
+                method=None,
+                uid=uid,
+                summary="Team Sync",
+                start=start,
+                end=end,
+                status="CONFIRMED",
+            ),
+            caldav_etag="etag-old",
+            local_version=1,
+            synced_version=1,
+            history=[],
+        )
+    )
+    session.commit()
+    event = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalar_one()
+    remote_payload = _build_ical(
+        method="CANCEL",
+        uid=uid,
+        summary="Team Sync",
+        start=start,
+        end=end,
+        status="CANCELLED",
+    )
+    remote_state = RemoteEventState(
+        uid=uid,
+        etag="etag-new",
+        last_modified=end + timedelta(hours=1),
+        payload=remote_payload,
+    )
+
+    event_processor._apply_remote_snapshot(event, remote_state)
+
+    session.refresh(event)
+    assert event.status == EventStatus.CANCELLED
+    assert event.cancelled_by_organizer is True
+    assert event.last_modified_source == "remote"
+
+    deleted_calls: List[str] = []
+    uploaded_calls: List[str] = []
+    cancellation_updates: List[Dict[int, tuple[bool, Optional[RemoteEventState]]]] = []
+
+    def _fake_delete(*_args, **_kwargs) -> bool:
+        deleted_calls.append("called")
+        return False
+
+    def _fake_upload(*_args, **_kwargs):
+        uploaded_calls.append("called")
+        return remote_state
+
+    def _fake_mark(results):
+        cancellation_updates.append(results)
+
+    monkeypatch.setattr("backend.app.services.event_processor.delete_event_by_uid", _fake_delete)
+    monkeypatch.setattr("backend.app.services.event_processor.upload_ical", _fake_upload)
+    monkeypatch.setattr("backend.app.services.event_processor.mark_as_cancelled", _fake_mark)
+    monkeypatch.setattr(
+        "backend.app.services.event_processor.get_event_state", lambda *_args, **_kwargs: remote_state
+    )
+
+    settings = CalDavSettings(url="https://cal.example.com", username="user", password="secret")
+    sync_events = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalars().all()
+    event_processor.sync_events_to_calendar(sync_events, "https://cal.example.com/shared", settings)
+
+    assert not deleted_calls
+    assert not uploaded_calls
+    assert cancellation_updates == []
+
+
+def test_organizer_cancellation_exports_cancel_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Organizer cancellations must be pushed to CalDAV as cancelled events."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    start = datetime(2024, 6, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "local-cancel"
+    payload = _build_ical(
+        method="CANCEL",
+        uid=uid,
+        summary="Projektstatus",
+        start=start,
+        end=end,
+        status="CANCELLED",
+    )
+    parsed = parse_ics_payload(payload.encode())
+    stored = event_processor.upsert_events(parsed, "msg-cancel", source_account_id=imap.id, source_folder="INBOX")
+    assert stored
+    session_event = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalar_one()
+
+    uploaded_states: List[RemoteEventState] = []
+    deleted_calls: List[str] = []
+
+    def _fake_upload(_url, _ical, _settings):
+        state = RemoteEventState(uid=uid, etag="etag-cancel", last_modified=end + timedelta(minutes=5), payload=payload)
+        uploaded_states.append(state)
+        return state
+
+    def _fake_delete(*_args, **_kwargs) -> bool:
+        deleted_calls.append("called")
+        return False
+
+    monkeypatch.setattr("backend.app.services.event_processor.upload_ical", _fake_upload)
+    monkeypatch.setattr("backend.app.services.event_processor.delete_event_by_uid", _fake_delete)
+    monkeypatch.setattr(
+        "backend.app.services.event_processor.get_event_state", lambda *_args, **_kwargs: None
+    )
+    settings = CalDavSettings(url="https://cal.example.com", username="user", password="secret")
+
+    event_processor.sync_events_to_calendar([session_event], "https://cal.example.com/shared", settings)
+
+    assert uploaded_states, "Cancellation should trigger an upload"
+    assert not deleted_calls
+
+    with SessionLocal() as verify_session:
+        refreshed = verify_session.execute(
+            select(TrackedEvent).where(TrackedEvent.uid == uid)
+        ).scalar_one()
+    assert refreshed.status == EventStatus.CANCELLED
+    assert refreshed.history[-1]["description"] == "Kalendereintrag als abgesagt markiert"
+
+
+def test_remote_reschedule_updates_local_snapshot() -> None:
+    """Remote updates must refresh the local copy when no local changes are pending."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    start = datetime(2024, 7, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "remote-update"
+    session.add(
+        TrackedEvent(
+            uid=uid,
+            summary="Kickoff",
+            start=start,
+            end=end,
+            status=EventStatus.SYNCED,
+            response_status=EventResponseStatus.NONE,
+            source_account_id=imap.id,
+            source_folder="INBOX",
+            payload=_build_ical(
+                method=None,
+                uid=uid,
+                summary="Kickoff",
+                start=start,
+                end=end,
+                status="CONFIRMED",
+            ),
+            caldav_etag="etag-original",
+            local_version=1,
+            synced_version=1,
+            history=[],
+        )
+    )
+    session.commit()
+    event = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalar_one()
+
+    new_start = start + timedelta(days=1)
+    new_end = new_start + timedelta(hours=1)
+    remote_payload = _build_ical(
+        method="PUBLISH",
+        uid=uid,
+        summary="Kickoff",
+        start=new_start,
+        end=new_end,
+        status="CONFIRMED",
+    )
+    remote_state = RemoteEventState(
+        uid=uid,
+        etag="etag-updated",
+        last_modified=new_end,
+        payload=remote_payload,
+    )
+
+    event_processor._apply_remote_snapshot(event, remote_state)
+
+    with SessionLocal() as verify_session:
+        updated = verify_session.execute(
+            select(TrackedEvent).where(TrackedEvent.uid == uid)
+        ).scalar_one()
+    assert updated.start == new_start.replace(tzinfo=None)
+    assert updated.end == new_end.replace(tzinfo=None)
+    assert updated.status == EventStatus.SYNCED
+    assert updated.last_modified_source == "remote"
+    assert updated.caldav_etag == "etag-updated"
