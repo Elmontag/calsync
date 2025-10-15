@@ -100,6 +100,7 @@ class TrackedEvent(Base):
         default=EventResponseStatus.NONE,
         nullable=False,
     )
+    cancelled_by_organizer = Column(Boolean, nullable=True)
     payload = Column(JSON, nullable=True)
     last_synced = Column(DateTime, nullable=True)
     history = Column(JSON, default=list)

@@ -79,6 +79,16 @@ def apply_schema_upgrades() -> None:
                 """
             )
 
+    if "cancelled_by_organizer" not in columns:
+        logger.info("Adding cancelled_by_organizer column to tracked_events table")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                ALTER TABLE tracked_events
+                ADD COLUMN cancelled_by_organizer BOOLEAN NULL
+                """
+            )
+
 
 @contextmanager
 def session_scope() -> Iterator[sessionmaker]:

@@ -25,6 +25,9 @@ def upsert_events(
     stored_events: List[TrackedEvent] = []
     with session_scope() as session:
         for parsed in parsed_events:
+            cancelled_by_organizer: Optional[bool] = None
+            if parsed.status == EventStatus.CANCELLED:
+                cancelled_by_organizer = (parsed.method or "").upper() == "CANCEL"
             event: TrackedEvent | None = session.execute(
                 select(TrackedEvent).where(TrackedEvent.uid == parsed.uid)
             ).scalar_one_or_none()
@@ -48,6 +51,7 @@ def upsert_events(
                     end=parsed.end,
                     status=parsed.status,
                     response_status=parsed.response_status or EventResponseStatus.NONE,
+                    cancelled_by_organizer=cancelled_by_organizer,
                     mailbox_message_id=source_message_id,
                     payload=parsed.event.to_ical().decode(),
                     history=[history_entry],
@@ -63,6 +67,7 @@ def upsert_events(
                 event.end = parsed.end
                 event.payload = parsed.event.to_ical().decode()
                 event.status = parsed.status if parsed.status != EventStatus.NEW else EventStatus.UPDATED
+                event.cancelled_by_organizer = cancelled_by_organizer
                 event.source_account_id = source_account_id or event.source_account_id
                 event.source_folder = source_folder or event.source_folder
                 if parsed.response_status is not None:
@@ -108,8 +113,18 @@ def sync_events_to_calendar(
     events_list = list(events)
     successfully_uploaded: List[TrackedEvent] = []
     cancellation_results: Dict[int, bool] = {}
+    ignored_cancellations: List[TrackedEvent] = []
     for event in events_list:
         if event.status == EventStatus.CANCELLED:
+            if getattr(event, "cancelled_by_organizer", None) is False:
+                logger.info(
+                    "Skipping calendar removal for %s because cancellation was not initiated by the organizer",
+                    event.uid,
+                )
+                ignored_cancellations.append(event)
+                if progress_callback is not None:
+                    progress_callback(event, True)
+                continue
             removed = delete_event_by_uid(calendar_url, event.uid, settings)
             cancellation_results[event.id] = removed
             if progress_callback is not None:
@@ -133,6 +148,8 @@ def sync_events_to_calendar(
         logger.warning("No events could be synced to %s", calendar_url)
     if cancellation_results:
         mark_as_cancelled(cancellation_results)
+    if ignored_cancellations:
+        mark_cancellations_ignored(ignored_cancellations)
     return uploaded_uids
 
 
@@ -180,3 +197,27 @@ def mark_as_cancelled(results: Dict[int, bool]) -> None:
             )
             session.add(event)
     logger.info("Processed %s cancellation updates", len(results))
+
+
+def mark_cancellations_ignored(events: Iterable[TrackedEvent]) -> None:
+    """Record ignored cancellation requests triggered by attendees."""
+
+    events_list = list(events)
+    if not events_list:
+        return
+    with session_scope() as session:
+        for event in events_list:
+            db_event = session.get(TrackedEvent, event.id)
+            if db_event is None:
+                continue
+            db_event.last_synced = datetime.utcnow()
+            db_event.history = merge_histories(
+                db_event.history or [],
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "action": EventStatus.CANCELLED.value,
+                    "description": "Absage ignoriert (nicht vom Ersteller)",
+                },
+            )
+            session.add(db_event)
+    logger.info("Ignored %s attendee cancellations", len(events_list))

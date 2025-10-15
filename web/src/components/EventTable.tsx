@@ -25,6 +25,8 @@ interface Props {
   ) => Promise<TrackedEvent>;
   loading?: boolean;
   onRefresh: () => Promise<void>;
+  autoSyncJob: SyncJobStatus | null;
+  onLoadAutoSync: () => Promise<void>;
 }
 
 const statusLabelMap: Record<TrackedEvent['status'], string> = {
@@ -173,6 +175,8 @@ export default function EventTable({
   onRespondToEvent,
   loading = false,
   onRefresh,
+  autoSyncJob,
+  onLoadAutoSync,
 }: Props) {
   const [selected, setSelected] = useState<number[]>([]);
   const [openItems, setOpenItems] = useState<number[]>([]);
@@ -183,6 +187,7 @@ export default function EventTable({
   const [scanJob, setScanJob] = useState<SyncJobStatus | null>(null);
   const [syncAllJob, setSyncAllJob] = useState<SyncJobStatus | null>(null);
   const [selectionJob, setSelectionJob] = useState<SyncJobStatus | null>(null);
+  const [autoJob, setAutoJob] = useState<SyncJobStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [respondingId, setRespondingId] = useState<number | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
@@ -364,7 +369,7 @@ export default function EventTable({
     return fallback;
   }
 
-  function clearPoller(key: string) {
+  function clearPoller(key: 'scan' | 'syncAll' | 'selection' | 'autoSync') {
     const existing = pollersRef.current[key];
     if (existing) {
       window.clearInterval(existing);
@@ -373,7 +378,7 @@ export default function EventTable({
   }
 
   function trackJob(
-    key: 'scan' | 'syncAll' | 'selection',
+    key: 'scan' | 'syncAll' | 'selection' | 'autoSync',
     initial: SyncJobStatus,
     setter: (status: SyncJobStatus) => void,
     onComplete?: (status: SyncJobStatus) => void,
@@ -403,6 +408,16 @@ export default function EventTable({
       void poll();
     }, 1500);
   }
+
+  useEffect(() => {
+    if (!autoSyncJob) {
+      clearPoller('autoSync');
+      setAutoJob(null);
+      return;
+    }
+    trackJob('autoSync', autoSyncJob, setAutoJob, handleAutoSyncJobComplete);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoSyncJob?.job_id]);
 
   function parseManualSyncDetail(
     detail: SyncJobStatus['detail'] | null | undefined,
@@ -513,6 +528,24 @@ export default function EventTable({
     }
     setSyncError(null);
     void onRefresh();
+  }
+
+  function handleAutoSyncJobComplete(status: SyncJobStatus) {
+    if (status.status === 'failed') {
+      setSyncError(status.message ?? 'AutoSync fehlgeschlagen.');
+      setSyncNotice(null);
+    } else {
+      const detail = (status.detail ?? {}) as Record<string, unknown>;
+      const uploadedCount = asNumber(detail.uploaded ?? status.processed, status.processed);
+      if (uploadedCount > 0) {
+        setSyncNotice(`AutoSync hat ${uploadedCount} Termine aktualisiert.`);
+      } else {
+        setSyncNotice('AutoSync ausgeführt (keine Änderungen erforderlich).');
+      }
+      setSyncError(null);
+    }
+    void onRefresh();
+    void onLoadAutoSync();
   }
 
   async function handleSyncSelection() {
@@ -915,13 +948,14 @@ export default function EventTable({
           </div>
         </div>
 
-        {(scanJob || syncAllJob || selectionJob) && (
+        {(scanJob || syncAllJob || selectionJob || autoJob) && (
           <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
             {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
-          {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
-          {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
-        </div>
-      )}
+            {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
+            {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
+            {renderJobProgress(autoJob, 'AutoSync', 'bg-emerald-300')}
+          </div>
+        )}
 
       {syncError && (
         <div className="rounded-lg border border-rose-700 bg-rose-500/10 p-4 text-sm text-rose-200">

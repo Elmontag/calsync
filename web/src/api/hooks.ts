@@ -67,6 +67,7 @@ export function useEvents() {
     enabled: false,
     interval_minutes: 5,
     auto_response: 'none',
+    active_job: null,
   });
 
   async function refresh() {
@@ -88,6 +89,7 @@ export function useEvents() {
       enabled: data.enabled,
       interval_minutes: data.interval_minutes ?? prev.interval_minutes ?? 5,
       auto_response: data.auto_response ?? prev.auto_response ?? 'none',
+      active_job: data.active_job ?? null,
     }));
   }
 
@@ -125,6 +127,7 @@ export function useEvents() {
       enabled: data.enabled,
       interval_minutes: data.interval_minutes ?? prev.interval_minutes ?? 5,
       auto_response: data.auto_response ?? prev.auto_response ?? 'none',
+      active_job: data.active_job ?? null,
     }));
     return data;
   }
