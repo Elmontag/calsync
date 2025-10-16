@@ -43,6 +43,7 @@ const statusLabelMap: Record<TrackedEvent['status'], string> = {
   updated: 'Aktualisiert',
   cancelled: 'Abgesagt',
   synced: 'Synchronisiert',
+  failed: 'Fehlerhaft',
 };
 
 const statusStyleMap: Record<TrackedEvent['status'], string> = {
@@ -50,6 +51,7 @@ const statusStyleMap: Record<TrackedEvent['status'], string> = {
   updated: 'bg-indigo-500/10 text-indigo-300',
   cancelled: 'bg-rose-500/10 text-rose-300',
   synced: 'bg-emerald-500/10 text-emerald-300',
+  failed: 'bg-rose-600/20 text-rose-200',
 };
 
 const statusFilterOptions: Array<{ value: TrackedEvent['status']; label: string }> = [
@@ -57,6 +59,7 @@ const statusFilterOptions: Array<{ value: TrackedEvent['status']; label: string 
   { value: 'updated', label: statusLabelMap.updated },
   { value: 'cancelled', label: statusLabelMap.cancelled },
   { value: 'synced', label: statusLabelMap.synced },
+  { value: 'failed', label: statusLabelMap.failed },
 ];
 
 const responseLabelMap: Record<TrackedEvent['response_status'], string> = {
@@ -376,7 +379,10 @@ export default function EventTable({
     const processed = events.filter((event) => event.status === 'synced').length;
     const cancelled = events.filter((event) => event.status === 'cancelled').length;
     const awaitingDecision = events.filter(
-      (event) => event.response_status === 'none' && event.status !== 'cancelled',
+      (event) =>
+        event.response_status === 'none' &&
+        event.status !== 'cancelled' &&
+        event.status !== 'failed',
     ).length;
     const conflicts = events.filter((event) => (event.conflicts?.length ?? 0) > 0).length;
     const syncConflicts = events.filter((event) => event.sync_state?.has_conflict).length;
@@ -1257,7 +1263,7 @@ export default function EventTable({
             const differences = syncState?.conflict_details?.differences ?? [];
             const suggestions = syncState?.conflict_details?.suggestions ?? [];
             const differencesExpanded = expandedDifferences[event.id] ?? false;
-            const isSelectable = !hasSyncConflict;
+            const isSelectable = !hasSyncConflict && event.status !== 'failed';
             const historyEntries = sortHistoryEntries(event.history ?? []);
             return (
               <div
@@ -1349,6 +1355,17 @@ export default function EventTable({
                         <p className="mt-1 text-slate-300">{dateRange}</p>
                       </div>
                     </div>
+                    {event.status === 'failed' && (
+                      <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-100">
+                        <p className="text-sm font-semibold text-rose-200">Importfehler</p>
+                        <p className="mt-1 text-rose-100/80">
+                          {event.mail_error ?? 'Der Kalenderinhalt dieser E-Mail konnte nicht verarbeitet werden.'}
+                        </p>
+                        <p className="mt-2 text-rose-100/60">
+                          Deaktiviere das Tracking, um diese Nachricht bei zukünftigen Scans zu überspringen.
+                        </p>
+                      </div>
+                    )}
                     {event.attendees.length > 0 && (
                       <div className="mt-4">
                         <p className="text-xs uppercase tracking-wide text-slate-500">Teilnehmer</p>
@@ -1625,33 +1642,35 @@ export default function EventTable({
                         <p className="mt-2 text-xs text-slate-400">Keine Historie vorhanden.</p>
                       )}
                     </div>
-                    <div className="mt-4 flex flex-wrap gap-2">
-                      {responseActions.map((action) => (
+                    {event.status !== 'failed' && (
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        {responseActions.map((action) => (
+                          <button
+                            key={action.value}
+                            type="button"
+                            onClick={() => handleResponse(event, action.value)}
+                            disabled={respondingId === event.id}
+                            className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:opacity-60 ${
+                              action.className
+                            } ${
+                              event.response_status === action.value
+                                ? 'ring-2 ring-emerald-300/60 ring-offset-2 ring-offset-slate-900'
+                                : ''
+                            }`}
+                          >
+                            {action.label}
+                          </button>
+                        ))}
                         <button
-                          key={action.value}
                           type="button"
-                          onClick={() => handleResponse(event, action.value)}
+                          onClick={() => handleResponse(event, 'none')}
                           disabled={respondingId === event.id}
-                          className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:opacity-60 ${
-                            action.className
-                          } ${
-                            event.response_status === action.value
-                              ? 'ring-2 ring-emerald-300/60 ring-offset-2 ring-offset-slate-900'
-                              : ''
-                          }`}
+                          className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-slate-500 hover:text-slate-100 disabled:opacity-60"
                         >
-                          {action.label}
+                          Antwort zurücksetzen
                         </button>
-                      ))}
-                      <button
-                        type="button"
-                        onClick={() => handleResponse(event, 'none')}
-                        disabled={respondingId === event.id}
-                        className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-slate-500 hover:text-slate-100 disabled:opacity-60"
-                      >
-                        Antwort zurücksetzen
-                      </button>
-                    </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

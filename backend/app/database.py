@@ -100,6 +100,7 @@ def apply_schema_upgrades() -> None:
         "sync_conflict_reason": "ALTER TABLE tracked_events ADD COLUMN sync_conflict_reason TEXT NULL",
         "sync_conflict_snapshot": "ALTER TABLE tracked_events ADD COLUMN sync_conflict_snapshot JSON NULL",
         "tracking_disabled": "ALTER TABLE tracked_events ADD COLUMN tracking_disabled BOOLEAN NOT NULL DEFAULT 0",
+        "mail_error": "ALTER TABLE tracked_events ADD COLUMN mail_error TEXT NULL",
     }
 
     for column_name, ddl in new_columns.items():

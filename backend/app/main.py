@@ -55,7 +55,13 @@ from .services.caldav_client import (
     get_event_state,
     list_calendars,
 )
-from .services.imap_client import FolderSelection, ImapSettings, fetch_calendar_candidates
+from .services.imap_client import (
+    CalendarCandidate,
+    FolderSelection,
+    ImapSettings,
+    MailAttachment,
+    fetch_calendar_candidates,
+)
 from .services.job_tracker import job_tracker
 from .services.scheduler import scheduler
 from .utils.ics_parser import (
@@ -612,6 +618,138 @@ def _folder_selections(account: Account) -> List[FolderSelection]:
     return selections
 
 
+def _sanitize_uid_component(value: Optional[str | int]) -> str:
+    """Normalize UID components to a filesystem-safe format."""
+
+    if value is None:
+        return "unknown"
+    normalized = "".join(ch if str(ch).isalnum() else "-" for ch in str(value))
+    normalized = normalized.strip("-")
+    return normalized or "unknown"
+
+
+def _failed_event_uid(account_id: Optional[int], folder: Optional[str], message_id: str) -> str:
+    """Generate a deterministic UID for failed mailbox imports."""
+
+    account_part = _sanitize_uid_component(account_id)
+    folder_part = _sanitize_uid_component(folder)
+    message_part = _sanitize_uid_component(message_id)
+    return f"mail-error::{account_part}:{folder_part}:{message_part}"
+
+
+def _mail_tracking_disabled(
+    db: Session, account_id: int, folder: str, message_id: str
+) -> bool:
+    """Return True if the user has disabled tracking for the given message."""
+
+    existing = (
+        db.execute(
+            select(TrackedEvent)
+            .where(TrackedEvent.source_account_id == account_id)
+            .where(TrackedEvent.source_folder == folder)
+            .where(TrackedEvent.mailbox_message_id == message_id)
+            .where(TrackedEvent.tracking_disabled.is_(True))
+        )
+        .scalars()
+        .first()
+    )
+    return existing is not None
+
+
+def _record_failed_mail(
+    db: Session,
+    account: Account,
+    candidate: CalendarCandidate,
+    attachment: MailAttachment,
+    error_message: str,
+) -> bool:
+    """Persist a failure placeholder for a mail message.
+
+    Returns True when the failure was recorded, False if it was skipped because
+    tracking is disabled.
+    """
+
+    uid = _failed_event_uid(account.id, candidate.folder, candidate.message_id)
+    existing = (
+        db.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalars().first()
+    )
+    now = datetime.utcnow()
+    attachment_label = attachment.filename or "Kalender-Anhang"
+    description = (
+        f"Fehler beim Verarbeiten von {attachment_label}: {error_message}".strip()
+    )
+    history_entry = {
+        "timestamp": now.isoformat(),
+        "action": "mail-error",
+        "description": description,
+    }
+
+    if existing is None:
+        event = TrackedEvent(
+            uid=uid,
+            source_account_id=account.id,
+            source_folder=candidate.folder,
+            summary=candidate.subject or "Fehlerhafte E-Mail-Einladung",
+            organizer=candidate.sender,
+            status=EventStatus.FAILED,
+            response_status=EventResponseStatus.NONE,
+            mailbox_message_id=candidate.message_id,
+            payload=None,
+            history=[history_entry],
+            mail_error=description,
+            local_version=0,
+            synced_version=0,
+            local_last_modified=now,
+            last_modified_source="local",
+            sync_conflict=False,
+            sync_conflict_reason=None,
+            sync_conflict_snapshot=None,
+        )
+        db.add(event)
+        logger.warning(
+            "Kalenderanhang konnte nicht verarbeitet werden (Konto %s, Ordner %s, Nachricht %s)",
+            account.id,
+            candidate.folder,
+            candidate.message_id,
+        )
+        db.flush()
+        return True
+
+    if existing.tracking_disabled:
+        logger.info(
+            "Fehlerhafte Nachricht %s (%s) wird übersprungen, Tracking deaktiviert",
+            candidate.message_id,
+            candidate.folder,
+        )
+        return False
+
+    existing.status = EventStatus.FAILED
+    existing.mail_error = description
+    if not existing.summary:
+        existing.summary = candidate.subject or "Fehlerhafte E-Mail-Einladung"
+    if not existing.organizer:
+        existing.organizer = candidate.sender
+    existing.source_account_id = account.id
+    existing.source_folder = candidate.folder
+    existing.mailbox_message_id = candidate.message_id
+    existing.history = merge_histories(existing.history or [], history_entry)
+    existing.updated_at = now
+    existing.local_last_modified = now
+    existing.last_modified_source = "local"
+    existing.sync_conflict = False
+    existing.sync_conflict_reason = None
+    existing.sync_conflict_snapshot = None
+    logger.warning(
+        "Kalenderanhang konnte weiterhin nicht verarbeitet werden (Konto %s, Ordner %s, Nachricht %s)",
+        account.id,
+        candidate.folder,
+        candidate.message_id,
+    )
+    db.add(existing)
+    db.flush()
+    return True
+
+
 def perform_mail_scan(
     db: Session, progress_callback: Optional[Callable[[int, int], None]] = None
 ) -> tuple[int, int]:
@@ -641,8 +779,40 @@ def perform_mail_scan(
         )
         for candidate in candidates:
             messages_processed += 1
+            if _mail_tracking_disabled(
+                db, account.id, candidate.folder, candidate.message_id
+            ):
+                logger.info(
+                    "Überspringe Nachricht %s in %s, Tracking deaktiviert",
+                    candidate.message_id,
+                    candidate.folder,
+                )
+                continue
+            failure_recorded = False
             for attachment in candidate.attachments:
-                parsed_events = parse_ics_payload(attachment.payload)
+                try:
+                    parsed_events = parse_ics_payload(attachment.payload)
+                except ValueError as exc:
+                    logger.warning(
+                        "Ungültiger ICS-Anhang in Nachricht %s (%s): %s",
+                        candidate.message_id,
+                        attachment.filename or "ohne Dateiname",
+                        exc,
+                    )
+                    if not failure_recorded:
+                        if _record_failed_mail(db, account, candidate, attachment, str(exc)):
+                            db.commit()
+                        failure_recorded = True
+                    continue
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.exception(
+                        "Unerwarteter Fehler beim Verarbeiten von Nachricht %s", candidate.message_id
+                    )
+                    if not failure_recorded:
+                        if _record_failed_mail(db, account, candidate, attachment, str(exc)):
+                            db.commit()
+                        failure_recorded = True
+                    continue
                 stored = event_processor.upsert_events(
                     parsed_events,
                     candidate.message_id,

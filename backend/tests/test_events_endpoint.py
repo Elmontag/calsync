@@ -16,7 +16,13 @@ if str(ROOT) not in sys.path:  # pragma: no cover - test bootstrap code
     sys.path.insert(0, str(ROOT))
 
 from backend.app.database import Base, SessionLocal, engine, session_scope
-from backend.app.main import app, list_events, perform_sync_all, _execute_manual_sync_job
+from backend.app.main import (
+    app,
+    list_events,
+    perform_mail_scan,
+    perform_sync_all,
+    _execute_manual_sync_job,
+)
 from backend.app.models import (
     Account,
     AccountType,
@@ -26,6 +32,7 @@ from backend.app.models import (
     TrackedEvent,
 )
 from backend.app.services import event_processor
+from backend.app.services.imap_client import CalendarCandidate, MailAttachment
 from backend.app.services.caldav_client import CalDavSettings, RemoteEventState
 from backend.app.services.job_tracker import job_tracker
 from backend.app.utils.ics_parser import parse_ics_payload
@@ -187,6 +194,54 @@ def test_delete_imap_account_removes_scan_results() -> None:
 
     assert remaining_mappings == []
     assert remaining_events == []
+
+
+def test_mail_scan_records_failed_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invalid ICS payloads should be captured as failed events without aborting the scan."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {"host": "imap.example.com", "username": "user", "password": "secret"}
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    candidate = CalendarCandidate(
+        message_id="123",
+        subject="Fehlerhafte Einladung",
+        sender="organizer@example.com",
+        folder="INBOX",
+        attachments=[
+            MailAttachment(
+                filename="invite.ics",
+                content_type="text/calendar",
+                payload=b"BEGIN:VCALENDAR\nINVALID",
+            )
+        ],
+        links=[],
+    )
+
+    def fake_fetch(*_args, **_kwargs):
+        return [candidate]
+
+    def broken_parse(_payload: bytes):
+        raise ValueError("kaputter inhalt")
+
+    monkeypatch.setattr("backend.app.main.fetch_calendar_candidates", fake_fetch)
+    monkeypatch.setattr("backend.app.main.parse_ics_payload", broken_parse)
+
+    messages, events = perform_mail_scan(session)
+
+    assert messages == 1
+    assert events == 0
+
+    stored = session.execute(select(TrackedEvent)).scalars().all()
+    assert len(stored) == 1
+    failed = stored[0]
+    assert failed.status == EventStatus.FAILED
+    assert failed.mail_error is not None
+    assert "kaputter inhalt" in failed.mail_error
+    assert failed.tracking_disabled is False
 
 
 def test_list_events_handles_duplicate_caldav_targets(monkeypatch: pytest.MonkeyPatch) -> None:

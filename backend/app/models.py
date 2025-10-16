@@ -62,6 +62,7 @@ class EventStatus(str, Enum):
     UPDATED = "updated"
     CANCELLED = "cancelled"
     SYNCED = "synced"
+    FAILED = "failed"
 
 
 class EventResponseStatus(str, Enum):
@@ -115,6 +116,7 @@ class TrackedEvent(Base):
     sync_conflict_reason = Column(Text, nullable=True)
     sync_conflict_snapshot = Column(JSON, nullable=True)
     tracking_disabled = Column(Boolean, default=False, nullable=False)
+    mail_error = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -44,8 +44,9 @@ export interface TrackedEvent {
   organizer?: string;
   start?: string;
   end?: string;
-  status: 'new' | 'updated' | 'cancelled' | 'synced';
+  status: 'new' | 'updated' | 'cancelled' | 'synced' | 'failed';
   response_status: 'none' | 'accepted' | 'tentative' | 'declined';
+  mail_error?: string | null;
   history: EventHistoryEntry[];
   conflicts: CalendarConflict[];
   sync_state: EventSyncState;

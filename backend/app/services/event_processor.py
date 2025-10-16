@@ -73,6 +73,7 @@ def upsert_events(
                     last_modified_source="local",
                     sync_conflict=False,
                     sync_conflict_reason=None,
+                    mail_error=None,
                 )
                 if parsed.response_status is not None:
                     annotate_response(event)
@@ -136,6 +137,9 @@ def upsert_events(
                     annotate_response(event)
                     content_changed = True
                     response_changed = True
+
+                if event.mail_error:
+                    event.mail_error = None
 
                 status_changed = False
                 if parsed.status == EventStatus.CANCELLED:

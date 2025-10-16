@@ -125,6 +125,7 @@ class TrackedEventRead(BaseModel):
     end: Optional[datetime] = None
     status: EventStatus
     response_status: EventResponseStatus
+    mail_error: Optional[str] = None
     history: List[EventHistoryEntry] = Field(default_factory=list)
     conflicts: List[CalendarConflict] = Field(default_factory=list)
     sync_state: EventSyncState = Field(default_factory=EventSyncState)
