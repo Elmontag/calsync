@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     JSON,
     String,
+    Text,
 )
 from sqlalchemy.orm import relationship
 
@@ -104,6 +105,16 @@ class TrackedEvent(Base):
     payload = Column(JSON, nullable=True)
     last_synced = Column(DateTime, nullable=True)
     history = Column(JSON, default=list)
+    caldav_etag = Column(String, nullable=True)
+    local_version = Column(Integer, default=0, nullable=False)
+    synced_version = Column(Integer, default=0, nullable=False)
+    remote_last_modified = Column(DateTime, nullable=True)
+    local_last_modified = Column(DateTime, nullable=True)
+    last_modified_source = Column(String, nullable=True)
+    sync_conflict = Column(Boolean, default=False, nullable=False)
+    sync_conflict_reason = Column(Text, nullable=True)
+    sync_conflict_snapshot = Column(JSON, nullable=True)
+    tracking_disabled = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

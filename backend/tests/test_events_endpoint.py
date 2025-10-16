@@ -15,8 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:  # pragma: no cover - test bootstrap code
     sys.path.insert(0, str(ROOT))
 
-from backend.app.database import Base, SessionLocal, engine
-from backend.app.main import app, list_events, perform_sync_all
+from backend.app.database import Base, SessionLocal, engine, session_scope
+from backend.app.main import app, list_events, perform_sync_all, _execute_manual_sync_job
 from backend.app.models import (
     Account,
     AccountType,
@@ -26,9 +26,11 @@ from backend.app.models import (
     TrackedEvent,
 )
 from backend.app.services import event_processor
-from backend.app.services.caldav_client import CalDavSettings
+from backend.app.services.caldav_client import CalDavSettings, RemoteEventState
+from backend.app.services.job_tracker import job_tracker
 from backend.app.utils.ics_parser import parse_ics_payload
 from sqlalchemy import select
+from icalendar import Calendar, Event as ICalEvent
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +63,38 @@ class _FakeConnection:
 
     def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - nothing to clean up
         return None
+
+
+def _build_ical(
+    *,
+    method: Optional[str],
+    uid: str,
+    summary: str,
+    start: datetime,
+    end: datetime,
+    status: str,
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+) -> str:
+    calendar = Calendar()
+    calendar.add("PRODID", "-//CalSync Tests//DE")
+    calendar.add("VERSION", "2.0")
+    if method:
+        calendar.add("METHOD", method)
+    component = ICalEvent()
+    component.add("UID", uid)
+    component.add("SUMMARY", summary)
+    component.add("DTSTART", start)
+    component.add("DTEND", end)
+    component.add("DTSTAMP", start)
+    component.add("LAST-MODIFIED", end)
+    component.add("STATUS", status)
+    if description:
+        component.add("DESCRIPTION", description)
+    if location:
+        component.add("LOCATION", location)
+    calendar.add_component(component)
+    return calendar.to_ical().decode()
 
 
 def _store_basic_accounts(session: SessionLocal) -> tuple[Account, Account]:
@@ -389,6 +423,460 @@ def test_perform_sync_all_filters_attendee_cancellations(monkeypatch: pytest.Mon
     assert uploaded == 1
 
 
+def test_perform_sync_all_ignores_sync_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Events mit Synchronisationskonflikten dürfen nicht erneut exportiert werden."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+
+    base_kwargs = dict(
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        start=datetime(2024, 2, 1, 9, 0, tzinfo=timezone.utc),
+        end=datetime(2024, 2, 1, 10, 0, tzinfo=timezone.utc),
+        response_status=EventResponseStatus.NONE,
+        payload="BEGIN:VEVENT\nUID:test\nEND:VEVENT",
+        history=[],
+    )
+
+    session.add_all(
+        [
+            TrackedEvent(
+                uid="uid-conflict",
+                status=EventStatus.UPDATED,
+                sync_conflict=True,
+                sync_conflict_reason="Remote-Version abweichend",
+                **base_kwargs,
+            ),
+            TrackedEvent(
+                uid="uid-pending",
+                status=EventStatus.UPDATED,
+                **base_kwargs,
+            ),
+        ]
+    )
+    session.commit()
+
+    captured: List[List[str]] = []
+
+    def _fake_sync(events, calendar_url, settings, progress_callback=None):
+        captured.append([event.uid for event in events])
+        if progress_callback is not None:
+            for event in events:
+                progress_callback(event, True)
+        return [event.uid for event in events]
+
+    monkeypatch.setattr(event_processor, "sync_events_to_calendar", _fake_sync)
+
+    uploaded = perform_sync_all(session)
+
+    assert uploaded == 1
+    assert captured == [["uid-pending"]]
+
+
+def test_conflict_details_and_disable_tracking() -> None:
+    """Konfliktdetails sollen Unterschiede und Deaktivierungsoption liefern."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    start = datetime(2024, 4, 10, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-diff",
+        summary="Lokaler Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Lokale Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-diff",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Lokaler Titel",
+        organizer="orga@example.com",
+        start=start,
+        end=end,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        payload=payload,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Remote-Version abweichend",
+        sync_conflict_snapshot={
+            "summary": "Server Titel",
+            "start": (start + timedelta(hours=2)).isoformat(),
+            "end": (end + timedelta(hours=2)).isoformat(),
+            "description": "Server Beschreibung",
+            "response_status": EventResponseStatus.ACCEPTED.value,
+        },
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    client = TestClient(app)
+    response = client.get("/events")
+    assert response.status_code == 200
+    items = response.json()
+    assert len(items) == 1
+    payload_event = items[0]
+    assert payload_event["tracking_disabled"] is False
+    details = payload_event["sync_state"]["conflict_details"]
+    assert details is not None
+    differences = {item["field"]: item for item in details["differences"]}
+    assert differences["summary"]["local_value"] == "Lokaler Titel"
+    assert differences["summary"]["remote_value"] == "Server Titel"
+    assert differences["description"]["remote_value"] == "Server Beschreibung"
+    assert differences["response_status"]["remote_value"] == "Zusage"
+    assert payload_event["attendees"] == []
+    suggestions = {item["action"]: item for item in details["suggestions"]}
+    assert set(suggestions) == {
+        "overwrite-calendar",
+        "skip-email-import",
+        "merge-fields",
+        "disable-tracking",
+    }
+    assert suggestions["merge-fields"]["interactive"] is True
+    disable_option = next(
+        suggestion
+        for suggestion in details["suggestions"]
+        if suggestion["action"] == "disable-tracking"
+    )
+    assert disable_option["interactive"] is True
+
+    disable_response = client.post(f"/events/{payload_event['id']}/disable-tracking")
+    assert disable_response.status_code == 200
+    disabled_payload = disable_response.json()
+    assert disabled_payload["tracking_disabled"] is True
+    assert disabled_payload["sync_state"]["has_conflict"] is False
+    refreshed = client.get("/events")
+    assert refreshed.status_code == 200
+    assert refreshed.json() == []
+
+
+def test_resolve_conflict_overwrite_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Das Überschreiben soll die lokale Version exportieren und Konflikte auflösen."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-conflict",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+    )
+    event = TrackedEvent(
+        uid="uid-conflict",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    calls: List[str] = []
+
+    def _fake_force(target: TrackedEvent, calendar_url: str, settings: CalDavSettings) -> None:
+        calls.append(target.uid)
+        with session_scope() as scoped:
+            db_event = scoped.get(TrackedEvent, target.id)
+            assert db_event is not None
+            db_event.sync_conflict = False
+            db_event.sync_conflict_reason = None
+            db_event.synced_version = db_event.local_version or 0
+            db_event.last_synced = datetime.utcnow()
+            scoped.add(db_event)
+
+    monkeypatch.setattr(event_processor, "force_overwrite_event", _fake_force)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={"action": "overwrite-calendar", "selections": {}},
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert calls == ["uid-conflict"]
+    history_descriptions = [entry["description"] for entry in payload_event["history"]]
+    assert any(
+        "Kalenderdaten wurden mit dem E-Mail-Import überschrieben" in description
+        for description in history_descriptions
+    )
+
+
+def test_resolve_conflict_skip_email_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Das Verwerfen soll keinen Export starten und den Konflikt nur temporär ausblenden."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-skip",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Mail Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-skip",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+        local_version=3,
+        synced_version=1,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    def _unexpected_remote_call(*_: object, **__: object) -> None:
+        raise AssertionError("skip-email-import sollte keine Remote-Daten abrufen")
+
+    monkeypatch.setattr("backend.app.main.get_event_state", _unexpected_remote_call)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={"action": "skip-email-import", "selections": {}},
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert payload_event["summary"] == "Mail Titel"
+    assert (
+        payload_event["sync_state"]["local_version"]
+        == payload_event["sync_state"]["synced_version"]
+        == 3
+    )
+    assert payload_event["status"] == EventStatus.SYNCED.value
+    history_descriptions = [entry["description"] for entry in payload_event["history"]]
+    assert any("Konflikt verworfen" in description for description in history_descriptions)
+
+
+def test_resolve_conflict_skip_email_import_applies_remote_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Das Verwerfen soll Remote-Schnappschüsse übernehmen und Sync-Markierungen zurücksetzen."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-skip-remote",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Mail Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-skip-remote",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+        local_version=5,
+        synced_version=2,
+        remote_last_modified=datetime(2024, 5, 31, 9, 0, tzinfo=timezone.utc),
+        sync_conflict_snapshot={
+            "summary": "Server Titel",
+            "organizer": "orga@example.com",
+            "start": "2024-06-01T09:00:00+00:00",
+            "end": "2024-06-01T10:00:00+00:00",
+            "response_status": EventResponseStatus.ACCEPTED.value,
+        },
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    monkeypatch.setattr("backend.app.main.get_event_state", lambda *args, **kwargs: None)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={"action": "skip-email-import", "selections": {}},
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert payload_event["summary"] == "Server Titel"
+    assert payload_event["status"] == EventStatus.SYNCED.value
+    assert payload_event["sync_state"]["local_version"] == 5
+    assert payload_event["sync_state"]["synced_version"] == 5
+    assert payload_event["sync_state"]["last_modified_source"] == "remote"
+    with SessionLocal() as verify_session:
+        stored = verify_session.get(TrackedEvent, event.id)
+        assert stored is not None
+        assert stored.payload is None
+        assert stored.local_version == 5
+        assert stored.synced_version == 5
+        assert stored.status == EventStatus.SYNCED
+        assert stored.last_modified_source == "remote"
+        assert stored.local_last_modified == stored.remote_last_modified
+
+
+def test_resolve_conflict_merge_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Die Zusammenführung soll ausgewählte Felder übernehmen und exportieren."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 7, 1, 8, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-merge",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Mail Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-merge",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.ACCEPTED,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    remote_payload = _build_ical(
+        method="REQUEST",
+        uid="uid-merge",
+        summary="Kalender Titel",
+        start=start + timedelta(hours=2),
+        end=end + timedelta(hours=2),
+        status="CONFIRMED",
+        description="Kalender Beschreibung",
+        location="Konferenzraum",
+    )
+    remote_state = RemoteEventState(
+        uid="uid-merge",
+        etag="etag-merge",
+        last_modified=datetime.utcnow(),
+        payload=remote_payload,
+    )
+
+    monkeypatch.setattr("backend.app.main.get_event_state", lambda url, uid, settings: remote_state)
+
+    calls: List[str] = []
+
+    def _fake_force(target: TrackedEvent, calendar_url: str, settings: CalDavSettings) -> None:
+        calls.append(target.uid)
+        with session_scope() as scoped:
+            db_event = scoped.get(TrackedEvent, target.id)
+            assert db_event is not None
+            db_event.sync_conflict = False
+            db_event.sync_conflict_reason = None
+            db_event.synced_version = db_event.local_version or 0
+            db_event.last_synced = datetime.utcnow()
+            scoped.add(db_event)
+
+    monkeypatch.setattr(event_processor, "force_overwrite_event", _fake_force)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={
+            "action": "merge-fields",
+            "selections": {"summary": "email", "location": "calendar", "response_status": "calendar"},
+        },
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert payload_event["summary"] == "Mail Titel"
+    assert payload_event["sync_state"]["conflict_details"] is None
+    assert calls == ["uid-merge"]
+    assert payload_event["response_status"] == EventResponseStatus.NONE.value
+    history_descriptions = [entry["description"] for entry in payload_event["history"]]
+    assert any("Daten wurden zusammengeführt" in description for description in history_descriptions)
+
 def test_attendee_cancellation_updates_history_without_deletion(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cancellations from attendees must not trigger deletions but still leave a history entry."""
 
@@ -506,3 +994,266 @@ def test_upsert_events_preserves_synced_status_for_identical_payload(monkeypatch
 
     assert captured == []
     assert uploaded == 0
+
+
+def test_remote_cancellation_keeps_server_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellations originating in CalDAV must not be removed during sync."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    start = datetime(2024, 5, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "remote-cancel"
+    session.add(
+        TrackedEvent(
+            uid=uid,
+            summary="Team Sync",
+            start=start,
+            end=end,
+            status=EventStatus.SYNCED,
+            response_status=EventResponseStatus.NONE,
+            source_account_id=imap.id,
+            source_folder="INBOX",
+            payload=_build_ical(
+                method=None,
+                uid=uid,
+                summary="Team Sync",
+                start=start,
+                end=end,
+                status="CONFIRMED",
+            ),
+            caldav_etag="etag-old",
+            local_version=1,
+            synced_version=1,
+            history=[],
+        )
+    )
+    session.commit()
+    event = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalar_one()
+    remote_payload = _build_ical(
+        method="CANCEL",
+        uid=uid,
+        summary="Team Sync",
+        start=start,
+        end=end,
+        status="CANCELLED",
+    )
+    remote_state = RemoteEventState(
+        uid=uid,
+        etag="etag-new",
+        last_modified=end + timedelta(hours=1),
+        payload=remote_payload,
+    )
+
+    event_processor._apply_remote_snapshot(event, remote_state)
+
+    session.refresh(event)
+    assert event.status == EventStatus.CANCELLED
+    assert event.cancelled_by_organizer is True
+    assert event.last_modified_source == "remote"
+
+    deleted_calls: List[str] = []
+    uploaded_calls: List[str] = []
+    cancellation_updates: List[Dict[int, tuple[bool, Optional[RemoteEventState]]]] = []
+
+    def _fake_delete(*_args, **_kwargs) -> bool:
+        deleted_calls.append("called")
+        return False
+
+    def _fake_upload(*_args, **_kwargs):
+        uploaded_calls.append("called")
+        return remote_state
+
+    def _fake_mark(results):
+        cancellation_updates.append(results)
+
+    monkeypatch.setattr("backend.app.services.event_processor.delete_event_by_uid", _fake_delete)
+    monkeypatch.setattr("backend.app.services.event_processor.upload_ical", _fake_upload)
+    monkeypatch.setattr("backend.app.services.event_processor.mark_as_cancelled", _fake_mark)
+    monkeypatch.setattr(
+        "backend.app.services.event_processor.get_event_state", lambda *_args, **_kwargs: remote_state
+    )
+
+    settings = CalDavSettings(url="https://cal.example.com", username="user", password="secret")
+    sync_events = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalars().all()
+    event_processor.sync_events_to_calendar(sync_events, "https://cal.example.com/shared", settings)
+
+    assert not deleted_calls
+    assert not uploaded_calls
+    assert cancellation_updates == []
+
+
+def test_manual_sync_marks_conflicts_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Manual sync jobs müssen Konflikte melden statt sie zu exportieren."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+
+    event = TrackedEvent(
+        uid="uid-conflict",
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        start=datetime(2024, 3, 1, 9, 0, tzinfo=timezone.utc),
+        end=datetime(2024, 3, 1, 10, 0, tzinfo=timezone.utc),
+        payload="BEGIN:VEVENT\nUID:uid-conflict\nEND:VEVENT",
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Remote-Version abweichend",
+        local_version=2,
+        synced_version=1,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    captured: List[List[str]] = []
+
+    def _fake_sync(events, calendar_url, settings, progress_callback=None):
+        captured.append([event.uid for event in events])
+        return [event.uid for event in events]
+
+    monkeypatch.setattr(event_processor, "sync_events_to_calendar", _fake_sync)
+
+    state = job_tracker.create("manual-sync", total=1)
+    try:
+        _execute_manual_sync_job(state.job_id, [event.id])
+        final_state = job_tracker.get(state.job_id)
+        assert final_state is not None
+        assert final_state.status == "completed"
+        assert final_state.detail is not None
+        detail = final_state.detail
+        assert detail.get("uploaded") == []
+        missing = detail.get("missing")
+        assert missing and missing[0]["event_id"] == event.id
+        assert "konflikt" in missing[0]["reason"].lower()
+    finally:
+        job_tracker._jobs.pop(state.job_id, None)
+
+    assert captured == []
+
+
+def test_organizer_cancellation_exports_cancel_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Organizer cancellations must be pushed to CalDAV as cancelled events."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    start = datetime(2024, 6, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "local-cancel"
+    payload = _build_ical(
+        method="CANCEL",
+        uid=uid,
+        summary="Projektstatus",
+        start=start,
+        end=end,
+        status="CANCELLED",
+    )
+    parsed = parse_ics_payload(payload.encode())
+    stored = event_processor.upsert_events(parsed, "msg-cancel", source_account_id=imap.id, source_folder="INBOX")
+    assert stored
+    session_event = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalar_one()
+
+    uploaded_states: List[RemoteEventState] = []
+    deleted_calls: List[str] = []
+
+    def _fake_upload(_url, _ical, _settings):
+        state = RemoteEventState(uid=uid, etag="etag-cancel", last_modified=end + timedelta(minutes=5), payload=payload)
+        uploaded_states.append(state)
+        return state
+
+    def _fake_delete(*_args, **_kwargs) -> bool:
+        deleted_calls.append("called")
+        return False
+
+    monkeypatch.setattr("backend.app.services.event_processor.upload_ical", _fake_upload)
+    monkeypatch.setattr("backend.app.services.event_processor.delete_event_by_uid", _fake_delete)
+    monkeypatch.setattr(
+        "backend.app.services.event_processor.get_event_state", lambda *_args, **_kwargs: None
+    )
+    settings = CalDavSettings(url="https://cal.example.com", username="user", password="secret")
+
+    event_processor.sync_events_to_calendar([session_event], "https://cal.example.com/shared", settings)
+
+    assert uploaded_states, "Cancellation should trigger an upload"
+    assert not deleted_calls
+
+    with SessionLocal() as verify_session:
+        refreshed = verify_session.execute(
+            select(TrackedEvent).where(TrackedEvent.uid == uid)
+        ).scalar_one()
+    assert refreshed.status == EventStatus.CANCELLED
+    assert refreshed.history[-1]["description"] == "Kalendereintrag als abgesagt markiert"
+
+
+def test_remote_reschedule_updates_local_snapshot() -> None:
+    """Remote updates must refresh the local copy when no local changes are pending."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    start = datetime(2024, 7, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "remote-update"
+    session.add(
+        TrackedEvent(
+            uid=uid,
+            summary="Kickoff",
+            start=start,
+            end=end,
+            status=EventStatus.SYNCED,
+            response_status=EventResponseStatus.NONE,
+            source_account_id=imap.id,
+            source_folder="INBOX",
+            payload=_build_ical(
+                method=None,
+                uid=uid,
+                summary="Kickoff",
+                start=start,
+                end=end,
+                status="CONFIRMED",
+            ),
+            caldav_etag="etag-original",
+            local_version=1,
+            synced_version=1,
+            history=[],
+        )
+    )
+    session.commit()
+    event = session.execute(select(TrackedEvent).where(TrackedEvent.uid == uid)).scalar_one()
+
+    new_start = start + timedelta(days=1)
+    new_end = new_start + timedelta(hours=1)
+    remote_payload = _build_ical(
+        method="PUBLISH",
+        uid=uid,
+        summary="Kickoff",
+        start=new_start,
+        end=new_end,
+        status="CONFIRMED",
+    )
+    remote_state = RemoteEventState(
+        uid=uid,
+        etag="etag-updated",
+        last_modified=new_end,
+        payload=remote_payload,
+    )
+
+    event_processor._apply_remote_snapshot(event, remote_state)
+
+    with SessionLocal() as verify_session:
+        updated = verify_session.execute(
+            select(TrackedEvent).where(TrackedEvent.uid == uid)
+        ).scalar_one()
+    assert updated.start == new_start.replace(tzinfo=None)
+    assert updated.end == new_end.replace(tzinfo=None)
+    assert updated.status == EventStatus.SYNCED
+    assert updated.last_modified_source == "remote"
+    assert updated.caldav_etag == "etag-updated"

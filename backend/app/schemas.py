@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -66,11 +66,52 @@ class EventHistoryEntry(BaseModel):
     description: str
 
 
+class EventAttendee(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    status: Optional[str] = None
+    role: Optional[str] = None
+    type: Optional[str] = None
+    response_requested: bool = False
+
+
 class CalendarConflict(BaseModel):
     uid: str
     summary: Optional[str] = None
     start: Optional[datetime] = None
     end: Optional[datetime] = None
+
+
+class ConflictDifference(BaseModel):
+    field: str
+    label: str
+    local_value: Optional[str] = None
+    remote_value: Optional[str] = None
+
+
+class ConflictResolutionOption(BaseModel):
+    action: str
+    label: str
+    description: str
+    interactive: bool = False
+    requires_confirmation: bool = False
+
+
+class SyncConflictDetails(BaseModel):
+    differences: List[ConflictDifference] = Field(default_factory=list)
+    suggestions: List[ConflictResolutionOption] = Field(default_factory=list)
+
+
+class EventSyncState(BaseModel):
+    local_version: int = 0
+    synced_version: int = 0
+    has_conflict: bool = False
+    conflict_reason: Optional[str] = None
+    local_last_modified: Optional[datetime] = None
+    remote_last_modified: Optional[datetime] = None
+    last_modified_source: Optional[str] = None
+    caldav_etag: Optional[str] = None
+    conflict_details: Optional[SyncConflictDetails] = None
 
 
 class TrackedEventRead(BaseModel):
@@ -86,6 +127,9 @@ class TrackedEventRead(BaseModel):
     response_status: EventResponseStatus
     history: List[EventHistoryEntry] = Field(default_factory=list)
     conflicts: List[CalendarConflict] = Field(default_factory=list)
+    sync_state: EventSyncState = Field(default_factory=EventSyncState)
+    tracking_disabled: bool = False
+    attendees: List[EventAttendee] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -111,6 +155,11 @@ class ManualSyncMissingDetail(BaseModel):
 class ManualSyncResponse(BaseModel):
     uploaded: List[str] = Field(default_factory=list)
     missing: List[ManualSyncMissingDetail] = Field(default_factory=list)
+
+
+class ConflictResolutionRequest(BaseModel):
+    action: str
+    selections: Dict[str, str] = Field(default_factory=dict)
 
 
 class SyncJobStatus(BaseModel):

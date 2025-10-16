@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
 from caldav import DAVClient
+from caldav.elements import dav
 from caldav.objects import Calendar
 from icalendar import Calendar as ICalendar
 
@@ -18,6 +19,16 @@ class CalDavSettings:
     url: str
     username: Optional[str] = None
     password: Optional[str] = None
+
+
+@dataclass
+class RemoteEventState:
+    """Captured metadata about a CalDAV event version."""
+
+    uid: str
+    etag: Optional[str] = None
+    last_modified: Optional[datetime] = None
+    payload: Optional[str] = None
 
 
 class CalDavConnection:
@@ -40,13 +51,17 @@ class CalDavConnection:
         logger.debug("Leaving CalDAV context")
 
 
-def upload_ical(calendar_url: str, ical: ICalendar, settings: CalDavSettings) -> None:
-    """Upload a parsed calendar event to the given calendar."""
+def upload_ical(
+    calendar_url: str, ical: ICalendar, settings: CalDavSettings
+) -> Optional[RemoteEventState]:
+    """Upload a parsed calendar event to the given calendar and return the remote state."""
     with CalDavConnection(settings) as client:
         principal = client.principal()
         calendar: Calendar = principal.calendar(cal_url=calendar_url)
         logger.info("Uploading event %s to %s", ical.get("UID"), calendar_url)
         calendar.save_event(ical.to_ical())
+        uid = str(ical.get("UID"))
+        return _fetch_event_state(calendar, uid)
 
 
 def delete_event_by_uid(calendar_url: str, uid: str, settings: CalDavSettings) -> bool:
@@ -66,6 +81,89 @@ def delete_event_by_uid(calendar_url: str, uid: str, settings: CalDavSettings) -
         except Exception:  # pragma: no cover - depends on CalDAV server responses
             logger.exception("Failed to remove calendar entry %s from %s", uid, calendar_url)
             return False
+
+
+def get_event_state(
+    calendar_url: str, uid: str, settings: CalDavSettings
+) -> Optional[RemoteEventState]:
+    """Load the current server-side metadata for an event by UID."""
+    with CalDavConnection(settings) as client:
+        principal = client.principal()
+        calendar: Calendar = principal.calendar(cal_url=calendar_url)
+        return _fetch_event_state(calendar, uid)
+
+
+def _fetch_event_state(
+    calendar: Calendar, uid: str
+) -> Optional[RemoteEventState]:
+    try:
+        event = calendar.event_by_uid(uid)
+    except Exception:  # pragma: no cover - depends on CalDAV responses
+        logger.debug("No remote event found for UID %s", uid)
+        return None
+
+    payload_text: Optional[str] = None
+    last_modified: Optional[datetime] = None
+    try:
+        payload_raw = event.data
+        if isinstance(payload_raw, bytes):
+            payload_text = payload_raw.decode()
+        elif isinstance(payload_raw, str):
+            payload_text = payload_raw
+        else:  # pragma: no cover - defensive fallback
+            payload_text = str(payload_raw)
+    except Exception:  # pragma: no cover - depends on CalDAV library
+        logger.warning("Failed to read payload for remote event %s", uid)
+        payload_text = None
+
+    if payload_text:
+        try:
+            calendar_payload = ICalendar.from_ical(payload_text)
+            for component in calendar_payload.walk("VEVENT"):
+                if str(component.get("UID")) != uid:
+                    continue
+                timestamp = component.get("LAST-MODIFIED") or component.get("DTSTAMP")
+                if timestamp and hasattr(timestamp, "dt"):
+                    last_modified = _ensure_datetime(timestamp.dt)
+                    break
+        except Exception:  # pragma: no cover - parsing resilience
+            logger.exception("Failed to parse CalDAV payload for %s", uid)
+
+    etag_text = _resolve_event_etag(event)
+    return RemoteEventState(uid=uid, etag=etag_text, last_modified=last_modified, payload=payload_text)
+
+
+def _resolve_event_etag(event) -> Optional[str]:
+    """Best-effort lookup of an event's ETag value.
+
+    The CalDAV library does not expose an ``etag`` attribute on calendar objects.
+    Instead, the value is exposed through the object's property store which only
+    gets populated when explicitly queried.  We therefore attempt the following
+    strategies in order:
+
+    1. Reuse a cached ``getetag`` entry on the object.
+    2. Trigger a lightweight PROPFIND for ``getetag`` to populate the cache.
+    3. Fall back to any attribute named ``etag`` should future library versions
+       expose one.
+    """
+
+    raw_props = getattr(event, "props", {}) or {}
+    cached = raw_props.get(dav.GetEtag.tag)
+    if cached is not None:
+        return str(cached)
+
+    if hasattr(event, "get_properties"):
+        try:
+            event.get_properties([dav.GetEtag()])
+        except Exception:  # pragma: no cover - depends on caldav implementation
+            logger.warning("Failed to query ETag properties for %s", getattr(event, "url", "<unknown>"))
+        else:
+            refreshed = getattr(event, "props", {}) or {}
+            if dav.GetEtag.tag in refreshed:
+                return str(refreshed[dav.GetEtag.tag])
+
+    etag_attr = getattr(event, "etag", None)
+    return str(etag_attr) if etag_attr is not None else None
 
 
 def _ensure_datetime(value: datetime | date) -> datetime:

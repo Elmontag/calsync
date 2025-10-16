@@ -25,6 +25,8 @@ function App() {
     setAutoSyncInterval,
     respondToEvent,
     loadAutoSync,
+    disableTracking,
+    resolveConflict,
   } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -120,6 +122,8 @@ function App() {
               onAutoSyncResponseChange={setAutoResponse}
               onAutoSyncIntervalChange={setAutoSyncInterval}
               onRespondToEvent={respondToEvent}
+              onDisableTracking={disableTracking}
+              onResolveConflict={resolveConflict}
               onRefresh={refresh}
               autoSyncJob={autoSync.active_job ?? null}
               onLoadAutoSync={loadAutoSync}

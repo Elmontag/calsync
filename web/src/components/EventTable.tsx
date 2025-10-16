@@ -4,6 +4,8 @@ import {
   ManualSyncRequest,
   ManualSyncResponse,
   SyncJobStatus,
+  ConflictDifference,
+  ConflictResolutionOption,
   TrackedEvent,
 } from '../types/api';
 
@@ -23,11 +25,18 @@ interface Props {
     eventId: number,
     response: TrackedEvent['response_status'],
   ) => Promise<TrackedEvent>;
+  onDisableTracking: (eventId: number) => Promise<TrackedEvent>;
+  onResolveConflict: (
+    eventId: number,
+    payload: { action: string; selections?: Record<string, 'email' | 'calendar'> },
+  ) => Promise<TrackedEvent>;
   loading?: boolean;
   onRefresh: () => Promise<void>;
   autoSyncJob: SyncJobStatus | null;
   onLoadAutoSync: () => Promise<void>;
 }
+
+type MergeSelectionMap = Record<number, Record<string, 'email' | 'calendar'>>;
 
 const statusLabelMap: Record<TrackedEvent['status'], string> = {
   new: 'Neu',
@@ -62,6 +71,12 @@ const responseStyleMap: Record<TrackedEvent['response_status'], string> = {
   accepted: 'bg-emerald-500/15 text-emerald-300',
   tentative: 'bg-amber-500/15 text-amber-300',
   declined: 'bg-rose-500/15 text-rose-300',
+};
+
+const attendeeStatusMap: Record<string, string> = {
+  ACCEPTED: 'Zusage',
+  TENTATIVE: 'Vorläufig',
+  DECLINED: 'Absage',
 };
 
 const responseActions: Array<{
@@ -117,6 +132,35 @@ function formatConflictRange(conflict: TrackedEvent['conflicts'][number]) {
   return start ?? end ?? 'Keine Zeitangabe';
 }
 
+function formatDifferenceValue(difference: ConflictDifference, side: 'local' | 'remote') {
+  const value = side === 'local' ? difference.local_value : difference.remote_value;
+  if (!value) {
+    return '–';
+  }
+  if (difference.field === 'start' || difference.field === 'end') {
+    return formatDateTime(value) ?? value;
+  }
+  return value;
+}
+
+function formatSyncTimestamp(value?: string | null) {
+  if (!value) {
+    return 'Keine Angabe';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return 'Keine Angabe';
+  }
+  const datePart = date.toLocaleDateString('de-DE');
+  const timePart = date.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+  return `${datePart} ${timePart}`;
+}
+
+const syncSourceLabels: Record<string, string> = {
+  local: 'E-Mail-Import',
+  remote: 'Kalenderdaten',
+};
+
 function parseIsoDate(value?: string | null): Date | null {
   if (!value) {
     return null;
@@ -134,6 +178,18 @@ function getEmailDate(event: TrackedEvent): Date | null {
 
 function getEventDate(event: TrackedEvent): Date | null {
   return parseIsoDate(event.start) ?? parseIsoDate(event.end);
+}
+
+function sortHistoryEntries(entries: TrackedEvent['history']): TrackedEvent['history'] {
+  const copy = [...entries];
+  copy.sort((a, b) => {
+    const timeA = a?.timestamp ? new Date(a.timestamp).getTime() : Number.NaN;
+    const timeB = b?.timestamp ? new Date(b.timestamp).getTime() : Number.NaN;
+    const normalizedA = Number.isNaN(timeA) ? 0 : timeA;
+    const normalizedB = Number.isNaN(timeB) ? 0 : timeB;
+    return normalizedB - normalizedA;
+  });
+  return copy;
 }
 
 type SortDirection = 'asc' | 'desc';
@@ -173,6 +229,8 @@ export default function EventTable({
   onAutoSyncResponseChange,
   onAutoSyncIntervalChange,
   onRespondToEvent,
+  onDisableTracking,
+  onResolveConflict,
   loading = false,
   onRefresh,
   autoSyncJob,
@@ -193,9 +251,14 @@ export default function EventTable({
   const [searchTerm, setSearchTerm] = useState('');
   const [sortOption, setSortOption] = useState<SortOption>('email-desc');
   const [statusFilters, setStatusFilters] = useState<TrackedEvent['status'][]>([]);
+  const [syncConflictFilter, setSyncConflictFilter] = useState<'all' | 'sync-only'>('all');
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
+  const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
+  const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
+  const [activeMergeId, setActiveMergeId] = useState<number | null>(null);
+  const [mergeSelections, setMergeSelections] = useState<MergeSelectionMap>({});
   const pollersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -208,8 +271,17 @@ export default function EventTable({
 
   // Remove selections for events that disappeared after refresh.
   useEffect(() => {
-    setSelected((prev) => prev.filter((id) => events.some((event) => event.id === id)));
-    setOpenItems((prev) => prev.filter((id) => events.some((event) => event.id === id)));
+    const eventMap = new Map(events.map((event) => [event.id, event]));
+    setSelected((prev) =>
+      prev.filter((id) => {
+        const match = eventMap.get(id);
+        if (!match) {
+          return false;
+        }
+        return !(match.sync_state?.has_conflict ?? false);
+      }),
+    );
+    setOpenItems((prev) => prev.filter((id) => eventMap.has(id)));
   }, [events]);
 
   useEffect(() => {
@@ -224,7 +296,7 @@ export default function EventTable({
 
   useEffect(() => {
     setPage(1);
-  }, [searchTerm, statusFilters, sortOption, pageSize]);
+  }, [searchTerm, statusFilters, sortOption, pageSize, syncConflictFilter]);
 
   // Compose the visible event list by applying search, status filters and sorting preferences.
   const filteredEvents = useMemo(() => {
@@ -234,6 +306,9 @@ export default function EventTable({
 
     const filtered = events.filter((event) => {
       if (statusSet.size > 0 && !statusSet.has(event.status)) {
+        return false;
+      }
+      if (syncConflictFilter === 'sync-only' && !(event.sync_state?.has_conflict ?? false)) {
         return false;
       }
       if (!hasTerm) {
@@ -274,7 +349,7 @@ export default function EventTable({
     }
 
     return sorted;
-  }, [events, searchTerm, statusFilters, sortOption]);
+  }, [events, searchTerm, statusFilters, sortOption, syncConflictFilter]);
 
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(filteredEvents.length / pageSize));
@@ -304,6 +379,7 @@ export default function EventTable({
       (event) => event.response_status === 'none' && event.status !== 'cancelled',
     ).length;
     const conflicts = events.filter((event) => (event.conflicts?.length ?? 0) > 0).length;
+    const syncConflicts = events.filter((event) => event.sync_state?.has_conflict).length;
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
     const todayEnd = new Date();
@@ -315,8 +391,10 @@ export default function EventTable({
       const startDate = new Date(event.start);
       return startDate >= todayStart && startDate <= todayEnd;
     }).length;
-    return { outstanding, processed, cancelled, awaitingDecision, today, conflicts };
+    return { outstanding, processed, cancelled, awaitingDecision, today, conflicts, syncConflicts };
   }, [events]);
+
+  const showOnlySyncConflicts = syncConflictFilter === 'sync-only';
 
   function toggleSelection(id: number) {
     setSelected((prev) =>
@@ -338,6 +416,10 @@ export default function EventTable({
     setStatusFilters((prev) =>
       prev.includes(status) ? prev.filter((item) => item !== status) : [...prev, status],
     );
+  }
+
+  function toggleSyncConflictFilter() {
+    setSyncConflictFilter((prev) => (prev === 'sync-only' ? 'all' : 'sync-only'));
   }
 
   function resetStatusFilters() {
@@ -494,7 +576,7 @@ export default function EventTable({
     setSyncResult(uploaded);
     setMissing(missingDetails);
     if (missingDetails.length > 0) {
-      setSyncError('Für einige Termine existiert keine Sync-Zuordnung.');
+      setSyncError('Einige Termine konnten nicht synchronisiert werden.');
       setSelected(
         missingDetails
           .map((item) => item.event_id)
@@ -623,9 +705,15 @@ export default function EventTable({
     const normalizedTotal = total > 0 ? total : 0;
     const normalizedProcessed =
       normalizedTotal > 0 ? Math.min(processed, normalizedTotal) : processed;
+    const detail =
+      job.detail && typeof job.detail === 'object'
+        ? (job.detail as Record<string, unknown>)
+        : null;
+    const detailProcessed = detail ? asNumber(detail.processed, normalizedProcessed) : normalizedProcessed;
+    const detailTotal = detail ? asNumber(detail.total, normalizedTotal) : normalizedTotal;
     const percent =
-      normalizedTotal > 0
-        ? Math.min(100, Math.round((normalizedProcessed / normalizedTotal) * 100))
+      detailTotal > 0
+        ? Math.min(100, Math.round((detailProcessed / detailTotal) * 100))
         : job.status === 'completed'
         ? 100
         : 0;
@@ -635,20 +723,31 @@ export default function EventTable({
         : job.status === 'completed'
         ? 'Abgeschlossen'
         : 'Läuft…';
+    const description =
+      detail && typeof detail.description === 'string'
+        ? (detail.description as string)
+        : statusLabel;
+    const phaseLabel =
+      detail && typeof detail.phase === 'string' ? (detail.phase as string) : undefined;
     return (
-      <div className="rounded-lg border border-slate-800 bg-slate-950/80 p-4" key={label}>
+      <div className="w-full rounded-xl border border-slate-800 bg-slate-950/80 p-4" key={label}>
         <div className="flex items-center justify-between text-xs text-slate-300">
-          <span className="font-semibold text-slate-100">{label}</span>
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-slate-100">{label}</span>
+            {phaseLabel && (
+              <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
+                {phaseLabel}
+              </span>
+            )}
+          </div>
           <span>
             {statusLabel}
-            {normalizedTotal > 0 ? ` · ${normalizedProcessed}/${normalizedTotal}` : ''}
+            {detailTotal > 0 ? ` · ${detailProcessed}/${detailTotal}` : ''}
           </span>
         </div>
-        <div className="mt-2 h-2 rounded-full bg-slate-800">
-          <div
-            className={`h-2 rounded-full transition-all ${accentClass}`}
-            style={{ width: `${percent}%` }}
-          />
+        <p className="mt-2 text-xs text-slate-400">{description}</p>
+        <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+          <div className={`h-full transition-all ${accentClass}`} style={{ width: `${percent}%` }} />
         </div>
       </div>
     );
@@ -778,6 +877,127 @@ export default function EventTable({
     }
   }
 
+  async function handleDisableTracking(event: TrackedEvent) {
+    if (resolvingConflictId !== null) {
+      return;
+    }
+    setResolvingConflictId(event.id);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      await onDisableTracking(event.id);
+      const title = event.summary ?? event.uid;
+      setSyncNotice(`"${title}" wird nicht mehr automatisch verfolgt.`);
+      resetMerge(event.id);
+      await onRefresh();
+    } catch (error) {
+      console.error('Konnte Tracking nicht deaktivieren.', error);
+      setSyncError('Tracking konnte nicht deaktiviert werden.');
+    } finally {
+      setResolvingConflictId(null);
+    }
+  }
+
+  function toggleDifferences(eventId: number) {
+    setExpandedDifferences((prev) => ({
+      ...prev,
+      [eventId]: !prev[eventId],
+    }));
+  }
+
+  function initializeMerge(event: TrackedEvent, differences: ConflictDifference[]) {
+    const defaults: Record<string, 'email' | 'calendar'> = {};
+    differences.forEach((difference) => {
+      defaults[difference.field] = difference.field === 'response_status' ? 'email' : 'calendar';
+    });
+    setMergeSelections((prev) => ({
+      ...prev,
+      [event.id]: defaults,
+    }));
+    setActiveMergeId(event.id);
+    setExpandedDifferences((prev) => ({
+      ...prev,
+      [event.id]: true,
+    }));
+  }
+
+  function updateMergeSelection(eventId: number, field: string, source: 'email' | 'calendar') {
+    setMergeSelections((prev) => ({
+      ...prev,
+      [eventId]: {
+        ...(prev[eventId] ?? {}),
+        [field]: source,
+      },
+    }));
+  }
+
+  function resetMerge(eventId: number) {
+    setMergeSelections((prev) => {
+      const { [eventId]: _removed, ...rest } = prev;
+      return rest;
+    });
+    setActiveMergeId((current) => (current === eventId ? null : current));
+  }
+
+  async function resolveConflict(
+    event: TrackedEvent,
+    action: 'overwrite-calendar' | 'skip-email-import' | 'merge-fields',
+    selections: Record<string, 'email' | 'calendar'> = {},
+  ) {
+    if (resolvingConflictId !== null) {
+      return;
+    }
+    setResolvingConflictId(event.id);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      const updated = await onResolveConflict(event.id, { action, selections });
+      const title = updated.summary ?? updated.uid;
+      if (action === 'overwrite-calendar') {
+        setSyncNotice(`Kalenderdaten für "${title}" wurden mit dem E-Mail-Import überschrieben.`);
+      } else if (action === 'skip-email-import') {
+        setSyncNotice(
+          `Kalenderdaten für "${title}" wurden beibehalten. Hinweis: Wenn erneut abweichende E-Mail-Daten eintreffen, kann wieder ein Konflikt entstehen.`,
+        );
+      } else {
+        setSyncNotice(`Konflikt für "${title}" wurde erfolgreich zusammengeführt.`);
+      }
+      resetMerge(event.id);
+    } catch (error) {
+      console.error('Konflikt konnte nicht gelöst werden.', error);
+      setSyncError('Konflikt konnte nicht gelöst werden.');
+    } finally {
+      setResolvingConflictId(null);
+    }
+  }
+
+  async function applyMerge(event: TrackedEvent) {
+    const selections = mergeSelections[event.id] ?? {};
+    await resolveConflict(event, 'merge-fields', selections);
+  }
+
+  function handleSuggestionClick(
+    event: TrackedEvent,
+    suggestion: ConflictResolutionOption,
+  ) {
+    if (suggestion.action === 'disable-tracking') {
+      void handleDisableTracking(event);
+      return;
+    }
+    const differences = event.sync_state?.conflict_details?.differences ?? [];
+    if (suggestion.action === 'merge-fields') {
+      if (differences.length === 0) {
+        void resolveConflict(event, 'merge-fields');
+        return;
+      }
+      initializeMerge(event, differences);
+      return;
+    }
+    void resolveConflict(event, suggestion.action as 'overwrite-calendar' | 'skip-email-import');
+  }
+
   const showInitialLoading = loading && events.length === 0;
   const showEmptyState = !loading && filteredEvents.length === 0;
 
@@ -805,8 +1025,12 @@ export default function EventTable({
           <p className="mt-1 text-2xl font-semibold text-sky-300">{metrics.today}</p>
         </div>
         <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Konflikte</p>
+          <p className="text-xs uppercase tracking-wide text-slate-500">Kalender-Konflikte</p>
           <p className="mt-1 text-2xl font-semibold text-amber-300">{metrics.conflicts}</p>
+          <p className="mt-2 text-xs text-slate-400">
+            Sync-Konflikte:{' '}
+            <span className="font-semibold text-rose-300">{metrics.syncConflicts}</span>
+          </p>
         </div>
       </div>
 
@@ -944,12 +1168,24 @@ export default function EventTable({
                   </button>
                 );
               })}
+              <button
+                type="button"
+                onClick={toggleSyncConflictFilter}
+                aria-pressed={showOnlySyncConflicts}
+                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                  showOnlySyncConflicts
+                    ? 'border-rose-400 bg-rose-500/20 text-rose-200'
+                    : 'border-slate-700 text-slate-300 hover:border-rose-400 hover:text-rose-200'
+                }`}
+              >
+                Nur Sync-Konflikte
+              </button>
             </div>
           </div>
         </div>
 
         {(scanJob || syncAllJob || selectionJob || autoJob) && (
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+          <div className="space-y-3">
             {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
             {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
             {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
@@ -1016,6 +1252,13 @@ export default function EventTable({
               event.source_folder,
             ].filter(Boolean);
             const conflictCount = event.conflicts?.length ?? 0;
+            const syncState = event.sync_state;
+            const hasSyncConflict = syncState?.has_conflict ?? false;
+            const differences = syncState?.conflict_details?.differences ?? [];
+            const suggestions = syncState?.conflict_details?.suggestions ?? [];
+            const differencesExpanded = expandedDifferences[event.id] ?? false;
+            const isSelectable = !hasSyncConflict;
+            const historyEntries = sortHistoryEntries(event.history ?? []);
             return (
               <div
                 key={event.id}
@@ -1025,9 +1268,17 @@ export default function EventTable({
                   <div className="flex flex-1 items-start gap-3">
                     <input
                       type="checkbox"
-                      className="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950"
+                      className={`mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950 ${
+                        isSelectable ? '' : 'cursor-not-allowed opacity-50'
+                      }`}
                       checked={selected.includes(event.id)}
                       onChange={() => toggleSelection(event.id)}
+                      disabled={!isSelectable}
+                      title={
+                        isSelectable
+                          ? undefined
+                          : 'Synchronisation gesperrt: Konflikt muss zuerst gelöst werden.'
+                      }
                     />
                     <button
                       type="button"
@@ -1069,6 +1320,11 @@ export default function EventTable({
                         {conflictCount === 1 ? '1 Konflikt' : `${conflictCount} Konflikte`}
                       </span>
                     )}
+                    {hasSyncConflict && (
+                      <span className="inline-flex items-center rounded-full bg-rose-500/20 px-3 py-1 text-xs font-semibold text-rose-300">
+                        Sync-Konflikt
+                      </span>
+                    )}
                   </div>
                 </div>
                 {isOpen && (
@@ -1093,6 +1349,34 @@ export default function EventTable({
                         <p className="mt-1 text-slate-300">{dateRange}</p>
                       </div>
                     </div>
+                    {event.attendees.length > 0 && (
+                      <div className="mt-4">
+                        <p className="text-xs uppercase tracking-wide text-slate-500">Teilnehmer</p>
+                        <div className="mt-2 max-h-40 overflow-y-auto pr-2">
+                          <ul className="space-y-1 text-xs text-slate-300">
+                            {event.attendees.map((attendee, index) => {
+                              const primaryLabel = attendee.name ?? attendee.email ?? `Teilnehmer ${index + 1}`;
+                              const emailLabel = attendee.name && attendee.email ? attendee.email : attendee.name ? '' : attendee.email;
+                              const statusLabel = attendee.status ? attendeeStatusMap[attendee.status] ?? attendee.status : null;
+                              const responseNote = attendee.response_requested ? 'Antwort erbeten' : null;
+                              return (
+                                <li key={`${attendee.email ?? attendee.name ?? index}`} className="rounded border border-slate-800/60 bg-slate-900/60 p-2">
+                                  <span className="font-semibold text-slate-200">{primaryLabel}</span>
+                                  {emailLabel && (
+                                    <span className="ml-2 text-[11px] text-slate-400">{emailLabel}</span>
+                                  )}
+                                  <div className="mt-1 text-[11px] text-slate-400">
+                                    {statusLabel ? statusLabel : 'Status unbekannt'}
+                                    {responseNote ? ` · ${responseNote}` : ''}
+                                    {attendee.type ? ` · ${attendee.type}` : ''}
+                                  </div>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
                     {conflictCount > 0 && (
                       <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">
                         <p className="text-sm font-semibold text-amber-200">Terminkonflikte erkannt</p>
@@ -1113,19 +1397,230 @@ export default function EventTable({
                         </ul>
                       </div>
                     )}
+                    {hasSyncConflict && (
+                      <div className="mt-4 space-y-3 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-100">
+                        <div>
+                          <p className="text-sm font-semibold text-rose-200">Synchronisationskonflikt</p>
+                          <p className="mt-1 text-rose-100/80">
+                            {syncState?.conflict_reason ??
+                              'Kalenderdaten und E-Mail-Import unterscheiden sich. Bitte Termin prüfen.'}
+                          </p>
+                        </div>
+                        {differences.length > 0 && (
+                          <div>
+                            <button
+                              type="button"
+                              onClick={() => toggleDifferences(event.id)}
+                              className="flex w-full items-center justify-between rounded-lg border border-rose-400/30 bg-rose-950/20 px-3 py-2 text-left text-xs font-semibold text-rose-200 transition hover:bg-rose-950/40 focus:outline-none focus:ring-2 focus:ring-rose-400/50"
+                              aria-expanded={differencesExpanded}
+                            >
+                              <span>
+                                Unterschiede zwischen E-Mail-Import und Kalenderdaten ({differences.length})
+                              </span>
+                              <span className={`text-base transition-transform ${differencesExpanded ? 'rotate-180' : ''}`}>
+                                ▾
+                              </span>
+                            </button>
+                            {differencesExpanded && (
+                              <div className="mt-2 space-y-2">
+                                {differences.map((difference) => {
+                                  const isMerging = activeMergeId === event.id;
+                                  const selection =
+                                    mergeSelections[event.id]?.[difference.field] ??
+                                    (difference.field === 'response_status' ? 'email' : 'calendar');
+                                  return (
+                                    <div
+                                      key={difference.field}
+                                      className="rounded-lg border border-rose-400/30 bg-rose-950/20 p-2"
+                                    >
+                                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                        <p className="text-xs font-semibold text-rose-200">{difference.label}</p>
+                                        {isMerging && (
+                                          <div className="flex flex-wrap gap-1 text-[11px]">
+                                            <button
+                                              type="button"
+                                              onClick={() => updateMergeSelection(event.id, difference.field, 'email')}
+                                              className={`rounded px-2 py-1 font-semibold transition ${
+                                                selection === 'email'
+                                                  ? 'bg-rose-400/30 text-rose-100'
+                                                  : 'bg-rose-950/40 text-rose-300 hover:bg-rose-900/40'
+                                              }`}
+                                            >
+                                              E-Mail-Import verwenden
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => updateMergeSelection(event.id, difference.field, 'calendar')}
+                                              className={`rounded px-2 py-1 font-semibold transition ${
+                                                selection === 'calendar'
+                                                  ? 'bg-rose-400/30 text-rose-100'
+                                                  : 'bg-rose-950/40 text-rose-300 hover:bg-rose-900/40'
+                                              }`}
+                                            >
+                                              Kalenderdaten verwenden
+                                            </button>
+                                          </div>
+                                        )}
+                                      </div>
+                                      <div className="mt-2 grid gap-3 text-[11px] text-rose-100/80 sm:grid-cols-2">
+                                        <div
+                                          className={
+                                            isMerging && selection === 'email'
+                                              ? 'rounded-md border border-rose-400/40 bg-rose-900/40 p-2'
+                                              : 'p-0'
+                                          }
+                                        >
+                                          <span className="font-semibold text-rose-300">E-Mail-Import</span>
+                                          <p className="mt-1 whitespace-pre-wrap break-words">
+                                            {formatDifferenceValue(difference, 'local')}
+                                          </p>
+                                        </div>
+                                        <div
+                                          className={
+                                            isMerging && selection === 'calendar'
+                                              ? 'rounded-md border border-rose-400/40 bg-rose-900/40 p-2'
+                                              : 'p-0'
+                                          }
+                                        >
+                                          <span className="font-semibold text-rose-300">Kalenderdaten</span>
+                                          <p className="mt-1 whitespace-pre-wrap break-words">
+                                            {formatDifferenceValue(difference, 'remote')}
+                                          </p>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {suggestions.length > 0 && (
+                              <div>
+                                <p className="text-[11px] uppercase tracking-wide text-rose-300/80">Lösungsvorschläge</p>
+                                <div className="mt-2 space-y-2">
+                                  {suggestions.map((suggestion) => {
+                                const disableInProgress =
+                                  suggestion.action === 'disable-tracking' &&
+                                  resolvingConflictId === event.id;
+                                const resolveInProgress =
+                                  suggestion.action !== 'disable-tracking' &&
+                                  suggestion.action !== 'merge-fields' &&
+                                  resolvingConflictId === event.id;
+                                const mergingActive =
+                                  suggestion.action === 'merge-fields' && activeMergeId === event.id;
+                                return (
+                                  <button
+                                    key={suggestion.action}
+                                    type="button"
+                                    onClick={() => handleSuggestionClick(event, suggestion)}
+                                    disabled={disableInProgress || resolveInProgress}
+                                    className={`w-full rounded-lg border border-rose-400/30 bg-rose-950/15 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-rose-400/50 ${
+                                      disableInProgress || resolveInProgress
+                                        ? 'cursor-progress opacity-60'
+                                        : 'cursor-pointer hover:bg-rose-900/40'
+                                    }`}
+                                  >
+                                    <p className="text-xs font-semibold text-rose-200">{suggestion.label}</p>
+                                    <p className="mt-1 whitespace-pre-wrap break-words text-rose-100/80">
+                                      {suggestion.description}
+                                    </p>
+                                    {disableInProgress && (
+                                      <p className="mt-2 text-[11px] font-semibold text-rose-200">
+                                        Wird entfernt…
+                                      </p>
+                                    )}
+                                    {resolveInProgress && (
+                                      <p className="mt-2 text-[11px] font-semibold text-rose-200">
+                                        Lösung wird angewendet…
+                                      </p>
+                                    )}
+                                    {mergingActive && (
+                                      <p className="mt-2 text-[11px] font-semibold text-rose-200">
+                                        Wähle für jedes Feld die gewünschte Quelle aus.
+                                      </p>
+                                    )}
+                                  </button>
+                                );
+                              })}
+                                </div>
+                              {activeMergeId === event.id && (
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => applyMerge(event)}
+                                    disabled={resolvingConflictId === event.id}
+                                    className="rounded-lg bg-rose-500 px-3 py-1.5 text-xs font-semibold text-rose-50 transition hover:bg-rose-400 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    Auswahl übernehmen
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => resetMerge(event.id)}
+                                    disabled={resolvingConflictId === event.id}
+                                    className="rounded-lg border border-rose-400/40 px-3 py-1.5 text-xs font-semibold text-rose-200 transition hover:border-rose-300 hover:text-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    Zusammenführung abbrechen
+                                  </button>
+                                </div>
+                              )}
+                              </div>
+                        )}
+                      </div>
+                    )}
+                    <div className="mt-4 grid gap-3 text-xs text-slate-400 sm:grid-cols-2">
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">Letzte Änderung (E-Mail-Import)</p>
+                        <p className="mt-1 text-slate-300">
+                          {formatSyncTimestamp(syncState?.local_last_modified)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">Letzte Änderung (Kalenderdaten)</p>
+                        <p className="mt-1 text-slate-300">
+                          {formatSyncTimestamp(syncState?.remote_last_modified)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">Quelle der letzten Änderung</p>
+                        <p className="mt-1 text-slate-300">
+                          {syncState?.last_modified_source
+                            ? syncSourceLabels[syncState.last_modified_source] ?? syncState.last_modified_source
+                            : 'Keine Angabe'}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="uppercase tracking-wide text-slate-500">CalDAV ETag</p>
+                        <p className="mt-1 break-all text-slate-300">{syncState?.caldav_etag ?? '–'}</p>
+                      </div>
+                    </div>
                     <div className="mt-4">
                       <p className="text-xs uppercase tracking-wide text-slate-500">Historie</p>
-                      {event.history.length > 0 ? (
-                        <ul className="mt-2 space-y-1 text-xs text-slate-300">
-                          {event.history.map((entry, index) => (
-                            <li key={`${entry.timestamp}-${index}`}>
-                              <span className="font-semibold text-slate-200">
-                                {new Date(entry.timestamp).toLocaleString()}:
-                              </span>{' '}
-                              {entry.description}
-                            </li>
-                          ))}
-                        </ul>
+                      {historyEntries.length > 0 ? (
+                        <>
+                          <div className="mt-2 max-h-48 overflow-y-auto pr-2">
+                            <ul className="space-y-1 text-xs text-slate-300">
+                              {historyEntries.map((entry, index) => {
+                                const parsed = entry.timestamp ? new Date(entry.timestamp) : null;
+                                const formatted =
+                                  parsed && !Number.isNaN(parsed.getTime())
+                                    ? parsed.toLocaleString()
+                                    : 'Unbekannter Zeitpunkt';
+                                return (
+                                  <li key={`${entry.timestamp}-${index}`}>
+                                    <span className="font-semibold text-slate-200">{formatted}:</span>{' '}
+                                    {entry.description}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+                          {historyEntries.length > 10 && (
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              Neueste Einträge zuerst – ältere Einträge per Scroll erreichbar.
+                            </p>
+                          )}
+                        </>
                       ) : (
                         <p className="mt-2 text-xs text-slate-400">Keine Historie vorhanden.</p>
                       )}
