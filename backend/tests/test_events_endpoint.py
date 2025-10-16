@@ -140,6 +140,55 @@ def _store_event(
     session.commit()
 
 
+def test_delete_imap_account_removes_scan_results() -> None:
+    """Deleting an IMAP account must also remove scan results and mappings."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    event = TrackedEvent(
+        uid="delete-me",
+        status=EventStatus.NEW,
+        response_status=EventResponseStatus.NONE,
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        history=[],
+    )
+    session.add_all([mapping, event])
+    session.commit()
+    imap_id = imap.id
+    session.close()
+
+    client = TestClient(app)
+    response = client.delete(f"/accounts/{imap_id}")
+
+    assert response.status_code == 200
+
+    with SessionLocal() as verify:
+        remaining_mappings = (
+            verify.execute(
+                select(SyncMapping).where(SyncMapping.imap_account_id == imap_id)
+            )
+            .scalars()
+            .all()
+        )
+        remaining_events = (
+            verify.execute(
+                select(TrackedEvent).where(TrackedEvent.source_account_id == imap_id)
+            )
+            .scalars()
+            .all()
+        )
+
+    assert remaining_mappings == []
+    assert remaining_events == []
+
+
 def test_list_events_handles_duplicate_caldav_targets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Listing events remains stable when different folders target the same calendar."""
     session = SessionLocal()

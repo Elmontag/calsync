@@ -1121,14 +1121,15 @@ def delete_account(account_id: int, db: Session = Depends(get_db)) -> dict[str, 
     for mapping in mappings:
         db.delete(mapping)
 
-    events = (
-        db.execute(select(TrackedEvent).where(TrackedEvent.source_account_id == account_id))
-        .scalars()
-        .all()
-    )
-    for event in events:
-        event.source_account_id = None
-        db.add(event)
+    if account.type == AccountType.IMAP:
+        removed_events = (
+            db.query(TrackedEvent)
+            .filter(TrackedEvent.source_account_id == account_id)
+            .delete(synchronize_session=False)
+        )
+        logger.info(
+            "Deleted %s tracked events for IMAP account %s", removed_events, account_id
+        )
 
     db.delete(account)
     db.commit()
@@ -1146,6 +1147,7 @@ def test_connection(payload: ConnectionTestRequest) -> ConnectionTestResult:
                 password=payload.settings["password"],
                 ssl=payload.settings.get("ssl", True),
                 port=payload.settings.get("port"),
+                timeout=payload.settings.get("timeout"),
             )
             fetch_calendar_candidates(settings, folders)
             return ConnectionTestResult(success=True, message="IMAP connection successful")

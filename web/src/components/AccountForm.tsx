@@ -29,7 +29,7 @@ function toFormDefaults(account?: Account | null): AccountCreateInput {
     return {
       label: '',
       type: 'imap',
-      settings: { ssl: true },
+      settings: { ssl: true, timeout: '' },
       imap_folders: [createDefaultFolder()],
     };
   }
@@ -45,6 +45,7 @@ function toFormDefaults(account?: Account | null): AccountCreateInput {
         password: settings.password ?? '',
         port: settings.port ?? '',
         ssl: settings.ssl ?? true,
+        timeout: settings.timeout ?? '',
       },
       imap_folders:
         account.imap_folders.length > 0
@@ -160,6 +161,11 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
   function buildAccountPayload(values: AccountCreateInput): AccountCreateInput {
     if (values.type === 'imap') {
       const settings = values.settings as Record<string, unknown>;
+      const rawTimeout = settings.timeout as string | number | undefined;
+      const timeout =
+        rawTimeout === undefined || rawTimeout === ''
+          ? undefined
+          : Number(rawTimeout);
       return {
         ...values,
         settings: {
@@ -168,6 +174,10 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
           password: settings.password,
           port: settings.port ? Number(settings.port) : undefined,
           ssl: settings.ssl ?? true,
+          timeout:
+            timeout !== undefined && Number.isFinite(timeout) && timeout > 0
+              ? Math.round(timeout)
+              : undefined,
         },
       };
     }
@@ -305,6 +315,22 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
                 className="mt-1 w-full rounded border border-slate-700 bg-slate-950 p-2"
                 type="number"
               />
+            </div>
+            <div>
+              <label className="block text-xs uppercase tracking-wide text-slate-400">
+                Timeout (Sekunden)
+              </label>
+              <input
+                {...register('settings.timeout')}
+                className="mt-1 w-full rounded border border-slate-700 bg-slate-950 p-2"
+                type="number"
+                min={30}
+                step={30}
+                placeholder="180"
+              />
+              <p className="mt-1 text-[11px] text-slate-500">
+                Erhöhe den Wert, wenn Scans großer Postfächer wegen Zeitüberschreitungen abbrechen.
+              </p>
             </div>
             <div>
               <label className="block text-xs uppercase tracking-wide text-slate-400">Benutzername</label>
