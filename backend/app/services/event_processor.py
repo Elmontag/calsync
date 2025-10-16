@@ -161,9 +161,18 @@ def upsert_events(
                         event.local_version = (event.local_version or 0) + 1
                         event.local_last_modified = datetime.utcnow()
                         event.last_modified_source = "local"
-                        event.sync_conflict = False
-                        event.sync_conflict_reason = None
-                        event.sync_conflict_snapshot = None
+                        if event.sync_conflict:
+                            # Nach einem erkannten Konflikt behalten wir den Status bei, damit
+                            # der Termin nicht erneut exportiert wird, bevor der Benutzer eine
+                            # Auflösung gewählt hat. Neue E-Mail-Änderungen liefern zwar eine
+                            # aktualisierte lokale Version, ändern aber nichts am offenen Konflikt.
+                            logger.debug(
+                                "Preserving conflict flag for %s despite new mail update", parsed.uid
+                            )
+                        else:
+                            event.sync_conflict = False
+                            event.sync_conflict_reason = None
+                            event.sync_conflict_snapshot = None
                     session.add(event)
 
                 if content_changed or status_changed or response_changed:

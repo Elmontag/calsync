@@ -1302,6 +1302,103 @@ def test_manual_sync_marks_conflicts_as_missing(monkeypatch: pytest.MonkeyPatch)
     assert captured == []
 
 
+def test_sync_conflict_persists_across_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ein erkannter Konflikt muss über Folge-Syncs hinweg bestehen bleiben."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+
+    start = datetime(2024, 4, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    remote_payload = _build_ical(
+        method=None,
+        uid="conflict-rolling",
+        summary="Jour fixe",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+    )
+    event = TrackedEvent(
+        uid="conflict-rolling",
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        payload="BEGIN:VEVENT\nUID:conflict-rolling\nEND:VEVENT",
+        history=[],
+        local_version=3,
+        synced_version=1,
+        last_synced=start - timedelta(hours=3),
+        remote_last_modified=start - timedelta(hours=3),
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    remote_state = RemoteEventState(
+        uid="conflict-rolling",
+        etag=None,
+        last_modified=end + timedelta(hours=2),
+        payload=remote_payload,
+    )
+
+    upload_calls: List[str] = []
+
+    def _fake_upload(*_args, **_kwargs):  # pragma: no cover - wird in diesem Szenario nicht erwartet
+        upload_calls.append("called")
+        return remote_state
+
+    monkeypatch.setattr(
+        "backend.app.services.event_processor.get_event_state", lambda *_args, **_kwargs: remote_state
+    )
+    monkeypatch.setattr("backend.app.services.event_processor.upload_ical", _fake_upload)
+
+    settings = CalDavSettings(url="https://cal.example.com", username="user", password="secret")
+
+    event_processor.sync_events_to_calendar([event], mapping.calendar_url, settings)
+
+    session.refresh(event)
+    assert event.sync_conflict is True
+    assert upload_calls == []
+
+    updated_payload = _build_ical(
+        method=None,
+        uid="conflict-rolling",
+        summary="Jour fixe (E-Mail)",
+        start=start + timedelta(minutes=15),
+        end=end + timedelta(minutes=15),
+        status="CONFIRMED",
+    )
+    parsed_update = parse_ics_payload(updated_payload.encode())
+    event_processor.upsert_events(
+        parsed_update,
+        "mail-update",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+    )
+
+    session.refresh(event)
+    assert event.sync_conflict is True
+
+    upload_calls.clear()
+
+    total_exported = perform_sync_all(session)
+
+    assert total_exported == 0
+    assert upload_calls == []
+
+    session.refresh(event)
+    assert event.sync_conflict is True
+
+
 def test_organizer_cancellation_exports_cancel_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     """Organizer cancellations must be pushed to CalDAV as cancelled events."""
 
