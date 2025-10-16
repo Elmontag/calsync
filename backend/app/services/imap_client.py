@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import email
 import logging
+import os
 from dataclasses import dataclass
 from email.message import Message
 from typing import Callable, Iterable, List, Optional, Sequence
@@ -12,6 +13,31 @@ from imapclient import IMAPClient
 logger = logging.getLogger(__name__)
 
 
+def _load_default_timeout() -> int:
+    """Determine the default IMAP socket timeout in seconds.
+
+    Operators can override the timeout via the ``IMAP_CLIENT_TIMEOUT``
+    environment variable.  Invalid overrides fall back to a conservative
+    default while logging a warning for better visibility.
+    """
+
+    raw_value = os.getenv("IMAP_CLIENT_TIMEOUT", "180")
+    try:
+        parsed = int(raw_value)
+        if parsed <= 0:
+            raise ValueError
+        return parsed
+    except ValueError:
+        logger.warning(
+            "Ungültiger Wert für IMAP_CLIENT_TIMEOUT (%s), verwende 180 Sekunden.",
+            raw_value,
+        )
+        return 180
+
+
+DEFAULT_IMAP_CLIENT_TIMEOUT = _load_default_timeout()
+
+
 @dataclass
 class ImapSettings:
     host: str
@@ -19,6 +45,7 @@ class ImapSettings:
     password: str
     ssl: bool = True
     port: Optional[int] = None
+    timeout: Optional[int] = None
 
 
 @dataclass
@@ -67,11 +94,21 @@ class ImapConnection:
         self._client: Optional[IMAPClient] = None
 
     def __enter__(self) -> IMAPClient:
-        logger.debug("Opening IMAP connection to %s", self.settings.host)
+        timeout = (
+            self.settings.timeout
+            if self.settings.timeout is not None
+            else DEFAULT_IMAP_CLIENT_TIMEOUT
+        )
+        logger.debug(
+            "Opening IMAP connection to %s (Timeout: %ss)",
+            self.settings.host,
+            timeout,
+        )
         self._client = IMAPClient(
             host=self.settings.host,
             port=self.settings.port,
             ssl=self.settings.ssl,
+            timeout=timeout,
         )
         self._client.login(self.settings.username, self.settings.password)
         return self._client
