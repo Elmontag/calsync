@@ -1083,6 +1083,167 @@ def test_remote_cancellation_keeps_server_status(monkeypatch: pytest.MonkeyPatch
     assert cancellation_updates == []
 
 
+def test_sync_events_detects_timestamp_conflict_without_etag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote Änderungen ohne ETag müssen als Konflikt erkannt werden."""
+
+    session = SessionLocal()
+    imap, _caldav = _store_basic_accounts(session)
+    start = datetime(2024, 7, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "uid-no-etag"
+    initial_remote_ts = datetime(2024, 7, 1, 8, 30, tzinfo=timezone.utc)
+    event = TrackedEvent(
+        uid=uid,
+        summary="Statusmeeting",
+        start=start,
+        end=end,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        payload=_build_ical(
+            method=None,
+            uid=uid,
+            summary="Statusmeeting",
+            start=start,
+            end=end,
+            status="CONFIRMED",
+        ),
+        history=[],
+        local_version=2,
+        synced_version=1,
+        remote_last_modified=initial_remote_ts,
+        last_synced=initial_remote_ts,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    remote_payload = _build_ical(
+        method=None,
+        uid=uid,
+        summary="Statusmeeting (Remote)",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+    )
+    remote_state = RemoteEventState(
+        uid=uid,
+        etag=None,
+        last_modified=end + timedelta(hours=2),
+        payload=remote_payload,
+    )
+
+    upload_calls: List[str] = []
+
+    def _fake_upload(*_args, **_kwargs):  # pragma: no cover - verification helper
+        upload_calls.append("called")
+        return remote_state
+
+    monkeypatch.setattr(
+        "backend.app.services.event_processor.get_event_state", lambda *_args, **_kwargs: remote_state
+    )
+    monkeypatch.setattr("backend.app.services.event_processor.upload_ical", _fake_upload)
+
+    settings = CalDavSettings(url="https://cal.example.com", username="user", password="secret")
+    event_processor.sync_events_to_calendar([event], "https://cal.example.com/shared", settings)
+
+    assert upload_calls == []
+
+    with SessionLocal() as verify_session:
+        stored = verify_session.get(TrackedEvent, event.id)
+        assert stored is not None
+        assert stored.sync_conflict is True
+        assert stored.sync_conflict_reason is not None
+        stored_remote = stored.remote_last_modified
+        assert stored_remote is not None
+        if stored_remote.tzinfo is None:
+            stored_remote = stored_remote.replace(tzinfo=timezone.utc)
+        assert stored_remote == remote_state.last_modified
+
+
+def test_sync_events_applies_remote_snapshot_without_local_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ohne lokale Änderungen müssen Remote-Zeitstempel-Updates übernommen werden."""
+
+    session = SessionLocal()
+    imap, _caldav = _store_basic_accounts(session)
+    start = datetime(2024, 8, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    uid = "uid-snapshot"
+    initial_remote_ts = datetime(2024, 8, 1, 7, 0, tzinfo=timezone.utc)
+    event = TrackedEvent(
+        uid=uid,
+        summary="Jour Fixe",
+        start=start,
+        end=end,
+        status=EventStatus.SYNCED,
+        response_status=EventResponseStatus.NONE,
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        payload=_build_ical(
+            method=None,
+            uid=uid,
+            summary="Jour Fixe",
+            start=start,
+            end=end,
+            status="CONFIRMED",
+        ),
+        history=[],
+        local_version=1,
+        synced_version=1,
+        remote_last_modified=initial_remote_ts,
+        last_synced=initial_remote_ts,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    remote_payload = _build_ical(
+        method=None,
+        uid=uid,
+        summary="Jour Fixe (Remote)",
+        start=start,
+        end=end + timedelta(minutes=15),
+        status="CONFIRMED",
+    )
+    remote_state = RemoteEventState(
+        uid=uid,
+        etag=None,
+        last_modified=end + timedelta(hours=3),
+        payload=remote_payload,
+    )
+
+    upload_calls: List[str] = []
+
+    def _fake_upload(*_args, **_kwargs):  # pragma: no cover - verification helper
+        upload_calls.append("called")
+        return remote_state
+
+    monkeypatch.setattr(
+        "backend.app.services.event_processor.get_event_state", lambda *_args, **_kwargs: remote_state
+    )
+    monkeypatch.setattr("backend.app.services.event_processor.upload_ical", _fake_upload)
+
+    settings = CalDavSettings(url="https://cal.example.com", username="user", password="secret")
+    event_processor.sync_events_to_calendar([event], "https://cal.example.com/shared", settings)
+
+    assert upload_calls == []
+
+    with SessionLocal() as verify_session:
+        stored = verify_session.get(TrackedEvent, event.id)
+        assert stored is not None
+        assert stored.summary == "Jour Fixe (Remote)"
+        assert stored.sync_conflict is False
+        stored_remote = stored.remote_last_modified
+        assert stored_remote is not None
+        if stored_remote.tzinfo is None:
+            stored_remote = stored_remote.replace(tzinfo=timezone.utc)
+        assert stored_remote == remote_state.last_modified
+
 def test_manual_sync_marks_conflicts_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Manual sync jobs müssen Konflikte melden statt sie zu exportieren."""
 

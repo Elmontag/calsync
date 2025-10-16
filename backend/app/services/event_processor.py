@@ -223,6 +223,14 @@ def sync_events_to_calendar(
     progress_callback: Optional[Callable[[TrackedEvent, bool], None]] = None,
 ) -> List[str]:
     """Upload a batch of events to the configured CalDAV calendar."""
+
+    def _normalize_to_utc(value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     uploaded_uids: List[str] = []
     events_list = list(events)
     successfully_uploaded: List[TrackedEvent] = []
@@ -240,17 +248,42 @@ def sync_events_to_calendar(
         known_etag = getattr(event, "caldav_etag", None)
         has_local_changes = (event.local_version or 0) > (event.synced_version or 0)
 
-        if (
-            remote_state
-            and remote_state.etag
-            and known_etag
-            and remote_state.etag != known_etag
-        ):
+        remote_change_detected = False
+        conflict_reason: Optional[str] = None
+        default_conflict_reason = (
+            "Kalendereintrag wurde in den Kalenderdaten verändert. Anpassungen aus dem E-Mail-Import wurden nicht überschrieben."
+        )
+        if remote_state is not None:
+            if remote_state.etag and known_etag and remote_state.etag != known_etag:
+                remote_change_detected = True
+                conflict_reason = default_conflict_reason
+            else:
+                remote_last_modified = _normalize_to_utc(remote_state.last_modified)
+                known_remote_last_modified = _normalize_to_utc(
+                    getattr(event, "remote_last_modified", None)
+                )
+                baseline = known_remote_last_modified or _normalize_to_utc(
+                    getattr(event, "last_synced", None)
+                )
+                if remote_last_modified and baseline and remote_last_modified > baseline:
+                    logger.info(
+                        "Detected remote change for %s via timestamp comparison (known=%s, remote=%s)",
+                        event.uid,
+                        baseline.isoformat(),
+                        remote_last_modified.isoformat(),
+                    )
+                    remote_change_detected = True
+                    conflict_reason = (
+                        "Kalendereintrag wurde im Kalender nach der letzten Synchronisierung verändert (Zeitstempel). "
+                        "Anpassungen aus dem E-Mail-Import wurden nicht überschrieben."
+                    )
+
+        if remote_change_detected and remote_state is not None:
             if has_local_changes:
                 conflicts_detected += 1
                 _record_sync_conflict(
                     event,
-                    "Kalendereintrag wurde in den Kalenderdaten verändert. Anpassungen aus dem E-Mail-Import wurden nicht überschrieben.",
+                    conflict_reason or default_conflict_reason,
                     remote_state,
                 )
                 if progress_callback is not None:
