@@ -199,9 +199,16 @@ export default function AccountForm({ account, onSubmit, onCancel, loading }: Pr
     const payload = buildAccountPayload(values);
     setTesting(true);
     try {
+      const requestSettings =
+        payload.type === 'imap'
+          ? {
+              ...(payload.settings as Record<string, unknown>),
+              folders: payload.imap_folders.map((folder) => folder.name),
+            }
+          : (payload.settings as Record<string, unknown>);
       const result = await runConnectionTest({
         type: payload.type,
-        settings: payload.settings as Record<string, unknown>,
+        settings: requestSettings,
       });
       setTestResult(result);
     } catch (error) {
