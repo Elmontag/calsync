@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import AccountForm from './components/AccountForm';
 import AccountList from './components/AccountList';
 import EventTable from './components/EventTable';
@@ -30,18 +30,42 @@ function App() {
     resolveConflict,
   } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
-  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
+  const [editingAccountId, setEditingAccountId] = useState<number | null>(null);
+  const activeAccount = useMemo(
+    () => accounts.find((account) => account.id === editingAccountId) ?? null,
+    [accounts, editingAccountId],
+  );
   const [savingAccount, setSavingAccount] = useState(false);
+  const [accountFeedback, setAccountFeedback] = useState<
+    { type: 'success' | 'error'; message: string }
+  | null>(null);
 
   async function handleAccountSubmit(values: AccountCreateInput) {
     setSavingAccount(true);
+    setAccountFeedback(null);
     try {
-      if (editingAccount) {
-        await updateAccount(editingAccount.id, values);
-        setEditingAccount(null);
+      if (editingAccountId !== null) {
+        const updated = await updateAccount(editingAccountId, values);
+        setAccountFeedback({
+          type: 'success',
+          message: 'Kontoeinstellungen wurden gespeichert.',
+        });
+        if (updated) {
+          setEditingAccountId(updated.id);
+        }
       } else {
         await addAccount(values);
+        setAccountFeedback({
+          type: 'success',
+          message: 'Neues Konto wurde erfolgreich gespeichert.',
+        });
       }
+    } catch (error) {
+      console.error('Konto konnte nicht gespeichert werden.', error);
+      setAccountFeedback({
+        type: 'error',
+        message: 'Konto konnte nicht gespeichert werden. Bitte versuche es erneut.',
+      });
     } finally {
       setSavingAccount(false);
     }
@@ -53,13 +77,15 @@ function App() {
       return;
     }
     await removeAccount(account.id);
-    if (editingAccount?.id === account.id) {
-      setEditingAccount(null);
+    if (editingAccountId === account.id) {
+      setEditingAccountId(null);
     }
+    setAccountFeedback(null);
   }
 
   function handleCancelEdit() {
-    setEditingAccount(null);
+    setEditingAccountId(null);
+    setAccountFeedback(null);
   }
 
   return (
@@ -139,16 +165,28 @@ function App() {
             <section className="space-y-6">
               <div className="rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-lg shadow-emerald-500/10">
                 <h2 className="text-lg font-semibold text-slate-100">
-                  {editingAccount ? 'Konto bearbeiten' : 'Neues Konto'}
+                  {activeAccount ? 'Konto bearbeiten' : 'Neues Konto'}
                 </h2>
                 <p className="mt-1 text-sm text-slate-400">
-                  {editingAccount
+                  {activeAccount
                     ? 'Passe Zugangsdaten und Ordnerzuweisungen für das ausgewählte Konto an.'
                     : 'Hinterlege hier IMAP oder CalDAV Verbindungen und teste deine Zugangsdaten direkt.'}
                 </p>
+                {accountFeedback && (
+                  <div
+                    className={`mt-4 rounded-lg border px-4 py-3 text-sm ${
+                      accountFeedback.type === 'success'
+                        ? 'border-emerald-500/60 bg-emerald-500/10 text-emerald-200'
+                        : 'border-rose-500/60 bg-rose-500/10 text-rose-200'
+                    }`}
+                  >
+                    {accountFeedback.message}
+                  </div>
+                )}
                 <div className="mt-6">
                   <AccountForm
-                    account={editingAccount}
+                    key={activeAccount ? activeAccount.id : 'new'}
+                    account={activeAccount}
                     onSubmit={handleAccountSubmit}
                     onCancel={handleCancelEdit}
                     loading={savingAccount}
@@ -157,11 +195,33 @@ function App() {
               </div>
             </section>
             <aside className="space-y-6">
+              <div className="rounded-xl border border-dashed border-emerald-500/40 bg-slate-900/60 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-100">Neues Konto</h3>
+                    <p className="text-xs text-slate-400">
+                      Starte ein leeres Formular ohne vorhandene Daten.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setEditingAccountId(null);
+                      setAccountFeedback(null);
+                    }}
+                    className="rounded-lg bg-emerald-500/20 px-3 py-1 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30 hover:text-emerald-100"
+                  >
+                    Neues Konto
+                  </button>
+                </div>
+              </div>
               <AccountList
                 accounts={accounts}
-                onEdit={setEditingAccount}
+                onEdit={(account) => {
+                  setEditingAccountId(account.id);
+                  setAccountFeedback(null);
+                }}
                 onDelete={handleDeleteAccount}
-                activeAccountId={editingAccount?.id ?? null}
+                activeAccountId={editingAccountId}
               />
             </aside>
           </div>
