@@ -913,12 +913,13 @@ def test_resolve_conflict_skip_email_import(monkeypatch: pytest.MonkeyPatch) -> 
         markers = (
             verify_session.execute(
                 select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
-            )
-            .scalars()
-            .all()
         )
-        assert len(markers) == 1
-        assert markers[0].message_id == "msg-skip"
+        .scalars()
+        .all()
+    )
+    assert len(markers) == 1
+    assert markers[0].message_id == "msg-skip"
+    assert markers[0].max_uid is None
 
 
 def test_resolve_conflict_skip_email_import_applies_remote_snapshot(
@@ -1003,12 +1004,82 @@ def test_resolve_conflict_skip_email_import_applies_remote_snapshot(
         markers = (
             verify_session.execute(
                 select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+        )
+        .scalars()
+        .all()
+    )
+    assert len(markers) == 1
+    assert markers[0].message_id == "msg-skip-remote"
+    assert markers[0].max_uid is None
+
+
+def test_resolve_conflict_skip_email_import_sets_uid_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Numeric message identifiers should extend the ignore threshold for older mails."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 8, 2, 12, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-skip-numeric",
+        summary="Kalender Stand",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Lokaler Eintrag",
+    )
+    event = TrackedEvent(
+        uid="uid-skip-numeric",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="65001",
+        summary="Kalender Stand",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+        local_version=4,
+        synced_version=2,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    monkeypatch.setattr("backend.app.main.get_event_state", lambda *args, **kwargs: None)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={"action": "skip-email-import", "selections": {}},
+    )
+    assert response.status_code == 200
+
+    with SessionLocal() as verify_session:
+        markers = (
+            verify_session.execute(
+                select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
             )
             .scalars()
             .all()
         )
         assert len(markers) == 1
-        assert markers[0].message_id == "msg-skip-remote"
+        assert markers[0].message_id == "65001"
+        assert markers[0].max_uid == 65001
 
 
 def test_resolve_conflict_merge_fields(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1318,6 +1389,108 @@ def test_upsert_events_respects_ignored_mail_marker() -> None:
         ]
         assert len(ignore_entries) == 1
 
+
+def test_upsert_events_skips_mail_below_ignore_uid_threshold() -> None:
+    """Older mails with lower UIDs must remain ignored even if the message ID differs."""
+
+    session = SessionLocal()
+    imap, _caldav = _store_basic_accounts(session)
+    imap_id = imap.id
+    start = datetime(2024, 9, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    baseline_payload = _build_ical(
+        method="REQUEST",
+        uid="uid-threshold",
+        summary="Kalender Stand",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+    )
+    event = TrackedEvent(
+        uid="uid-threshold",
+        source_account_id=imap_id,
+        source_folder="INBOX",
+        mailbox_message_id="900",
+        summary="Kalender Stand",
+        start=start,
+        end=end,
+        payload=baseline_payload,
+        status=EventStatus.SYNCED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        local_version=1,
+        synced_version=1,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+    event_id = event.id
+
+    marker = IgnoredMailImport(
+        event_id=event.id,
+        account_id=imap_id,
+        folder="INBOX",
+        message_id="900",
+        max_uid=900,
+    )
+    session.add(marker)
+    session.commit()
+    session.close()
+
+    older_payload = _build_ical(
+        method="REQUEST",
+        uid="uid-threshold",
+        summary="Mail Vorschlag Alt",
+        start=start + timedelta(hours=2),
+        end=end + timedelta(hours=2),
+        status="CONFIRMED",
+    )
+    parsed_older = parse_ics_payload(older_payload.encode())
+
+    event_processor.upsert_events(
+        parsed_older,
+        "850",
+        source_account_id=imap_id,
+        source_folder="INBOX",
+    )
+
+    with SessionLocal() as verify_session:
+        refreshed = verify_session.get(TrackedEvent, event_id)
+        assert refreshed is not None
+        assert refreshed.summary == "Kalender Stand"
+        assert refreshed.local_version == 1
+        ignored_entries = [
+            entry
+            for entry in refreshed.history or []
+            if entry.get("action") == "mail-ignored"
+            and "850" in entry.get("description", "")
+        ]
+        assert len(ignored_entries) == 1
+
+    newer_payload = _build_ical(
+        method="REQUEST",
+        uid="uid-threshold",
+        summary="Mail Vorschlag Neu",
+        start=start + timedelta(days=1),
+        end=end + timedelta(days=1),
+        status="CONFIRMED",
+    )
+    parsed_newer = parse_ics_payload(newer_payload.encode())
+
+    event_processor.upsert_events(
+        parsed_newer,
+        "950",
+        source_account_id=imap_id,
+        source_folder="INBOX",
+    )
+
+    with SessionLocal() as verify_session:
+        refreshed = verify_session.get(TrackedEvent, event_id)
+        assert refreshed is not None
+        assert refreshed.summary == "Mail Vorschlag Neu"
+        assert refreshed.start == (start + timedelta(days=1)).replace(tzinfo=None)
+        assert refreshed.local_version == 2
+        assert refreshed.mailbox_message_id == "950"
 
 def test_remote_cancellation_keeps_server_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cancellations originating in CalDAV must not be removed during sync."""

@@ -32,6 +32,12 @@ def apply_schema_upgrades() -> None:
         table_definition = connection.exec_driver_sql(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='tracked_events'"
         ).scalar_one_or_none()
+        ignored_mail_columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info('ignored_mail_imports')"
+            ).fetchall()
+        }
 
     if not columns:
         # Table does not exist yet; the regular metadata.create_all call will create it.
@@ -118,6 +124,16 @@ def apply_schema_upgrades() -> None:
         and table_definition is not None
         and "failed" not in table_definition.lower()
     )
+
+    if ignored_mail_columns and "max_uid" not in ignored_mail_columns:
+        logger.info("Adding max_uid column to ignored_mail_imports table")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                ALTER TABLE ignored_mail_imports
+                ADD COLUMN max_uid INTEGER NULL
+                """
+            )
 
     if needs_status_enum_upgrade:
         logger.info(

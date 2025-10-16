@@ -26,6 +26,18 @@ from .caldav_client import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_mail_uid(message_id: str | None) -> Optional[int]:
+    """Return a numeric UID if the message identifier resembles an IMAP UID."""
+
+    if not message_id:
+        return None
+    try:
+        value = int(str(message_id).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 def upsert_events(
     parsed_events: Iterable[ParsedEvent],
     source_message_id: str,
@@ -80,48 +92,64 @@ def upsert_events(
                 session.add(event)
                 logger.info("Stored new event %s", parsed.uid)
             else:
-                ignored_marker = session.execute(
-                    select(IgnoredMailImport)
-                    .where(IgnoredMailImport.event_id == event.id)
-                    .where(IgnoredMailImport.message_id == source_message_id)
-                ).scalar_one_or_none()
-                if ignored_marker:
+                source_uid = _parse_mail_uid(source_message_id)
+                markers = (
+                    session.execute(
+                        select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+                    )
+                    .scalars()
+                    .all()
+                )
+                skip_reason: Optional[str] = None
+                for marker in markers:
                     account_matches = (
-                        ignored_marker.account_id is None
-                        or ignored_marker.account_id == source_account_id
+                        marker.account_id is None or marker.account_id == source_account_id
                     )
                     folder_matches = (
-                        ignored_marker.folder is None
-                        or ignored_marker.folder == source_folder
+                        marker.folder is None or marker.folder == source_folder
                     )
-                    if account_matches and folder_matches:
-                        logger.info(
-                            "Skipping update for %s from ignored message %s",
-                            parsed.uid,
-                            source_message_id,
-                        )
-                        ignore_description = (
-                            "E-Mail-Import ignoriert – Nachricht {message} wurde nach "
-                            "einer Konfliktauflösung ausgeschlossen."
-                        ).format(message=source_message_id)
-                        already_recorded = any(
-                            entry.get("action") == "mail-ignored"
-                            and entry.get("description") == ignore_description
-                            for entry in event.history or []
-                        )
-                        if not already_recorded:
-                            event.history = merge_histories(
-                                event.history or [],
-                                {
-                                    "timestamp": now.isoformat(),
-                                    "action": "mail-ignored",
-                                    "description": ignore_description,
-                                },
-                            )
-                        event.updated_at = datetime.utcnow()
-                        session.add(event)
-                        stored_events.append(event)
+                    if not (account_matches and folder_matches):
                         continue
+                    if marker.message_id == source_message_id:
+                        skip_reason = f"ignored message {source_message_id}"
+                        break
+                    if (
+                        source_uid is not None
+                        and marker.max_uid is not None
+                        and source_uid <= marker.max_uid
+                    ):
+                        skip_reason = (
+                            f"UID {source_uid} below ignore threshold {marker.max_uid}"
+                        )
+                        break
+                if skip_reason:
+                    logger.info(
+                        "Skipping update for %s from ignored mail (%s)",
+                        parsed.uid,
+                        skip_reason,
+                    )
+                    ignore_description = (
+                        "E-Mail-Import ignoriert – Nachricht {message} wurde nach "
+                        "einer Konfliktauflösung ausgeschlossen."
+                    ).format(message=source_message_id)
+                    already_recorded = any(
+                        entry.get("action") == "mail-ignored"
+                        and entry.get("description") == ignore_description
+                        for entry in event.history or []
+                    )
+                    if not already_recorded:
+                        event.history = merge_histories(
+                            event.history or [],
+                            {
+                                "timestamp": now.isoformat(),
+                                "action": "mail-ignored",
+                                "description": ignore_description,
+                            },
+                        )
+                    event.updated_at = datetime.utcnow()
+                    session.add(event)
+                    stored_events.append(event)
+                    continue
 
                 new_payload = parsed.event.to_ical().decode()
                 previous_status = event.status

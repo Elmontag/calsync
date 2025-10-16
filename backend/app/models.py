@@ -136,6 +136,7 @@ class IgnoredMailImport(Base):
     account_id = Column(Integer, nullable=True)
     folder = Column(String, nullable=True)
     message_id = Column(String, nullable=False)
+    max_uid = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     event = relationship("TrackedEvent", back_populates="ignored_mail_imports")
