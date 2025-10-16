@@ -161,6 +161,12 @@ export function useEvents() {
     return data;
   }
 
+  async function deleteMail(eventId: number) {
+    const { data } = await api.post<TrackedEvent>(`/events/${eventId}/delete-mail`);
+    setEvents((prev) => prev.map((event) => (event.id === eventId ? data : event)));
+    return data;
+  }
+
   async function resolveConflict(
     eventId: number,
     payload: { action: string; selections?: Record<string, 'email' | 'calendar'> },
@@ -185,6 +191,7 @@ export function useEvents() {
     respondToEvent,
     loadAutoSync,
     disableTracking,
+    deleteMail,
     resolveConflict,
   };
 }

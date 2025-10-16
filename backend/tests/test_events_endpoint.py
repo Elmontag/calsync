@@ -16,7 +16,13 @@ if str(ROOT) not in sys.path:  # pragma: no cover - test bootstrap code
     sys.path.insert(0, str(ROOT))
 
 from backend.app.database import Base, SessionLocal, engine, session_scope
-from backend.app.main import app, list_events, perform_sync_all, _execute_manual_sync_job
+from backend.app.main import (
+    app,
+    list_events,
+    perform_mail_scan,
+    perform_sync_all,
+    _execute_manual_sync_job,
+)
 from backend.app.models import (
     Account,
     AccountType,
@@ -26,6 +32,7 @@ from backend.app.models import (
     TrackedEvent,
 )
 from backend.app.services import event_processor
+from backend.app.services.imap_client import CalendarCandidate, MailAttachment
 from backend.app.services.caldav_client import CalDavSettings, RemoteEventState
 from backend.app.services.job_tracker import job_tracker
 from backend.app.utils.ics_parser import parse_ics_payload
@@ -187,6 +194,155 @@ def test_delete_imap_account_removes_scan_results() -> None:
 
     assert remaining_mappings == []
     assert remaining_events == []
+
+
+def test_mail_scan_records_failed_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invalid ICS payloads should be captured as failed events without aborting the scan."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {"host": "imap.example.com", "username": "user", "password": "secret"}
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    candidate = CalendarCandidate(
+        message_id="123",
+        subject="Fehlerhafte Einladung",
+        sender="organizer@example.com",
+        folder="INBOX",
+        attachments=[
+            MailAttachment(
+                filename="invite.ics",
+                content_type="text/calendar",
+                payload=b"BEGIN:VCALENDAR\nINVALID",
+            )
+        ],
+        links=[],
+    )
+
+    def fake_fetch(*_args, **_kwargs):
+        return [candidate]
+
+    def broken_parse(_payload: bytes):
+        raise ValueError("kaputter inhalt")
+
+    monkeypatch.setattr("backend.app.main.fetch_calendar_candidates", fake_fetch)
+    monkeypatch.setattr("backend.app.main.parse_ics_payload", broken_parse)
+
+    messages, events = perform_mail_scan(session)
+
+    assert messages == 1
+    assert events == 0
+
+    stored = session.execute(select(TrackedEvent)).scalars().all()
+    assert len(stored) == 1
+    failed = stored[0]
+    assert failed.status == EventStatus.FAILED
+    assert failed.mail_error is not None
+    assert "kaputter inhalt" in failed.mail_error
+    assert failed.tracking_disabled is False
+
+
+def test_delete_failed_mail_removes_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deleting a failed mail should update the tracked event and audit history."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {
+        "host": "imap.example.com",
+        "username": "user",
+        "password": "secret",
+    }
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    event = TrackedEvent(
+        uid="mail-error::1:inbox:42",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="42",
+        summary="Fehlerhafte Einladung",
+        organizer="orga@example.com",
+        status=EventStatus.FAILED,
+        response_status=EventResponseStatus.NONE,
+        mail_error="Kaputter Inhalt",
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    calls: List[Tuple[str, str]] = []
+
+    def fake_delete(settings, folder, message_id):
+        calls.append((folder, message_id))
+        assert settings.host == "imap.example.com"
+        return True
+
+    monkeypatch.setattr("backend.app.main.delete_message", fake_delete)
+
+    client = TestClient(app)
+    response = client.post(f"/events/{event.id}/delete-mail")
+    assert response.status_code == 200
+    payload = response.json()
+    assert any(entry["action"] == "mail-deleted" for entry in payload["history"])
+    assert "gelöscht" in (payload["mail_error"] or "")
+    assert calls == [("INBOX", "42")]
+
+    with session_scope() as verify:
+        updated = verify.get(TrackedEvent, event.id)
+        assert updated is not None
+        assert updated.mailbox_message_id is None
+        assert any(entry["action"] == "mail-deleted" for entry in updated.history)
+
+
+def test_delete_failed_mail_handles_missing_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Users should see a helpful error when the mail is already gone."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {
+        "host": "imap.example.com",
+        "username": "user",
+        "password": "secret",
+    }
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    event = TrackedEvent(
+        uid="mail-error::1:inbox:99",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="99",
+        summary="Fehlerhafte Einladung",
+        organizer="orga@example.com",
+        status=EventStatus.FAILED,
+        response_status=EventResponseStatus.NONE,
+        mail_error="Kaputter Inhalt",
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    def fake_delete(_settings, _folder, _message_id):
+        return False
+
+    monkeypatch.setattr("backend.app.main.delete_message", fake_delete)
+
+    client = TestClient(app)
+    response = client.post(f"/events/{event.id}/delete-mail")
+    assert response.status_code == 404
+    assert "nicht gefunden" in response.json()["detail"]
+
+    with session_scope() as verify:
+        persisted = verify.get(TrackedEvent, event.id)
+        assert persisted is not None
+        assert persisted.mailbox_message_id == "99"
+        assert not any(entry["action"] == "mail-deleted" for entry in persisted.history or [])
 
 
 def test_list_events_handles_duplicate_caldav_targets(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1345,6 +1501,59 @@ def test_manual_sync_marks_conflicts_as_missing(monkeypatch: pytest.MonkeyPatch)
         missing = detail.get("missing")
         assert missing and missing[0]["event_id"] == event.id
         assert "konflikt" in missing[0]["reason"].lower()
+    finally:
+        job_tracker._jobs.pop(state.job_id, None)
+
+    assert captured == []
+
+
+def test_manual_sync_skips_failed_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fehlgeschlagene Mailimporte dürfen nicht zu einem Sync-Fehler führen."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+
+    event = TrackedEvent(
+        uid="failed-import",
+        status=EventStatus.FAILED,
+        response_status=EventResponseStatus.NONE,
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mail_error="Ungültige ICS-Nutzlast",
+        payload=None,
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    captured: List[List[str]] = []
+
+    def _fake_sync(events, calendar_url, settings, progress_callback=None):
+        captured.append([event.uid for event in events])
+        return [event.uid for event in events]
+
+    monkeypatch.setattr(event_processor, "sync_events_to_calendar", _fake_sync)
+
+    state = job_tracker.create("manual-sync", total=1)
+    try:
+        _execute_manual_sync_job(state.job_id, [event.id])
+        final_state = job_tracker.get(state.job_id)
+        assert final_state is not None
+        assert final_state.status == "completed"
+        assert final_state.detail is not None
+        detail = final_state.detail
+        assert detail.get("uploaded") == []
+        missing = detail.get("missing")
+        assert missing and missing[0]["event_id"] == event.id
+        assert "Fehler" in missing[0]["reason"]
     finally:
         job_tracker._jobs.pop(state.job_id, None)
 

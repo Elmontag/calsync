@@ -26,6 +26,7 @@ interface Props {
     response: TrackedEvent['response_status'],
   ) => Promise<TrackedEvent>;
   onDisableTracking: (eventId: number) => Promise<TrackedEvent>;
+  onDeleteMail: (eventId: number) => Promise<TrackedEvent>;
   onResolveConflict: (
     eventId: number,
     payload: { action: string; selections?: Record<string, 'email' | 'calendar'> },
@@ -43,6 +44,7 @@ const statusLabelMap: Record<TrackedEvent['status'], string> = {
   updated: 'Aktualisiert',
   cancelled: 'Abgesagt',
   synced: 'Synchronisiert',
+  failed: 'Fehlerhaft',
 };
 
 const statusStyleMap: Record<TrackedEvent['status'], string> = {
@@ -50,6 +52,7 @@ const statusStyleMap: Record<TrackedEvent['status'], string> = {
   updated: 'bg-indigo-500/10 text-indigo-300',
   cancelled: 'bg-rose-500/10 text-rose-300',
   synced: 'bg-emerald-500/10 text-emerald-300',
+  failed: 'bg-rose-600/20 text-rose-200',
 };
 
 const statusFilterOptions: Array<{ value: TrackedEvent['status']; label: string }> = [
@@ -57,6 +60,7 @@ const statusFilterOptions: Array<{ value: TrackedEvent['status']; label: string 
   { value: 'updated', label: statusLabelMap.updated },
   { value: 'cancelled', label: statusLabelMap.cancelled },
   { value: 'synced', label: statusLabelMap.synced },
+  { value: 'failed', label: statusLabelMap.failed },
 ];
 
 const responseLabelMap: Record<TrackedEvent['response_status'], string> = {
@@ -230,6 +234,7 @@ export default function EventTable({
   onAutoSyncIntervalChange,
   onRespondToEvent,
   onDisableTracking,
+  onDeleteMail,
   onResolveConflict,
   loading = false,
   onRefresh,
@@ -256,6 +261,7 @@ export default function EventTable({
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
   const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
+  const [mailActionId, setMailActionId] = useState<number | null>(null);
   const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
   const [activeMergeId, setActiveMergeId] = useState<number | null>(null);
   const [mergeSelections, setMergeSelections] = useState<MergeSelectionMap>({});
@@ -376,7 +382,10 @@ export default function EventTable({
     const processed = events.filter((event) => event.status === 'synced').length;
     const cancelled = events.filter((event) => event.status === 'cancelled').length;
     const awaitingDecision = events.filter(
-      (event) => event.response_status === 'none' && event.status !== 'cancelled',
+      (event) =>
+        event.response_status === 'none' &&
+        event.status !== 'cancelled' &&
+        event.status !== 'failed',
     ).length;
     const conflicts = events.filter((event) => (event.conflicts?.length ?? 0) > 0).length;
     const syncConflicts = events.filter((event) => event.sync_state?.has_conflict).length;
@@ -881,6 +890,9 @@ export default function EventTable({
     if (resolvingConflictId !== null) {
       return;
     }
+    if (mailActionId !== null) {
+      return;
+    }
     setResolvingConflictId(event.id);
     setSyncError(null);
     setSyncResult([]);
@@ -888,7 +900,7 @@ export default function EventTable({
     try {
       await onDisableTracking(event.id);
       const title = event.summary ?? event.uid;
-      setSyncNotice(`"${title}" wird nicht mehr automatisch verfolgt.`);
+      setSyncNotice(`"${title}" wird bei zukünftigen Scans ignoriert.`);
       resetMerge(event.id);
       await onRefresh();
     } catch (error) {
@@ -896,6 +908,30 @@ export default function EventTable({
       setSyncError('Tracking konnte nicht deaktiviert werden.');
     } finally {
       setResolvingConflictId(null);
+    }
+  }
+
+  async function handleDeleteMail(event: TrackedEvent) {
+    if (mailActionId !== null) {
+      return;
+    }
+    if (resolvingConflictId !== null) {
+      return;
+    }
+    setMailActionId(event.id);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      const updated = await onDeleteMail(event.id);
+      const title = updated.summary ?? updated.uid;
+      setSyncNotice(`E-Mail für "${title}" wurde im Postfach gelöscht.`);
+      await onRefresh();
+    } catch (error) {
+      console.error('Konnte E-Mail nicht löschen.', error);
+      setSyncError('Die E-Mail konnte nicht gelöscht werden.');
+    } finally {
+      setMailActionId(null);
     }
   }
 
@@ -1257,8 +1293,10 @@ export default function EventTable({
             const differences = syncState?.conflict_details?.differences ?? [];
             const suggestions = syncState?.conflict_details?.suggestions ?? [];
             const differencesExpanded = expandedDifferences[event.id] ?? false;
-            const isSelectable = !hasSyncConflict;
+            const isSelectable = !hasSyncConflict && event.status !== 'failed';
             const historyEntries = sortHistoryEntries(event.history ?? []);
+            const deletingMail = mailActionId === event.id;
+            const disablingTracking = resolvingConflictId === event.id;
             return (
               <div
                 key={event.id}
@@ -1349,6 +1387,44 @@ export default function EventTable({
                         <p className="mt-1 text-slate-300">{dateRange}</p>
                       </div>
                     </div>
+                    {event.status === 'failed' && (
+                      <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-100">
+                        <p className="text-sm font-semibold text-rose-200">Importfehler</p>
+                        <p className="mt-1 text-rose-100/80">
+                          {event.mail_error ?? 'Der Kalenderinhalt dieser E-Mail konnte nicht verarbeitet werden.'}
+                        </p>
+                        <p className="mt-2 text-rose-100/60">
+                          Lösche die Nachricht oder schließe sie vom zukünftigen Tracking aus, um weitere Fehler zu
+                          vermeiden.
+                        </p>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteMail(event)}
+                            disabled={deletingMail || disablingTracking}
+                            className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-rose-300/60 ${
+                              deletingMail || disablingTracking
+                                ? 'cursor-progress bg-rose-500/30 text-rose-200/80'
+                                : 'bg-rose-500 text-rose-950 hover:bg-rose-400'
+                            }`}
+                          >
+                            {deletingMail ? 'Wird gelöscht…' : 'Mail im Postfach löschen'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDisableTracking(event)}
+                            disabled={deletingMail || disablingTracking}
+                            className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-rose-300/60 ${
+                              deletingMail || disablingTracking
+                                ? 'cursor-progress border-rose-400/40 text-rose-200/70'
+                                : 'border-rose-400/60 text-rose-100 hover:border-rose-300 hover:bg-rose-900/40'
+                            }`}
+                          >
+                            {disablingTracking ? 'Wird ausgeschlossen…' : 'Vom Tracking ausschließen'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                     {event.attendees.length > 0 && (
                       <div className="mt-4">
                         <p className="text-xs uppercase tracking-wide text-slate-500">Teilnehmer</p>
@@ -1625,33 +1701,35 @@ export default function EventTable({
                         <p className="mt-2 text-xs text-slate-400">Keine Historie vorhanden.</p>
                       )}
                     </div>
-                    <div className="mt-4 flex flex-wrap gap-2">
-                      {responseActions.map((action) => (
+                    {event.status !== 'failed' && (
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        {responseActions.map((action) => (
+                          <button
+                            key={action.value}
+                            type="button"
+                            onClick={() => handleResponse(event, action.value)}
+                            disabled={respondingId === event.id}
+                            className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:opacity-60 ${
+                              action.className
+                            } ${
+                              event.response_status === action.value
+                                ? 'ring-2 ring-emerald-300/60 ring-offset-2 ring-offset-slate-900'
+                                : ''
+                            }`}
+                          >
+                            {action.label}
+                          </button>
+                        ))}
                         <button
-                          key={action.value}
                           type="button"
-                          onClick={() => handleResponse(event, action.value)}
+                          onClick={() => handleResponse(event, 'none')}
                           disabled={respondingId === event.id}
-                          className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:opacity-60 ${
-                            action.className
-                          } ${
-                            event.response_status === action.value
-                              ? 'ring-2 ring-emerald-300/60 ring-offset-2 ring-offset-slate-900'
-                              : ''
-                          }`}
+                          className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-slate-500 hover:text-slate-100 disabled:opacity-60"
                         >
-                          {action.label}
+                          Antwort zurücksetzen
                         </button>
-                      ))}
-                      <button
-                        type="button"
-                        onClick={() => handleResponse(event, 'none')}
-                        disabled={respondingId === event.id}
-                        className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-slate-500 hover:text-slate-100 disabled:opacity-60"
-                      >
-                        Antwort zurücksetzen
-                      </button>
-                    </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
