@@ -266,7 +266,6 @@ export default function EventTable({
   const [sortOption, setSortOption] = useState<SortOption>('email-desc');
   const [responseFilters, setResponseFilters] = useState<TrackedEvent['response_status'][]>([]);
   const [activeKpi, setActiveKpi] = useState<KpiKey | null>(null);
-  const [syncConflictFilter, setSyncConflictFilter] = useState<'all' | 'sync-only'>('all');
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
@@ -312,7 +311,7 @@ export default function EventTable({
 
   useEffect(() => {
     setPage(1);
-  }, [searchTerm, responseFilters, sortOption, pageSize, syncConflictFilter, activeKpi]);
+  }, [searchTerm, responseFilters, sortOption, pageSize, activeKpi]);
 
   // Compose the visible event list by applying search, status filters and sorting preferences.
   const filteredEvents = useMemo(() => {
@@ -325,9 +324,6 @@ export default function EventTable({
         return false;
       }
       if (responseSet.size > 0 && !responseSet.has(event.response_status)) {
-        return false;
-      }
-      if (syncConflictFilter === 'sync-only' && !(event.sync_state?.has_conflict ?? false)) {
         return false;
       }
       if (!hasTerm) {
@@ -368,7 +364,7 @@ export default function EventTable({
     }
 
     return sorted;
-  }, [events, searchTerm, responseFilters, sortOption, syncConflictFilter, activeKpi]);
+  }, [events, searchTerm, responseFilters, sortOption, activeKpi]);
 
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(filteredEvents.length / pageSize));
@@ -412,13 +408,26 @@ export default function EventTable({
     accent: string;
     description?: string;
   }> = [
-    { key: 'outstanding', label: 'Ausstehend', count: metrics.outstanding, accent: 'text-slate-100' },
-    { key: 'processed', label: 'Verarbeitet', count: metrics.processed, accent: 'text-emerald-400' },
+    {
+      key: 'outstanding',
+      label: 'Ausstehend',
+      count: metrics.outstanding,
+      accent: 'text-slate-100',
+      description: 'Offene Mails mit noch nicht übernommenen Änderungen.',
+    },
+    {
+      key: 'processed',
+      label: 'Verarbeitet',
+      count: metrics.processed,
+      accent: 'text-emerald-400',
+      description: 'Mails, deren Termine bereits synchronisiert wurden.',
+    },
     {
       key: 'failedImports',
       label: 'Fehlerhafte Mailimporte',
       count: metrics.failedImports,
       accent: 'text-rose-300',
+      description: 'Mails, die nicht importiert werden konnten.',
     },
     {
       key: 'calendarConflicts',
@@ -435,8 +444,6 @@ export default function EventTable({
       description: 'Konflikte zwischen Mail-Import und Kalenderdaten.',
     },
   ];
-
-  const showOnlySyncConflicts = syncConflictFilter === 'sync-only';
 
   function toggleSelection(id: number) {
     setSelected((prev) =>
@@ -462,10 +469,6 @@ export default function EventTable({
 
   function toggleKpiFilter(key: KpiKey) {
     setActiveKpi((prev) => (prev === key ? null : key));
-  }
-
-  function toggleSyncConflictFilter() {
-    setSyncConflictFilter((prev) => (prev === 'sync-only' ? 'all' : 'sync-only'));
   }
 
   function resetResponseFilters() {
@@ -1235,18 +1238,6 @@ export default function EventTable({
                   </button>
                 );
               })}
-              <button
-                type="button"
-                onClick={toggleSyncConflictFilter}
-                aria-pressed={showOnlySyncConflicts}
-                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                  showOnlySyncConflicts
-                    ? 'border-rose-400 bg-rose-500/20 text-rose-200'
-                    : 'border-slate-700 text-slate-300 hover:border-rose-400 hover:text-rose-200'
-                }`}
-              >
-                Nur Sync-Konflikte
-              </button>
             </div>
           </div>
         </div>
