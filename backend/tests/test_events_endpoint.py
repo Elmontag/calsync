@@ -672,6 +672,8 @@ def test_resolve_conflict_skip_email_import(monkeypatch: pytest.MonkeyPatch) -> 
         history=[],
         sync_conflict=True,
         sync_conflict_reason="Kalender abweichend",
+        local_version=3,
+        synced_version=1,
     )
     session.add(event)
     session.commit()
@@ -691,8 +693,94 @@ def test_resolve_conflict_skip_email_import(monkeypatch: pytest.MonkeyPatch) -> 
     payload_event = response.json()
     assert payload_event["sync_state"]["has_conflict"] is False
     assert payload_event["summary"] == "Mail Titel"
+    assert (
+        payload_event["sync_state"]["local_version"]
+        == payload_event["sync_state"]["synced_version"]
+        == 3
+    )
+    assert payload_event["status"] == EventStatus.SYNCED.value
     history_descriptions = [entry["description"] for entry in payload_event["history"]]
     assert any("Konflikt verworfen" in description for description in history_descriptions)
+
+
+def test_resolve_conflict_skip_email_import_applies_remote_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Das Verwerfen soll Remote-Schnappschüsse übernehmen und Sync-Markierungen zurücksetzen."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-skip-remote",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Mail Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-skip-remote",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+        local_version=5,
+        synced_version=2,
+        remote_last_modified=datetime(2024, 5, 31, 9, 0, tzinfo=timezone.utc),
+        sync_conflict_snapshot={
+            "summary": "Server Titel",
+            "organizer": "orga@example.com",
+            "start": "2024-06-01T09:00:00+00:00",
+            "end": "2024-06-01T10:00:00+00:00",
+            "response_status": EventResponseStatus.ACCEPTED.value,
+        },
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    monkeypatch.setattr("backend.app.main.get_event_state", lambda *args, **kwargs: None)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={"action": "skip-email-import", "selections": {}},
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert payload_event["summary"] == "Server Titel"
+    assert payload_event["status"] == EventStatus.SYNCED.value
+    assert payload_event["sync_state"]["local_version"] == 5
+    assert payload_event["sync_state"]["synced_version"] == 5
+    assert payload_event["sync_state"]["last_modified_source"] == "remote"
+    with SessionLocal() as verify_session:
+        stored = verify_session.get(TrackedEvent, event.id)
+        assert stored is not None
+        assert stored.payload is None
+        assert stored.local_version == 5
+        assert stored.synced_version == 5
+        assert stored.status == EventStatus.SYNCED
+        assert stored.last_modified_source == "remote"
+        assert stored.local_last_modified == stored.remote_last_modified
 
 
 def test_resolve_conflict_merge_fields(monkeypatch: pytest.MonkeyPatch) -> None:

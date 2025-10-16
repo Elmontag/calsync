@@ -1339,9 +1339,52 @@ def resolve_event_conflict(
         db.commit()
         db.refresh(event)
     elif action == "skip-email-import":
+        logger.info("Discarding email import for event %s", event.uid)
+
+        remote_snapshot: Optional[dict] = None
+        if isinstance(event.sync_conflict_snapshot, dict):
+            remote_snapshot = event.sync_conflict_snapshot
+
+        def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                logger.warning(
+                    "Unable to parse remote timestamp %s for event %s", value, event.uid
+                )
+                return None
+
+        if remote_snapshot:
+            event.summary = remote_snapshot.get("summary") or event.summary
+            event.organizer = remote_snapshot.get("organizer") or event.organizer
+            event.start = _parse_timestamp(remote_snapshot.get("start")) or event.start
+            event.end = _parse_timestamp(remote_snapshot.get("end")) or event.end
+            response_value = remote_snapshot.get("response_status")
+            if response_value:
+                try:
+                    event.response_status = EventResponseStatus(response_value)
+                except ValueError:
+                    logger.warning(
+                        "Unsupported response status %s in remote snapshot for %s",
+                        response_value,
+                        event.uid,
+                    )
+            event.payload = None
+
+        event.last_modified_source = "remote"
+
+        event.status = EventStatus.SYNCED
         event.sync_conflict = False
         event.sync_conflict_reason = None
         event.sync_conflict_snapshot = None
+        event.synced_version = max(event.synced_version or 0, event.local_version or 0)
+        event.local_version = event.synced_version
+        event.last_synced = datetime.utcnow()
+        if event.remote_last_modified and not event.local_last_modified:
+            event.local_last_modified = event.remote_last_modified
+
         event.history = merge_histories(
             event.history or [],
             {
