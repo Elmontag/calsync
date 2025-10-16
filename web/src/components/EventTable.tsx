@@ -55,12 +55,11 @@ const statusStyleMap: Record<TrackedEvent['status'], string> = {
   failed: 'bg-rose-600/20 text-rose-200',
 };
 
-const statusFilterOptions: Array<{ value: TrackedEvent['status']; label: string }> = [
-  { value: 'new', label: statusLabelMap.new },
-  { value: 'updated', label: statusLabelMap.updated },
-  { value: 'cancelled', label: statusLabelMap.cancelled },
-  { value: 'synced', label: statusLabelMap.synced },
-  { value: 'failed', label: statusLabelMap.failed },
+const responseFilterOptions: Array<{ value: TrackedEvent['response_status']; label: string }> = [
+  { value: 'accepted', label: 'Zugesagt' },
+  { value: 'declined', label: 'Abgesagt' },
+  { value: 'tentative', label: 'Vielleicht' },
+  { value: 'none', label: 'Antwort offen' },
 ];
 
 const responseLabelMap: Record<TrackedEvent['response_status'], string> = {
@@ -94,6 +93,16 @@ const responseActions: Array<{
 ];
 
 type SortOption = 'email-desc' | 'email-asc' | 'event-asc' | 'event-desc' | 'none';
+
+type KpiKey = 'outstanding' | 'processed' | 'calendarConflicts' | 'failedImports' | 'syncConflicts';
+
+const KPI_FILTERS: Record<KpiKey, (event: TrackedEvent) => boolean> = {
+  outstanding: (event) => event.status === 'new' || event.status === 'updated',
+  processed: (event) => event.status === 'synced',
+  calendarConflicts: (event) => (event.conflicts?.length ?? 0) > 0,
+  failedImports: (event) => event.status === 'failed',
+  syncConflicts: (event) => event.sync_state?.has_conflict ?? false,
+};
 
 const sortOptionItems: Array<{ value: SortOption; label: string }> = [
   { value: 'email-desc', label: 'E-Mail-Datum (neueste zuerst)' },
@@ -255,7 +264,8 @@ export default function EventTable({
   const [respondingId, setRespondingId] = useState<number | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortOption, setSortOption] = useState<SortOption>('email-desc');
-  const [statusFilters, setStatusFilters] = useState<TrackedEvent['status'][]>([]);
+  const [responseFilters, setResponseFilters] = useState<TrackedEvent['response_status'][]>([]);
+  const [activeKpi, setActiveKpi] = useState<KpiKey | null>(null);
   const [syncConflictFilter, setSyncConflictFilter] = useState<'all' | 'sync-only'>('all');
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
@@ -291,8 +301,8 @@ export default function EventTable({
   }, [events]);
 
   useEffect(() => {
-    setStatusFilters((prev) =>
-      prev.filter((status) => events.some((event) => event.status === status)),
+    setResponseFilters((prev) =>
+      prev.filter((status) => events.some((event) => event.response_status === status)),
     );
   }, [events]);
 
@@ -302,16 +312,19 @@ export default function EventTable({
 
   useEffect(() => {
     setPage(1);
-  }, [searchTerm, statusFilters, sortOption, pageSize, syncConflictFilter]);
+  }, [searchTerm, responseFilters, sortOption, pageSize, syncConflictFilter, activeKpi]);
 
   // Compose the visible event list by applying search, status filters and sorting preferences.
   const filteredEvents = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
     const hasTerm = term.length > 0;
-    const statusSet = new Set(statusFilters);
+    const responseSet = new Set(responseFilters);
 
     const filtered = events.filter((event) => {
-      if (statusSet.size > 0 && !statusSet.has(event.status)) {
+      if (activeKpi && !KPI_FILTERS[activeKpi](event)) {
+        return false;
+      }
+      if (responseSet.size > 0 && !responseSet.has(event.response_status)) {
         return false;
       }
       if (syncConflictFilter === 'sync-only' && !(event.sync_state?.has_conflict ?? false)) {
@@ -355,7 +368,7 @@ export default function EventTable({
     }
 
     return sorted;
-  }, [events, searchTerm, statusFilters, sortOption, syncConflictFilter]);
+  }, [events, searchTerm, responseFilters, sortOption, syncConflictFilter, activeKpi]);
 
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(filteredEvents.length / pageSize));
@@ -375,33 +388,53 @@ export default function EventTable({
   }, [totalPages]);
 
   // Aggregate key performance indicators for the overview widgets.
-  const metrics = useMemo(() => {
-    const outstanding = events.filter(
-      (event) => event.status === 'new' || event.status === 'updated',
-    ).length;
-    const processed = events.filter((event) => event.status === 'synced').length;
-    const cancelled = events.filter((event) => event.status === 'cancelled').length;
-    const awaitingDecision = events.filter(
-      (event) =>
-        event.response_status === 'none' &&
-        event.status !== 'cancelled' &&
-        event.status !== 'failed',
-    ).length;
-    const conflicts = events.filter((event) => (event.conflicts?.length ?? 0) > 0).length;
-    const syncConflicts = events.filter((event) => event.sync_state?.has_conflict).length;
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    const todayEnd = new Date();
-    todayEnd.setHours(23, 59, 59, 999);
-    const today = events.filter((event) => {
-      if (!event.start) {
-        return false;
-      }
-      const startDate = new Date(event.start);
-      return startDate >= todayStart && startDate <= todayEnd;
-    }).length;
-    return { outstanding, processed, cancelled, awaitingDecision, today, conflicts, syncConflicts };
-  }, [events]);
+  const metrics = useMemo(
+    () => ({
+      outstanding: events.filter(KPI_FILTERS.outstanding).length,
+      processed: events.filter(KPI_FILTERS.processed).length,
+      calendarConflicts: events.filter(KPI_FILTERS.calendarConflicts).length,
+      failedImports: events.filter(KPI_FILTERS.failedImports).length,
+      syncConflicts: events.filter(KPI_FILTERS.syncConflicts).length,
+    }),
+    [events],
+  );
+
+  useEffect(() => {
+    if (activeKpi && metrics[activeKpi] === 0) {
+      setActiveKpi(null);
+    }
+  }, [activeKpi, metrics]);
+
+  const kpiItems: Array<{
+    key: KpiKey;
+    label: string;
+    count: number;
+    accent: string;
+    description?: string;
+  }> = [
+    { key: 'outstanding', label: 'Ausstehend', count: metrics.outstanding, accent: 'text-slate-100' },
+    { key: 'processed', label: 'Verarbeitet', count: metrics.processed, accent: 'text-emerald-400' },
+    {
+      key: 'failedImports',
+      label: 'Fehlerhafte Mailimporte',
+      count: metrics.failedImports,
+      accent: 'text-rose-300',
+    },
+    {
+      key: 'calendarConflicts',
+      label: 'Kalender-Konflikte',
+      count: metrics.calendarConflicts,
+      accent: 'text-amber-300',
+      description: 'Termine mit Konflikten im Zielkalender.',
+    },
+    {
+      key: 'syncConflicts',
+      label: 'Sync-Konflikte',
+      count: metrics.syncConflicts,
+      accent: 'text-rose-300',
+      description: 'Konflikte zwischen Mail-Import und Kalenderdaten.',
+    },
+  ];
 
   const showOnlySyncConflicts = syncConflictFilter === 'sync-only';
 
@@ -421,18 +454,22 @@ export default function EventTable({
     setSortOption(event.target.value as SortOption);
   }
 
-  function toggleStatusFilter(status: TrackedEvent['status']) {
-    setStatusFilters((prev) =>
+  function toggleResponseFilter(status: TrackedEvent['response_status']) {
+    setResponseFilters((prev) =>
       prev.includes(status) ? prev.filter((item) => item !== status) : [...prev, status],
     );
+  }
+
+  function toggleKpiFilter(key: KpiKey) {
+    setActiveKpi((prev) => (prev === key ? null : key));
   }
 
   function toggleSyncConflictFilter() {
     setSyncConflictFilter((prev) => (prev === 'sync-only' ? 'all' : 'sync-only'));
   }
 
-  function resetStatusFilters() {
-    setStatusFilters([]);
+  function resetResponseFilters() {
+    setResponseFilters([]);
   }
 
   function handlePageSizeChange(event: ChangeEvent<HTMLSelectElement>) {
@@ -1039,35 +1076,29 @@ export default function EventTable({
 
   return (
     <div className="space-y-6">
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Ausstehend</p>
-          <p className="mt-1 text-2xl font-semibold text-slate-100">{metrics.outstanding}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Verarbeitet</p>
-          <p className="mt-1 text-2xl font-semibold text-emerald-400">{metrics.processed}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Abgesagt</p>
-          <p className="mt-1 text-2xl font-semibold text-rose-300">{metrics.cancelled}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Antwort offen</p>
-          <p className="mt-1 text-2xl font-semibold text-amber-300">{metrics.awaitingDecision}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Heute</p>
-          <p className="mt-1 text-2xl font-semibold text-sky-300">{metrics.today}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Kalender-Konflikte</p>
-          <p className="mt-1 text-2xl font-semibold text-amber-300">{metrics.conflicts}</p>
-          <p className="mt-2 text-xs text-slate-400">
-            Sync-Konflikte:{' '}
-            <span className="font-semibold text-rose-300">{metrics.syncConflicts}</span>
-          </p>
-        </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+        {kpiItems.map((item) => {
+          const isActive = activeKpi === item.key;
+          return (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => toggleKpiFilter(item.key)}
+              aria-pressed={isActive}
+              className={`rounded-xl border p-4 text-left transition focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 focus:ring-offset-slate-950 ${
+                isActive
+                  ? 'border-emerald-400/80 bg-emerald-500/10 shadow-lg shadow-emerald-500/20'
+                  : 'border-slate-800 bg-slate-900 hover:border-emerald-400/60 hover:bg-slate-900/80'
+              }`}
+            >
+              <p className="text-xs uppercase tracking-wide text-slate-500">{item.label}</p>
+              <p className={`mt-1 text-2xl font-semibold ${item.accent}`}>{item.count}</p>
+              {item.description ? (
+                <p className="mt-2 text-xs text-slate-400">{item.description}</p>
+              ) : null}
+            </button>
+          );
+        })}
       </div>
 
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
@@ -1175,25 +1206,25 @@ export default function EventTable({
               </label>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Statusfilter</span>
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Terminstatus</span>
               <button
                 type="button"
-                onClick={resetStatusFilters}
+                onClick={resetResponseFilters}
                 className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                  statusFilters.length === 0
+                  responseFilters.length === 0
                     ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
                     : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
                 }`}
               >
-                Alle Stati
+                Alle Terminstatus
               </button>
-              {statusFilterOptions.map((option) => {
-                const active = statusFilters.includes(option.value);
+              {responseFilterOptions.map((option) => {
+                const active = responseFilters.includes(option.value);
                 return (
                   <button
                     key={option.value}
                     type="button"
-                    onClick={() => toggleStatusFilter(option.value)}
+                    onClick={() => toggleResponseFilter(option.value)}
                     className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
                       active
                         ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
