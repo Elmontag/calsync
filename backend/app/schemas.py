@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -66,6 +66,15 @@ class EventHistoryEntry(BaseModel):
     description: str
 
 
+class EventAttendee(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    status: Optional[str] = None
+    role: Optional[str] = None
+    type: Optional[str] = None
+    response_requested: bool = False
+
+
 class CalendarConflict(BaseModel):
     uid: str
     summary: Optional[str] = None
@@ -120,6 +129,7 @@ class TrackedEventRead(BaseModel):
     conflicts: List[CalendarConflict] = Field(default_factory=list)
     sync_state: EventSyncState = Field(default_factory=EventSyncState)
     tracking_disabled: bool = False
+    attendees: List[EventAttendee] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -145,6 +155,11 @@ class ManualSyncMissingDetail(BaseModel):
 class ManualSyncResponse(BaseModel):
     uploaded: List[str] = Field(default_factory=list)
     missing: List[ManualSyncMissingDetail] = Field(default_factory=list)
+
+
+class ConflictResolutionRequest(BaseModel):
+    action: str
+    selections: Dict[str, str] = Field(default_factory=dict)
 
 
 class SyncJobStatus(BaseModel):

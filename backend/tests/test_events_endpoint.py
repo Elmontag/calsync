@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:  # pragma: no cover - test bootstrap code
     sys.path.insert(0, str(ROOT))
 
-from backend.app.database import Base, SessionLocal, engine
+from backend.app.database import Base, SessionLocal, engine, session_scope
 from backend.app.main import app, list_events, perform_sync_all, _execute_manual_sync_job
 from backend.app.models import (
     Account,
@@ -74,6 +74,7 @@ def _build_ical(
     end: datetime,
     status: str,
     description: Optional[str] = None,
+    location: Optional[str] = None,
 ) -> str:
     calendar = Calendar()
     calendar.add("PRODID", "-//CalSync Tests//DE")
@@ -90,6 +91,8 @@ def _build_ical(
     component.add("STATUS", status)
     if description:
         component.add("DESCRIPTION", description)
+    if location:
+        component.add("LOCATION", location)
     calendar.add_component(component)
     return calendar.to_ical().decode()
 
@@ -513,6 +516,7 @@ def test_conflict_details_and_disable_tracking() -> None:
             "start": (start + timedelta(hours=2)).isoformat(),
             "end": (end + timedelta(hours=2)).isoformat(),
             "description": "Server Beschreibung",
+            "response_status": EventResponseStatus.ACCEPTED.value,
         },
     )
     session.add(event)
@@ -532,6 +536,16 @@ def test_conflict_details_and_disable_tracking() -> None:
     assert differences["summary"]["local_value"] == "Lokaler Titel"
     assert differences["summary"]["remote_value"] == "Server Titel"
     assert differences["description"]["remote_value"] == "Server Beschreibung"
+    assert differences["response_status"]["remote_value"] == "Zusage"
+    assert payload_event["attendees"] == []
+    suggestions = {item["action"]: item for item in details["suggestions"]}
+    assert set(suggestions) == {
+        "overwrite-calendar",
+        "skip-email-import",
+        "merge-fields",
+        "disable-tracking",
+    }
+    assert suggestions["merge-fields"]["interactive"] is True
     disable_option = next(
         suggestion
         for suggestion in details["suggestions"]
@@ -548,6 +562,232 @@ def test_conflict_details_and_disable_tracking() -> None:
     assert refreshed.status_code == 200
     assert refreshed.json() == []
 
+
+def test_resolve_conflict_overwrite_calendar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Das Überschreiben soll die lokale Version exportieren und Konflikte auflösen."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-conflict",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+    )
+    event = TrackedEvent(
+        uid="uid-conflict",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    calls: List[str] = []
+
+    def _fake_force(target: TrackedEvent, calendar_url: str, settings: CalDavSettings) -> None:
+        calls.append(target.uid)
+        with session_scope() as scoped:
+            db_event = scoped.get(TrackedEvent, target.id)
+            assert db_event is not None
+            db_event.sync_conflict = False
+            db_event.sync_conflict_reason = None
+            db_event.synced_version = db_event.local_version or 0
+            db_event.last_synced = datetime.utcnow()
+            scoped.add(db_event)
+
+    monkeypatch.setattr(event_processor, "force_overwrite_event", _fake_force)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={"action": "overwrite-calendar", "selections": {}},
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert calls == ["uid-conflict"]
+    history_descriptions = [entry["description"] for entry in payload_event["history"]]
+    assert any(
+        "Kalenderdaten wurden mit dem E-Mail-Import überschrieben" in description
+        for description in history_descriptions
+    )
+
+
+def test_resolve_conflict_skip_email_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Das Verwerfen soll keinen Export starten und den Konflikt nur temporär ausblenden."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-skip",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Mail Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-skip",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    def _unexpected_remote_call(*_: object, **__: object) -> None:
+        raise AssertionError("skip-email-import sollte keine Remote-Daten abrufen")
+
+    monkeypatch.setattr("backend.app.main.get_event_state", _unexpected_remote_call)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={"action": "skip-email-import", "selections": {}},
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert payload_event["summary"] == "Mail Titel"
+    history_descriptions = [entry["description"] for entry in payload_event["history"]]
+    assert any("Konflikt verworfen" in description for description in history_descriptions)
+
+
+def test_resolve_conflict_merge_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Die Zusammenführung soll ausgewählte Felder übernehmen und exportieren."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+    session.commit()
+    start = datetime(2024, 7, 1, 8, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    payload = _build_ical(
+        method="REQUEST",
+        uid="uid-merge",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+        description="Mail Beschreibung",
+    )
+    event = TrackedEvent(
+        uid="uid-merge",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        summary="Mail Titel",
+        start=start,
+        end=end,
+        payload=payload,
+        status=EventStatus.UPDATED,
+        response_status=EventResponseStatus.ACCEPTED,
+        history=[],
+        sync_conflict=True,
+        sync_conflict_reason="Kalender abweichend",
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    remote_payload = _build_ical(
+        method="REQUEST",
+        uid="uid-merge",
+        summary="Kalender Titel",
+        start=start + timedelta(hours=2),
+        end=end + timedelta(hours=2),
+        status="CONFIRMED",
+        description="Kalender Beschreibung",
+        location="Konferenzraum",
+    )
+    remote_state = RemoteEventState(
+        uid="uid-merge",
+        etag="etag-merge",
+        last_modified=datetime.utcnow(),
+        payload=remote_payload,
+    )
+
+    monkeypatch.setattr("backend.app.main.get_event_state", lambda url, uid, settings: remote_state)
+
+    calls: List[str] = []
+
+    def _fake_force(target: TrackedEvent, calendar_url: str, settings: CalDavSettings) -> None:
+        calls.append(target.uid)
+        with session_scope() as scoped:
+            db_event = scoped.get(TrackedEvent, target.id)
+            assert db_event is not None
+            db_event.sync_conflict = False
+            db_event.sync_conflict_reason = None
+            db_event.synced_version = db_event.local_version or 0
+            db_event.last_synced = datetime.utcnow()
+            scoped.add(db_event)
+
+    monkeypatch.setattr(event_processor, "force_overwrite_event", _fake_force)
+
+    client = TestClient(app)
+    response = client.post(
+        f"/events/{event.id}/resolve-conflict",
+        json={
+            "action": "merge-fields",
+            "selections": {"summary": "email", "location": "calendar", "response_status": "calendar"},
+        },
+    )
+    assert response.status_code == 200
+    payload_event = response.json()
+    assert payload_event["sync_state"]["has_conflict"] is False
+    assert payload_event["summary"] == "Mail Titel"
+    assert payload_event["sync_state"]["conflict_details"] is None
+    assert calls == ["uid-merge"]
+    assert payload_event["response_status"] == EventResponseStatus.NONE.value
+    history_descriptions = [entry["description"] for entry in payload_event["history"]]
+    assert any("Daten wurden zusammengeführt" in description for description in history_descriptions)
 
 def test_attendee_cancellation_updates_history_without_deletion(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cancellations from attendees must not trigger deletions but still leave a history entry."""

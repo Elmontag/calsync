@@ -10,6 +10,7 @@ from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from icalendar import Calendar
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
@@ -32,6 +33,7 @@ from .schemas import (
     ConnectionTestResult,
     ConflictResolutionOption,
     ConflictDifference,
+    ConflictResolutionRequest,
     ManualSyncMissingDetail,
     ManualSyncRequest,
     ManualSyncResponse,
@@ -50,12 +52,18 @@ from .services.caldav_client import (
     CalDavConnection,
     CalDavSettings,
     find_conflicting_events,
+    get_event_state,
     list_calendars,
 )
 from .services.imap_client import FolderSelection, ImapSettings, fetch_calendar_candidates
 from .services.job_tracker import job_tracker
 from .services.scheduler import scheduler
-from .utils.ics_parser import extract_event_snapshot, merge_histories, parse_ics_payload
+from .utils.ics_parser import (
+    extract_event_attendees,
+    extract_event_snapshot,
+    merge_histories,
+    parse_ics_payload,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -306,6 +314,129 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
             continue
 
 
+def _attach_attendees(events: List[TrackedEvent]) -> None:
+    """Expose attendee information derived from the stored ICS payload."""
+
+    for event in events:
+        attendees: List[dict] = []
+        payload = getattr(event, "payload", None)
+        if payload:
+            try:
+                attendees = extract_event_attendees(payload, uid=event.uid)
+            except Exception:
+                logger.exception("Teilnehmerliste konnte nicht gelesen werden: %s", event.uid)
+        setattr(event, "attendees", attendees)
+
+
+def _resolve_caldav_context(
+    event: TrackedEvent, db: Session
+) -> Tuple[SyncMapping, CalDavSettings]:
+    """Return the sync mapping and CalDAV settings for an event."""
+
+    if event.source_account_id is None or not event.source_folder:
+        raise HTTPException(
+            status_code=400,
+            detail="Termin verfügt über keine Kalenderzuordnung und kann nicht synchronisiert werden.",
+        )
+    mapping = (
+        db.execute(
+            select(SyncMapping)
+            .where(SyncMapping.imap_account_id == event.source_account_id)
+            .where(SyncMapping.imap_folder == event.source_folder)
+        )
+        .scalars()
+        .first()
+    )
+    if mapping is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Keine Synchronisationszuordnung für diesen Termin gefunden.",
+        )
+    caldav_account = db.get(Account, mapping.caldav_account_id)
+    if caldav_account is None or caldav_account.type != AccountType.CALDAV:
+        raise HTTPException(
+            status_code=409,
+            detail="Zugeordnetes CalDAV-Konto ist nicht verfügbar.",
+        )
+    try:
+        settings = CalDavSettings(**caldav_account.settings)
+    except TypeError:
+        logger.exception("Ungültige CalDAV Einstellungen für Konto %s", caldav_account.id)
+        raise HTTPException(status_code=500, detail="CalDAV-Einstellungen sind ungültig.")
+    return mapping, settings
+
+
+def _load_event_component(payload: bytes | str, uid: str):
+    """Parse an ICS payload and return the calendar plus matching component."""
+
+    raw = payload.encode() if isinstance(payload, str) else payload
+    calendar = Calendar.from_ical(raw)
+    selected = None
+    for component in calendar.walk("VEVENT"):
+        component_uid = str(component.get("UID")) if component.get("UID") else None
+        if uid and component_uid == uid:
+            selected = component
+            break
+        if selected is None:
+            selected = component
+    if selected is None:
+        raise ValueError("ICS-Payload enthält keinen VEVENT-Eintrag")
+    return calendar, selected
+
+
+def _build_merged_payload(
+    event: TrackedEvent,
+    remote_payload: bytes | str,
+    selections: Dict[str, str],
+) -> Tuple[str, EventResponseStatus]:
+    """Combine local and remote event data based on the chosen selections."""
+
+    if not event.payload:
+        raise ValueError("Keine Daten aus dem E-Mail-Import verfügbar")
+    local_calendar, local_component = _load_event_component(event.payload, event.uid)
+    remote_calendar, remote_component = _load_event_component(remote_payload, event.uid)
+
+    allowed_fields = {
+        "summary": "SUMMARY",
+        "organizer": "ORGANIZER",
+        "start": "DTSTART",
+        "end": "DTEND",
+        "location": "LOCATION",
+        "description": "DESCRIPTION",
+    }
+    normalized = {field: selections.get(field, "calendar") for field in allowed_fields}
+    response_source = selections.get("response_status", "email")
+
+    for field, property_name in allowed_fields.items():
+        source = normalized.get(field, "calendar")
+        source_component = local_component if source == "email" else remote_component
+        try:
+            if property_name in remote_component:
+                del remote_component[property_name]
+        except KeyError:
+            pass
+        value = source_component.get(property_name)
+        if value is not None:
+            remote_component[property_name] = value
+
+    merged_bytes = remote_calendar.to_ical()
+    parsed_local = parse_ics_payload(event.payload.encode())
+    parsed_remote = parse_ics_payload(merged_bytes)
+    local_selected = next((item for item in parsed_local if item.uid == event.uid), parsed_local[0])
+    remote_selected = next((item for item in parsed_remote if item.uid == event.uid), parsed_remote[0])
+
+    if response_source == "calendar":
+        chosen_response = remote_selected.response_status or EventResponseStatus.NONE
+    else:
+        chosen_response = (
+            local_selected.response_status
+            or event.response_status
+            or EventResponseStatus.NONE
+        )
+
+    return merged_bytes.decode(), chosen_response
+
+
 def _serialize_timestamp(value: Optional[datetime]) -> Optional[str]:
     if value is None:
         return None
@@ -342,10 +473,19 @@ def _build_conflict_details(event: TrackedEvent) -> Optional[SyncConflictDetails
         "end": _serialize_timestamp(event.end),
         "location": None,
         "description": None,
+        "response_status": event.response_status.value if event.response_status else None,
     }
 
     if local_snapshot:
-        for key in ("summary", "organizer", "start", "end", "location", "description"):
+        for key in (
+            "summary",
+            "organizer",
+            "start",
+            "end",
+            "location",
+            "description",
+            "response_status",
+        ):
             value = local_snapshot.get(key)
             if value is not None:
                 local_values[key] = str(value)
@@ -358,7 +498,24 @@ def _build_conflict_details(event: TrackedEvent) -> Optional[SyncConflictDetails
         "organizer": "Organisator",
         "location": "Ort",
         "description": "Beschreibung",
+        "response_status": "Teilnahmestatus",
     }
+
+    response_labels = {
+        EventResponseStatus.ACCEPTED: "Zusage",
+        EventResponseStatus.TENTATIVE: "Vorläufig",
+        EventResponseStatus.DECLINED: "Abgelehnt",
+        EventResponseStatus.NONE: "Keine Antwort",
+    }
+
+    def _format_response(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            status = EventResponseStatus(value)
+        except ValueError:
+            return value
+        return response_labels.get(status, status.value)
 
     for field, label in label_map.items():
         local_value = local_values.get(field)
@@ -368,25 +525,36 @@ def _build_conflict_details(event: TrackedEvent) -> Optional[SyncConflictDetails
             continue
         if local_value == remote_value:
             continue
+        display_local = local_value
+        display_remote = remote_value
+        if field == "response_status":
+            display_local = _format_response(local_value)
+            display_remote = _format_response(remote_value)
         differences.append(
             ConflictDifference(
                 field=field,
                 label=label,
-                local_value=local_value,
-                remote_value=remote_value,
+                local_value=display_local,
+                remote_value=display_remote,
             )
         )
 
     suggestions: List[ConflictResolutionOption] = [
         ConflictResolutionOption(
-            action="retry-sync",
-            label="E-Mail-Import erneut synchronisieren",
-            description="Prüfe die Daten aus dem E-Mail-Import und starte anschließend eine neue Synchronisation, sobald der Konflikt behoben ist.",
+            action="overwrite-calendar",
+            label="Kalenderdaten überschreiben",
+            description="Schreibt die Daten aus dem E-Mail-Import in den Kalender und gleicht beide Stände ab.",
         ),
         ConflictResolutionOption(
-            action="apply-remote",
-            label="Kalenderdaten übernehmen",
-            description="Übernehme die Anpassungen aus den Kalenderdaten manuell oder importiere die ICS-Daten, um beide Stände anzugleichen.",
+            action="skip-email-import",
+            label="E-Mail-Daten nicht importieren",
+            description="Belässt den Termin in den Kalenderdaten unverändert und verwirft diesen Synchronisationsversuch. Hinweis: Sobald erneut abweichende E-Mail-Daten eintreffen, kann wieder ein Konflikt entstehen.",
+        ),
+        ConflictResolutionOption(
+            action="merge-fields",
+            label="Daten zusammenführen",
+            description="Vergleiche Kalenderdaten und E-Mail-Import im Detail und wähle je Feld die passende Variante aus.",
+            interactive=True,
         ),
         ConflictResolutionOption(
             action="disable-tracking",
@@ -1001,6 +1169,7 @@ def list_events(db: Session = Depends(get_db)):
     _normalize_histories(events, db)
     _attach_conflicts(events, db)
     _attach_sync_state(events)
+    _attach_attendees(events)
     return events
 
 
@@ -1114,6 +1283,163 @@ def update_event_response(
         )
     _attach_conflicts([event], db)
     _attach_sync_state([event])
+    _attach_attendees([event])
+    return event
+
+
+@app.post("/events/{event_id}/resolve-conflict", response_model=TrackedEventRead)
+def resolve_event_conflict(
+    event_id: int, payload: ConflictResolutionRequest, db: Session = Depends(get_db)
+) -> TrackedEvent:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+
+    action = payload.action
+    valid_actions = {"overwrite-calendar", "skip-email-import", "merge-fields"}
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail="Unbekannte Konfliktaktion")
+
+    mapping, settings = _resolve_caldav_context(event, db)
+
+    if action == "overwrite-calendar":
+        if not event.payload:
+            raise HTTPException(
+                status_code=400,
+                detail="Keine Daten aus dem E-Mail-Import verfügbar",
+            )
+        try:
+            event_processor.force_overwrite_event(event, mapping.calendar_url, settings)
+        except Exception:
+            logger.exception(
+                "Konfliktauflösung durch Überschreiben fehlgeschlagen für %s", event.uid
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Kalenderdaten konnten nicht überschrieben werden.",
+            )
+        db.refresh(event)
+        event.history = merge_histories(
+            event.history or [],
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "action": "conflict-resolved",
+                "description": "Konflikt gelöst – Kalenderdaten wurden mit dem E-Mail-Import überschrieben.",
+            },
+        )
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+    elif action == "skip-email-import":
+        event.sync_conflict = False
+        event.sync_conflict_reason = None
+        event.sync_conflict_snapshot = None
+        event.history = merge_histories(
+            event.history or [],
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "action": "conflict-resolved",
+                "description": (
+                    "Konflikt verworfen – Kalenderdaten behalten Vorrang. Hinweis: Bei "
+                    "künftigen Abweichungen kann erneut ein Konflikt entstehen."
+                ),
+            },
+        )
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+    else:  # merge-fields
+        allowed_fields = {
+            "summary",
+            "organizer",
+            "start",
+            "end",
+            "location",
+            "description",
+            "response_status",
+        }
+        for field, source in payload.selections.items():
+            if field not in allowed_fields:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unbekanntes Feld {field} in der Zusammenführung",
+                )
+            if source not in {"email", "calendar"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Ungültige Auswahlquelle für die Zusammenführung",
+                )
+        try:
+            remote_state = get_event_state(mapping.calendar_url, event.uid, settings)
+        except Exception:
+            logger.exception("Zusammenführung fehlgeschlagen – Remote-Leseproblem für %s", event.uid)
+            raise HTTPException(
+                status_code=502,
+                detail="Kalenderdaten konnten nicht geladen werden.",
+            )
+        if remote_state is None or not remote_state.payload:
+            raise HTTPException(
+                status_code=404,
+                detail="Für diesen Termin liegen keine Kalenderdaten vor.",
+            )
+        try:
+            merged_payload, chosen_response = _build_merged_payload(
+                event, remote_state.payload, payload.selections
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        parsed = parse_ics_payload(merged_payload.encode())
+        if not parsed:
+            raise HTTPException(
+                status_code=400,
+                detail="Zusammengeführte Daten konnten nicht interpretiert werden.",
+            )
+        selected = next((item for item in parsed if item.uid == event.uid), parsed[0])
+        event.summary = selected.summary
+        event.organizer = selected.organizer
+        event.start = selected.start
+        event.end = selected.end
+        event.payload = merged_payload
+        event.status = (
+            EventStatus.CANCELLED
+            if selected.status == EventStatus.CANCELLED
+            else EventStatus.UPDATED
+        )
+        event.local_version = (event.local_version or 0) + 1
+        event.local_last_modified = datetime.utcnow()
+        event.last_modified_source = "local"
+        event.sync_conflict = False
+        event.sync_conflict_reason = None
+        event.sync_conflict_snapshot = None
+        event.response_status = chosen_response
+        event.history = merge_histories(
+            event.history or [],
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "action": "conflict-resolved",
+                "description": "Konflikt gelöst – Daten wurden zusammengeführt.",
+            },
+        )
+        event_processor.annotate_response(event)
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+        try:
+            event_processor.force_overwrite_event(event, mapping.calendar_url, settings)
+        except Exception:
+            logger.exception(
+                "Zusammengeführte Daten konnten nicht exportiert werden für %s", event.uid
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Zusammengeführte Daten konnten nicht im Kalender gespeichert werden.",
+            )
+        db.refresh(event)
+
+    setattr(event, "conflicts", [])
+    _attach_conflicts([event], db)
+    _attach_sync_state([event])
+    _attach_attendees([event])
     return event
 
 
@@ -1146,6 +1472,7 @@ def disable_event_tracking(event_id: int, db: Session = Depends(get_db)) -> Trac
     db.refresh(event)
     setattr(event, "conflicts", [])
     _attach_sync_state([event])
+    _attach_attendees([event])
     return event
 
 

@@ -26,6 +26,10 @@ interface Props {
     response: TrackedEvent['response_status'],
   ) => Promise<TrackedEvent>;
   onDisableTracking: (eventId: number) => Promise<TrackedEvent>;
+  onResolveConflict: (
+    eventId: number,
+    payload: { action: string; selections?: Record<string, 'email' | 'calendar'> },
+  ) => Promise<TrackedEvent>;
   loading?: boolean;
   onRefresh: () => Promise<void>;
   autoSyncJob: SyncJobStatus | null;
@@ -65,6 +69,12 @@ const responseStyleMap: Record<TrackedEvent['response_status'], string> = {
   accepted: 'bg-emerald-500/15 text-emerald-300',
   tentative: 'bg-amber-500/15 text-amber-300',
   declined: 'bg-rose-500/15 text-rose-300',
+};
+
+const attendeeStatusMap: Record<string, string> = {
+  ACCEPTED: 'Zusage',
+  TENTATIVE: 'Vorläufig',
+  DECLINED: 'Absage',
 };
 
 const responseActions: Array<{
@@ -218,6 +228,7 @@ export default function EventTable({
   onAutoSyncIntervalChange,
   onRespondToEvent,
   onDisableTracking,
+  onResolveConflict,
   loading = false,
   onRefresh,
   autoSyncJob,
@@ -244,6 +255,10 @@ export default function EventTable({
   const [page, setPage] = useState(1);
   const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
   const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
+  const [activeMergeId, setActiveMergeId] = useState<number | null>(null);
+  const [mergeSelections, setMergeSelections] = useState<
+    Record<number, Record<string, 'email' | 'calendar'>
+  >({});
   const pollersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -874,6 +889,7 @@ export default function EventTable({
       await onDisableTracking(event.id);
       const title = event.summary ?? event.uid;
       setSyncNotice(`"${title}" wird nicht mehr automatisch verfolgt.`);
+      resetMerge(event.id);
       await onRefresh();
     } catch (error) {
       console.error('Konnte Tracking nicht deaktivieren.', error);
@@ -890,6 +906,77 @@ export default function EventTable({
     }));
   }
 
+  function initializeMerge(event: TrackedEvent, differences: ConflictDifference[]) {
+    const defaults: Record<string, 'email' | 'calendar'> = {};
+    differences.forEach((difference) => {
+      defaults[difference.field] = difference.field === 'response_status' ? 'email' : 'calendar';
+    });
+    setMergeSelections({
+      [event.id]: defaults,
+    });
+    setActiveMergeId(event.id);
+    setExpandedDifferences((prev) => ({
+      ...prev,
+      [event.id]: true,
+    }));
+  }
+
+  function updateMergeSelection(eventId: number, field: string, source: 'email' | 'calendar') {
+    setMergeSelections((prev) => ({
+      ...prev,
+      [eventId]: {
+        ...(prev[eventId] ?? {}),
+        [field]: source,
+      },
+    }));
+  }
+
+  function resetMerge(eventId: number) {
+    setMergeSelections((prev) => {
+      const { [eventId]: _removed, ...rest } = prev;
+      return rest;
+    });
+    setActiveMergeId((current) => (current === eventId ? null : current));
+  }
+
+  async function resolveConflict(
+    event: TrackedEvent,
+    action: 'overwrite-calendar' | 'skip-email-import' | 'merge-fields',
+    selections: Record<string, 'email' | 'calendar'> = {},
+  ) {
+    if (resolvingConflictId !== null) {
+      return;
+    }
+    setResolvingConflictId(event.id);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      const updated = await onResolveConflict(event.id, { action, selections });
+      const title = updated.summary ?? updated.uid;
+      if (action === 'overwrite-calendar') {
+        setSyncNotice(`Kalenderdaten für "${title}" wurden mit dem E-Mail-Import überschrieben.`);
+      } else if (action === 'skip-email-import') {
+        setSyncNotice(
+          `Kalenderdaten für "${title}" wurden beibehalten. Hinweis: Wenn erneut abweichende E-Mail-Daten eintreffen, kann wieder ein Konflikt entstehen.`,
+        );
+      } else {
+        setSyncNotice(`Konflikt für "${title}" wurde erfolgreich zusammengeführt.`);
+      }
+      resetMerge(event.id);
+    } catch (error) {
+      console.error('Konflikt konnte nicht gelöst werden.', error);
+      setSyncError('Konflikt konnte nicht gelöst werden.');
+    } finally {
+      setResolvingConflictId(null);
+    }
+  }
+
+  async function applyMerge(event: TrackedEvent) {
+    const selections = mergeSelections[event.id] ?? {};
+    await resolveConflict(event, 'merge-fields', selections);
+  }
+
   function handleSuggestionClick(
     event: TrackedEvent,
     suggestion: ConflictResolutionOption,
@@ -898,11 +985,16 @@ export default function EventTable({
       void handleDisableTracking(event);
       return;
     }
-
-    setExpandedDifferences((prev) => ({
-      ...prev,
-      [event.id]: true,
-    }));
+    const differences = event.sync_state?.conflict_details?.differences ?? [];
+    if (suggestion.action === 'merge-fields') {
+      if (differences.length === 0) {
+        void resolveConflict(event, 'merge-fields');
+        return;
+      }
+      initializeMerge(event, differences);
+      return;
+    }
+    void resolveConflict(event, suggestion.action as 'overwrite-calendar' | 'skip-email-import');
   }
 
   const showInitialLoading = loading && events.length === 0;
@@ -1256,6 +1348,34 @@ export default function EventTable({
                         <p className="mt-1 text-slate-300">{dateRange}</p>
                       </div>
                     </div>
+                    {event.attendees.length > 0 && (
+                      <div className="mt-4">
+                        <p className="text-xs uppercase tracking-wide text-slate-500">Teilnehmer</p>
+                        <div className="mt-2 max-h-40 overflow-y-auto pr-2">
+                          <ul className="space-y-1 text-xs text-slate-300">
+                            {event.attendees.map((attendee, index) => {
+                              const primaryLabel = attendee.name ?? attendee.email ?? `Teilnehmer ${index + 1}`;
+                              const emailLabel = attendee.name && attendee.email ? attendee.email : attendee.name ? '' : attendee.email;
+                              const statusLabel = attendee.status ? attendeeStatusMap[attendee.status] ?? attendee.status : null;
+                              const responseNote = attendee.response_requested ? 'Antwort erbeten' : null;
+                              return (
+                                <li key={`${attendee.email ?? attendee.name ?? index}`} className="rounded border border-slate-800/60 bg-slate-900/60 p-2">
+                                  <span className="font-semibold text-slate-200">{primaryLabel}</span>
+                                  {emailLabel && (
+                                    <span className="ml-2 text-[11px] text-slate-400">{emailLabel}</span>
+                                  )}
+                                  <div className="mt-1 text-[11px] text-slate-400">
+                                    {statusLabel ? statusLabel : 'Status unbekannt'}
+                                    {responseNote ? ` · ${responseNote}` : ''}
+                                    {attendee.type ? ` · ${attendee.type}` : ''}
+                                  </div>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
                     {conflictCount > 0 && (
                       <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">
                         <p className="text-sm font-semibold text-amber-200">Terminkonflikte erkannt</p>
@@ -1302,48 +1422,100 @@ export default function EventTable({
                             </button>
                             {differencesExpanded && (
                               <div className="mt-2 space-y-2">
-                                {differences.map((difference) => (
-                                  <div
-                                    key={difference.field}
-                                    className="rounded-lg border border-rose-400/30 bg-rose-950/20 p-2"
-                                  >
-                                    <p className="text-xs font-semibold text-rose-200">{difference.label}</p>
-                                    <div className="mt-2 grid gap-3 text-[11px] text-rose-100/80 sm:grid-cols-2">
-                                      <div>
-                                        <span className="font-semibold text-rose-300">E-Mail-Import</span>
-                                        <p className="mt-1 whitespace-pre-wrap break-words">
-                                          {formatDifferenceValue(difference, 'local')}
-                                        </p>
+                                {differences.map((difference) => {
+                                  const isMerging = activeMergeId === event.id;
+                                  const selection =
+                                    mergeSelections[event.id]?.[difference.field] ??
+                                    (difference.field === 'response_status' ? 'email' : 'calendar');
+                                  return (
+                                    <div
+                                      key={difference.field}
+                                      className="rounded-lg border border-rose-400/30 bg-rose-950/20 p-2"
+                                    >
+                                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                        <p className="text-xs font-semibold text-rose-200">{difference.label}</p>
+                                        {isMerging && (
+                                          <div className="flex flex-wrap gap-1 text-[11px]">
+                                            <button
+                                              type="button"
+                                              onClick={() => updateMergeSelection(event.id, difference.field, 'email')}
+                                              className={`rounded px-2 py-1 font-semibold transition ${
+                                                selection === 'email'
+                                                  ? 'bg-rose-400/30 text-rose-100'
+                                                  : 'bg-rose-950/40 text-rose-300 hover:bg-rose-900/40'
+                                              }`}
+                                            >
+                                              E-Mail-Import verwenden
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() => updateMergeSelection(event.id, difference.field, 'calendar')}
+                                              className={`rounded px-2 py-1 font-semibold transition ${
+                                                selection === 'calendar'
+                                                  ? 'bg-rose-400/30 text-rose-100'
+                                                  : 'bg-rose-950/40 text-rose-300 hover:bg-rose-900/40'
+                                              }`}
+                                            >
+                                              Kalenderdaten verwenden
+                                            </button>
+                                          </div>
+                                        )}
                                       </div>
-                                      <div>
-                                        <span className="font-semibold text-rose-300">Kalenderdaten</span>
-                                        <p className="mt-1 whitespace-pre-wrap break-words">
-                                          {formatDifferenceValue(difference, 'remote')}
-                                        </p>
+                                      <div className="mt-2 grid gap-3 text-[11px] text-rose-100/80 sm:grid-cols-2">
+                                        <div
+                                          className={
+                                            isMerging && selection === 'email'
+                                              ? 'rounded-md border border-rose-400/40 bg-rose-900/40 p-2'
+                                              : 'p-0'
+                                          }
+                                        >
+                                          <span className="font-semibold text-rose-300">E-Mail-Import</span>
+                                          <p className="mt-1 whitespace-pre-wrap break-words">
+                                            {formatDifferenceValue(difference, 'local')}
+                                          </p>
+                                        </div>
+                                        <div
+                                          className={
+                                            isMerging && selection === 'calendar'
+                                              ? 'rounded-md border border-rose-400/40 bg-rose-900/40 p-2'
+                                              : 'p-0'
+                                          }
+                                        >
+                                          <span className="font-semibold text-rose-300">Kalenderdaten</span>
+                                          <p className="mt-1 whitespace-pre-wrap break-words">
+                                            {formatDifferenceValue(difference, 'remote')}
+                                          </p>
+                                        </div>
                                       </div>
                                     </div>
-                                  </div>
-                                ))}
+                                  );
+                                })}
                               </div>
                             )}
                           </div>
                         )}
                         {suggestions.length > 0 && (
-                          <div>
-                            <p className="text-[11px] uppercase tracking-wide text-rose-300/80">Lösungsvorschläge</p>
-                            <div className="mt-2 space-y-2">
-                              {suggestions.map((suggestion) => {
+                              <div>
+                                <p className="text-[11px] uppercase tracking-wide text-rose-300/80">Lösungsvorschläge</p>
+                                <div className="mt-2 space-y-2">
+                                  {suggestions.map((suggestion) => {
                                 const disableInProgress =
                                   suggestion.action === 'disable-tracking' &&
                                   resolvingConflictId === event.id;
+                                const resolveInProgress =
+                                  suggestion.action !== 'disable-tracking' &&
+                                  suggestion.action !== 'merge-fields' &&
+                                  resolvingConflictId === event.id;
+                                const mergingActive =
+                                  suggestion.action === 'merge-fields' && activeMergeId === event.id;
                                 return (
                                   <button
                                     key={suggestion.action}
                                     type="button"
                                     onClick={() => handleSuggestionClick(event, suggestion)}
-                                    disabled={disableInProgress}
+                                    disabled={disableInProgress || resolveInProgress}
                                     className={`w-full rounded-lg border border-rose-400/30 bg-rose-950/15 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-rose-400/50 ${
-                                      disableInProgress
+                                      disableInProgress || resolveInProgress
                                         ? 'cursor-progress opacity-60'
                                         : 'cursor-pointer hover:bg-rose-900/40'
                                     }`}
@@ -1357,11 +1529,41 @@ export default function EventTable({
                                         Wird entfernt…
                                       </p>
                                     )}
+                                    {resolveInProgress && (
+                                      <p className="mt-2 text-[11px] font-semibold text-rose-200">
+                                        Lösung wird angewendet…
+                                      </p>
+                                    )}
+                                    {mergingActive && (
+                                      <p className="mt-2 text-[11px] font-semibold text-rose-200">
+                                        Wähle für jedes Feld die gewünschte Quelle aus.
+                                      </p>
+                                    )}
                                   </button>
                                 );
                               })}
-                            </div>
-                          </div>
+                                </div>
+                              {activeMergeId === event.id && (
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => applyMerge(event)}
+                                    disabled={resolvingConflictId === event.id}
+                                    className="rounded-lg bg-rose-500 px-3 py-1.5 text-xs font-semibold text-rose-50 transition hover:bg-rose-400 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    Auswahl übernehmen
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => resetMerge(event.id)}
+                                    disabled={resolvingConflictId === event.id}
+                                    className="rounded-lg border border-rose-400/40 px-3 py-1.5 text-xs font-semibold text-rose-200 transition hover:border-rose-300 hover:text-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                  >
+                                    Zusammenführung abbrechen
+                                  </button>
+                                </div>
+                              )}
+                              </div>
                         )}
                       </div>
                     )}

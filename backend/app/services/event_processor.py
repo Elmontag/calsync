@@ -347,6 +347,46 @@ def sync_events_to_calendar(
     return uploaded_uids
 
 
+def force_overwrite_event(
+    event: TrackedEvent,
+    calendar_url: str,
+    settings: CalDavSettings,
+) -> None:
+    """Upload the local event payload to CalDAV, ignoring version conflicts."""
+
+    remote_state: Optional[RemoteEventState] = None
+    try:
+        remote_state = get_event_state(calendar_url, event.uid, settings)
+    except Exception:
+        logger.exception("Failed to inspect remote state before overwrite for %s", event.uid)
+
+    new_state: Optional[RemoteEventState] = None
+    try:
+        new_state = upload_ical(calendar_url, event_payload_to_ical(event), settings)
+        logger.info("Overwrote remote event %s with local data", event.uid)
+    except Exception:
+        logger.exception("Forced overwrite for event %s failed", event.uid)
+        raise
+    finally:
+        if new_state is None and remote_state is None:
+            try:
+                remote_state = get_event_state(calendar_url, event.uid, settings)
+            except Exception:
+                logger.exception("Failed to refresh remote state after overwrite for %s", event.uid)
+
+    effective_state: Optional[RemoteEventState] = new_state or remote_state
+    if effective_state is not None:
+        mark_as_synced([event], remote_states={event.id: effective_state})
+    else:
+        mark_as_synced([event])
+
+
+def apply_remote_version(event: TrackedEvent, remote_state: RemoteEventState) -> None:
+    """Persist the remote calendar version locally during conflict resolution."""
+
+    _apply_remote_snapshot(event, remote_state)
+
+
 def _record_sync_conflict(
     event: TrackedEvent, reason: str, remote_state: Optional[RemoteEventState]
 ) -> None:

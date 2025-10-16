@@ -161,6 +161,15 @@ export function useEvents() {
     return data;
   }
 
+  async function resolveConflict(
+    eventId: number,
+    payload: { action: string; selections?: Record<string, 'email' | 'calendar'> },
+  ) {
+    const { data } = await api.post<TrackedEvent>(`/events/${eventId}/resolve-conflict`, payload);
+    setEvents((prev) => prev.map((event) => (event.id === eventId ? data : event)));
+    return data;
+  }
+
   return {
     events,
     loading,
@@ -176,6 +185,7 @@ export function useEvents() {
     respondToEvent,
     loadAutoSync,
     disableTracking,
+    resolveConflict,
   };
 }
 

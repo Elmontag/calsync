@@ -50,6 +50,7 @@ export interface TrackedEvent {
   conflicts: CalendarConflict[];
   sync_state: EventSyncState;
   tracking_disabled: boolean;
+  attendees: EventAttendee[];
   created_at: string;
   updated_at: string;
 }
@@ -58,6 +59,15 @@ export interface EventHistoryEntry {
   timestamp: string;
   action: string;
   description: string;
+}
+
+export interface EventAttendee {
+  name?: string | null;
+  email?: string | null;
+  status?: string | null;
+  role?: string | null;
+  type?: string | null;
+  response_requested: boolean;
 }
 
 export interface CalendarConflict {
