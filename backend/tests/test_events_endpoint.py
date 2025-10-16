@@ -1406,6 +1406,59 @@ def test_manual_sync_marks_conflicts_as_missing(monkeypatch: pytest.MonkeyPatch)
     assert captured == []
 
 
+def test_manual_sync_skips_failed_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fehlgeschlagene Mailimporte dürfen nicht zu einem Sync-Fehler führen."""
+
+    session = SessionLocal()
+    imap, caldav = _store_basic_accounts(session)
+    mapping = SyncMapping(
+        imap_account_id=imap.id,
+        imap_folder="INBOX",
+        caldav_account_id=caldav.id,
+        calendar_url="https://cal.example.com/shared",
+    )
+    session.add(mapping)
+
+    event = TrackedEvent(
+        uid="failed-import",
+        status=EventStatus.FAILED,
+        response_status=EventResponseStatus.NONE,
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mail_error="Ungültige ICS-Nutzlast",
+        payload=None,
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    captured: List[List[str]] = []
+
+    def _fake_sync(events, calendar_url, settings, progress_callback=None):
+        captured.append([event.uid for event in events])
+        return [event.uid for event in events]
+
+    monkeypatch.setattr(event_processor, "sync_events_to_calendar", _fake_sync)
+
+    state = job_tracker.create("manual-sync", total=1)
+    try:
+        _execute_manual_sync_job(state.job_id, [event.id])
+        final_state = job_tracker.get(state.job_id)
+        assert final_state is not None
+        assert final_state.status == "completed"
+        assert final_state.detail is not None
+        detail = final_state.detail
+        assert detail.get("uploaded") == []
+        missing = detail.get("missing")
+        assert missing and missing[0]["event_id"] == event.id
+        assert "Fehler" in missing[0]["reason"]
+    finally:
+        job_tracker._jobs.pop(state.job_id, None)
+
+    assert captured == []
+
+
 def test_sync_conflict_persists_across_runs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ein erkannter Konflikt muss über Folge-Syncs hinweg bestehen bleiben."""
 

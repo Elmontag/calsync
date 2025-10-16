@@ -948,6 +948,36 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
                         },
                     )
                     continue
+                if event.status == EventStatus.FAILED or not event.payload:
+                    logger.info(
+                        "Skipping manual sync for %s due to failed mail import", event.uid
+                    )
+                    reason = (
+                        f"Fehlerhafte Mail: {event.mail_error}"
+                        if event.mail_error
+                        else "Fehlerhafte Mail"
+                    )
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason=reason,
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
+                    continue
                 if event.sync_conflict:
                     logger.info(
                         "Skipping manual sync for %s due to existing conflict", event.uid
