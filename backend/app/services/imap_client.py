@@ -44,6 +44,21 @@ class FolderSelection:
     include_subfolders: bool = True
 
 
+CALENDAR_MIME_TYPES = {"text/calendar", "text/x-vcalendar"}
+CALENDAR_EXTENSIONS = (".ics", ".vcs")
+
+
+def _is_calendar_attachment(content_type: str, filename: Optional[str]) -> bool:
+    """Return True when the mail part represents a calendar payload."""
+
+    if content_type in CALENDAR_MIME_TYPES:
+        return True
+    if filename:
+        lowered = filename.lower()
+        return any(lowered.endswith(ext) for ext in CALENDAR_EXTENSIONS)
+    return False
+
+
 class ImapConnection:
     """Context manager for IMAP operations."""
 
@@ -101,12 +116,14 @@ def fetch_calendar_candidates(
                 for part in message.walk():
                     content_type = part.get_content_type()
                     filename = part.get_filename()
-                    is_calendar_part = content_type == "text/calendar" or (
-                        filename and filename.lower().endswith(".ics")
-                    )
+                    is_calendar_part = _is_calendar_attachment(content_type, filename)
                     if is_calendar_part:
                         payload = part.get_payload(decode=True) or b""
-                        attachment_name = filename or "calendar.ics"
+                        if filename:
+                            attachment_name = filename
+                        else:
+                            default_extension = ".vcs" if content_type == "text/x-vcalendar" else ".ics"
+                            attachment_name = f"calendar{default_extension}"
                         attachments.append(
                             MailAttachment(
                                 filename=attachment_name,
@@ -175,7 +192,7 @@ def extract_calendar_links(text: str) -> List[str]:
     """Extract potential calendar links from plain text bodies."""
     import re
 
-    link_pattern = re.compile(r"https?://\S+(?:/download/ics|\.ics\b)")
+    link_pattern = re.compile(r"https?://\S+(?:/download/(?:ics|vcs)|\.(?:ics|vcs)\b)")
     links = link_pattern.findall(text)
     logger.debug("Found %s calendar links", len(links))
     return links
