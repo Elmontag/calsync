@@ -29,6 +29,9 @@ def apply_schema_upgrades() -> None:
             row[1]
             for row in connection.exec_driver_sql("PRAGMA table_info('tracked_events')").fetchall()
         }
+        table_definition = connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tracked_events'"
+        ).scalar_one_or_none()
 
     if not columns:
         # Table does not exist yet; the regular metadata.create_all call will create it.
@@ -109,6 +112,41 @@ def apply_schema_upgrades() -> None:
         logger.info("Adding %s column to tracked_events table", column_name)
         with engine.begin() as connection:
             connection.exec_driver_sql(ddl)
+
+    needs_status_enum_upgrade = (
+        "status" in columns
+        and table_definition is not None
+        and "failed" not in table_definition.lower()
+    )
+
+    if needs_status_enum_upgrade:
+        logger.info(
+            "Rebuilding tracked_events table to allow the failed status in enum constraint"
+        )
+        from .models import TrackedEvent
+
+        tracked_events_table = TrackedEvent.__table__
+        column_names = [column.name for column in tracked_events_table.columns]
+        quoted_columns = ", ".join(f'"{name}"' for name in column_names)
+
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE IF EXISTS tracked_events_old")
+            connection.exec_driver_sql("ALTER TABLE tracked_events RENAME TO tracked_events_old")
+            old_indexes = connection.exec_driver_sql(
+                "PRAGMA index_list('tracked_events_old')"
+            ).fetchall()
+            for index in old_indexes:
+                origin = index[3] if len(index) > 3 else None
+                if origin != "c":
+                    continue
+                index_name = index[1]
+                connection.exec_driver_sql(f'DROP INDEX IF EXISTS "{index_name}"')
+            tracked_events_table.create(bind=connection)
+            connection.exec_driver_sql(
+                f"INSERT INTO tracked_events ({quoted_columns}) "
+                f"SELECT {quoted_columns} FROM tracked_events_old"
+            )
+            connection.exec_driver_sql("DROP TABLE tracked_events_old")
 
 
 @contextmanager
