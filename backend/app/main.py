@@ -48,6 +48,11 @@ from .schemas import (
     SyncMappingUpdate,
     TrackedEventRead,
 )
+from .security import (
+    SecretEncryptionError,
+    decrypt_account_settings,
+    encrypt_account_settings,
+)
 from .services import event_processor
 from .services.caldav_client import (
     CalDavConnection,
@@ -78,6 +83,47 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+
+
+def _serialize_account(account: Account) -> AccountRead:
+    try:
+        settings = decrypt_account_settings(account.type, account.settings)
+    except SecretEncryptionError as exc:
+        logger.exception("Konto %s konnte nicht entschlüsselt werden", account.id)
+        raise HTTPException(
+            status_code=500,
+            detail="Gespeicherte Zugangsdaten konnten nicht entschlüsselt werden.",
+        ) from exc
+
+    return AccountRead.model_validate(
+        {
+            "id": account.id,
+            "label": account.label,
+            "type": account.type,
+            "settings": settings,
+            "imap_folders": [
+                {
+                    "id": folder.id,
+                    "name": folder.name,
+                    "include_subfolders": folder.include_subfolders,
+                }
+                for folder in account.imap_folders
+            ],
+            "created_at": account.created_at,
+            "updated_at": account.updated_at,
+        }
+    )
+
+
+def _decrypt_settings_for_runtime(account: Account) -> Optional[dict[str, Any]]:
+    try:
+        return decrypt_account_settings(account.type, account.settings)
+    except SecretEncryptionError:
+        logger.exception(
+            "Gespeicherte Zugangsdaten des Kontos %s konnten nicht entschlüsselt werden.",
+            account.id,
+        )
+        return None
 
 Base.metadata.create_all(bind=engine)
 
@@ -325,8 +371,11 @@ def _attach_conflicts(events: List[TrackedEvent], db: Session) -> None:
                 )
                 continue
             account_cache[mapping.caldav_account_id] = account
+        settings_payload = _decrypt_settings_for_runtime(account)
+        if settings_payload is None:
+            continue
         try:
-            settings = CalDavSettings(**account.settings)
+            settings = CalDavSettings(**settings_payload)
         except TypeError:
             logger.exception(
                 "Ungültige CalDAV Einstellungen für Konto %s", account.id
@@ -442,8 +491,14 @@ def _resolve_caldav_context(
             status_code=409,
             detail="Zugeordnetes CalDAV-Konto ist nicht verfügbar.",
         )
+    settings_payload = _decrypt_settings_for_runtime(caldav_account)
+    if settings_payload is None:
+        raise HTTPException(
+            status_code=500,
+            detail="CalDAV-Zugangsdaten konnten nicht entschlüsselt werden.",
+        )
     try:
-        settings = CalDavSettings(**caldav_account.settings)
+        settings = CalDavSettings(**settings_payload)
     except TypeError:
         logger.exception("Ungültige CalDAV Einstellungen für Konto %s", caldav_account.id)
         raise HTTPException(status_code=500, detail="CalDAV-Einstellungen sind ungültig.")
@@ -840,8 +895,11 @@ def perform_mail_scan(
     events_imported = 0
 
     for account in accounts:
+        settings_payload = _decrypt_settings_for_runtime(account)
+        if settings_payload is None:
+            continue
         try:
-            settings = ImapSettings(**account.settings)
+            settings = ImapSettings(**settings_payload)
         except TypeError:
             logger.exception("Ungültige IMAP Einstellungen für Konto %s", account.id)
             continue
@@ -1161,8 +1219,32 @@ def _execute_manual_sync_job(job_id: str, event_ids: List[int]) -> None:
                     )
                     continue
 
+                settings_payload = _decrypt_settings_for_runtime(caldav_account)
+                if settings_payload is None:
+                    missing.append(
+                        ManualSyncMissingDetail(
+                            event_id=event.id,
+                            uid=event.uid,
+                            account_id=event.source_account_id,
+                            folder=event.source_folder,
+                            reason="CalDAV-Zugangsdaten konnten nicht entschlüsselt werden.",
+                        )
+                    )
+                    processed += 1
+                    job_tracker.update(
+                        job_id,
+                        processed=processed,
+                        detail={
+                            "phase": "Prüfung",
+                            "description": "Terminauswahl wird geprüft…",
+                            "processed": processed,
+                            "total": total,
+                        },
+                    )
+                    continue
+
                 try:
-                    settings = CalDavSettings(**caldav_account.settings)
+                    settings = CalDavSettings(**settings_payload)
                 except TypeError as exc:
                     logger.exception(
                         "CalDAV settings invalid for account %s", caldav_account.id
@@ -1325,15 +1407,26 @@ def health() -> dict[str, str]:
 @app.get("/accounts", response_model=List[AccountRead])
 def list_accounts(db: Session = Depends(get_db)):
     accounts = db.execute(select(Account)).scalars().all()
-    return accounts
+    return [_serialize_account(account) for account in accounts]
 
 
 @app.post("/accounts", response_model=AccountRead)
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
+    try:
+        encrypted_settings = encrypt_account_settings(account.type, account.settings)
+    except SecretEncryptionError as exc:
+        logger.exception(
+            "Verschlüsselung der Zugangsdaten für Konto %s fehlgeschlagen", account.label
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Konto konnte nicht gespeichert werden, Verschlüsselung fehlgeschlagen.",
+        ) from exc
+
     db_account = Account(
         label=account.label,
         type=account.type,
-        settings=account.settings,
+        settings=encrypted_settings,
     )
     db.add(db_account)
     db.flush()
@@ -1347,7 +1440,7 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
         )
     db.commit()
     db.refresh(db_account)
-    return db_account
+    return _serialize_account(db_account)
 
 
 @app.put("/accounts/{account_id}", response_model=AccountRead)
@@ -1358,7 +1451,16 @@ def update_account(account_id: int, payload: AccountUpdate, db: Session = Depend
 
     db_account.label = payload.label
     db_account.type = payload.type
-    db_account.settings = payload.settings
+    try:
+        db_account.settings = encrypt_account_settings(payload.type, payload.settings)
+    except SecretEncryptionError as exc:
+        logger.exception(
+            "Verschlüsselung der Zugangsdaten für Konto %s fehlgeschlagen", account_id
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Konto konnte nicht aktualisiert werden, Verschlüsselung fehlgeschlagen.",
+        ) from exc
     if payload.type == AccountType.IMAP:
         db_account.imap_folders = [
             ImapFolder(
@@ -1374,7 +1476,7 @@ def update_account(account_id: int, payload: AccountUpdate, db: Session = Depend
     db.commit()
     db.refresh(db_account)
     logger.info("Updated account %s", account_id)
-    return db_account
+    return _serialize_account(db_account)
 
 
 @app.delete("/accounts/{account_id}")
@@ -1541,13 +1643,17 @@ def update_event_response(
                     mapping.id,
                 )
             else:
-                try:
-                    caldav_settings = CalDavSettings(**caldav_account.settings)
-                except TypeError:
-                    logger.exception(
-                        "Ungültige CalDAV Einstellungen für Konto %s", caldav_account.id
-                    )
+                settings_payload = _decrypt_settings_for_runtime(caldav_account)
+                if settings_payload is None:
                     caldav_settings = None
+                else:
+                    try:
+                        caldav_settings = CalDavSettings(**settings_payload)
+                    except TypeError:
+                        logger.exception(
+                            "Ungültige CalDAV Einstellungen für Konto %s", caldav_account.id
+                        )
+                        caldav_settings = None
 
     db.add(event)
     db.commit()
@@ -1832,8 +1938,14 @@ def delete_event_mail(event_id: int, db: Session = Depends(get_db)) -> TrackedEv
             detail="IMAP-Konto für diesen Termin wurde nicht gefunden.",
         )
 
+    settings_payload = _decrypt_settings_for_runtime(account)
+    if settings_payload is None:
+        raise HTTPException(
+            status_code=500,
+            detail="IMAP-Zugangsdaten konnten nicht entschlüsselt werden.",
+        )
     try:
-        settings = ImapSettings(**account.settings)
+        settings = ImapSettings(**settings_payload)
     except TypeError:
         logger.exception("Ungültige IMAP Einstellungen für Konto %s", account.id)
         raise HTTPException(
@@ -1918,7 +2030,16 @@ def perform_sync_all(
         if caldav_account is None:
             logger.warning("CalDAV account %s not found", mapping.caldav_account_id)
             continue
-        settings = CalDavSettings(**caldav_account.settings)
+        settings_payload = _decrypt_settings_for_runtime(caldav_account)
+        if settings_payload is None:
+            continue
+        try:
+            settings = CalDavSettings(**settings_payload)
+        except TypeError:
+            logger.exception(
+                "Ungültige CalDAV Einstellungen für Konto %s", caldav_account.id
+            )
+            continue
         events = db.execute(
             select(TrackedEvent)
             .where(TrackedEvent.source_account_id == mapping.imap_account_id)
@@ -2154,7 +2275,17 @@ def get_calendars(account_id: int, db: Session = Depends(get_db)) -> dict[str, L
     account = db.get(Account, account_id)
     if account is None or account.type != AccountType.CALDAV:
         raise HTTPException(status_code=404, detail="CalDAV account not found")
-    settings = CalDavSettings(**account.settings)
+    settings_payload = _decrypt_settings_for_runtime(account)
+    if settings_payload is None:
+        raise HTTPException(
+            status_code=500,
+            detail="CalDAV-Zugangsdaten konnten nicht entschlüsselt werden.",
+        )
+    try:
+        settings = CalDavSettings(**settings_payload)
+    except TypeError:
+        logger.exception("Ungültige CalDAV Einstellungen für Konto %s", account.id)
+        raise HTTPException(status_code=500, detail="CalDAV-Einstellungen sind ungültig.")
     calendars = list(list_calendars(settings))
     return {"calendars": calendars}
 

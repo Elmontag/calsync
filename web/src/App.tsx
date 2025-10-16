@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { isAxiosError } from 'axios';
 import AccountForm from './components/AccountForm';
 import AccountList from './components/AccountList';
 import EventTable from './components/EventTable';
@@ -6,7 +7,7 @@ import SyncMappingConfigurator from './components/SyncMappingConfigurator';
 import { useAccounts, useEvents, useSyncMappings } from './api/hooks';
 import type { Account, AccountCreateInput } from './types/api';
 
-type ActiveView = 'sync' | 'accounts' | 'settings';
+type ActiveView = 'sync' | 'accounts' | 'rules';
 
 function App() {
   const [activeView, setActiveView] = useState<ActiveView>('sync');
@@ -32,16 +33,49 @@ function App() {
   const { mappings, addMapping, removeMapping } = useSyncMappings();
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [savingAccount, setSavingAccount] = useState(false);
+  const [accountFeedback, setAccountFeedback] = useState<
+    { type: 'success' | 'error'; message: string } | null
+  >(null);
+
+  useEffect(() => {
+    if (!accountFeedback || accountFeedback.type === 'error') {
+      return;
+    }
+    const timeout = window.setTimeout(() => setAccountFeedback(null), 6000);
+    return () => window.clearTimeout(timeout);
+  }, [accountFeedback]);
 
   async function handleAccountSubmit(values: AccountCreateInput) {
     setSavingAccount(true);
     try {
       if (editingAccount) {
-        await updateAccount(editingAccount.id, values);
-        setEditingAccount(null);
+        const updated = await updateAccount(editingAccount.id, values);
+        setEditingAccount(updated);
+        setAccountFeedback({
+          type: 'success',
+          message: `Konto „${updated.label}“ wurde gespeichert.`,
+        });
       } else {
-        await addAccount(values);
+        const created = await addAccount(values);
+        setEditingAccount(created);
+        setAccountFeedback({
+          type: 'success',
+          message: `Konto „${created.label}“ wurde angelegt.`,
+        });
       }
+    } catch (error) {
+      console.error('Konto konnte nicht gespeichert werden.', error);
+      let message = 'Speichern des Kontos ist fehlgeschlagen.';
+      if (isAxiosError(error)) {
+        if (typeof error.response?.data?.detail === 'string') {
+          message = error.response.data.detail;
+        } else if (error.message) {
+          message = error.message;
+        }
+      } else if (error instanceof Error && error.message) {
+        message = error.message;
+      }
+      setAccountFeedback({ type: 'error', message });
     } finally {
       setSavingAccount(false);
     }
@@ -94,14 +128,14 @@ function App() {
               Konten ({accounts.length})
             </button>
             <button
-              onClick={() => setActiveView('settings')}
+              onClick={() => setActiveView('rules')}
               className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
-                activeView === 'settings'
+                activeView === 'rules'
                   ? 'bg-emerald-500 text-emerald-950'
                   : 'bg-slate-800 text-slate-200 hover:bg-slate-700'
               }`}
             >
-              Einstellungen
+              Regeln
             </button>
           </div>
         </div>
@@ -146,6 +180,17 @@ function App() {
                     ? 'Passe Zugangsdaten und Ordnerzuweisungen für das ausgewählte Konto an.'
                     : 'Hinterlege hier IMAP oder CalDAV Verbindungen und teste deine Zugangsdaten direkt.'}
                 </p>
+                {accountFeedback && (
+                  <div
+                    className={`mt-4 rounded border px-3 py-2 text-sm ${
+                      accountFeedback.type === 'success'
+                        ? 'border-emerald-600 bg-emerald-500/10 text-emerald-200'
+                        : 'border-rose-600 bg-rose-500/10 text-rose-200'
+                    }`}
+                  >
+                    {accountFeedback.message}
+                  </div>
+                )}
                 <div className="mt-6">
                   <AccountForm
                     account={editingAccount}
@@ -157,6 +202,18 @@ function App() {
               </div>
             </section>
             <aside className="space-y-6">
+              <div className="rounded-xl border border-slate-800 bg-slate-900 p-5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingAccount(null);
+                    setActiveView('accounts');
+                  }}
+                  className="w-full rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-200 transition hover:bg-emerald-500/20"
+                >
+                  Neues Konto
+                </button>
+              </div>
               <AccountList
                 accounts={accounts}
                 onEdit={setEditingAccount}
@@ -167,7 +224,7 @@ function App() {
           </div>
         )}
 
-        {activeView === 'settings' && (
+        {activeView === 'rules' && (
           <section>
             <SyncMappingConfigurator
               accounts={accounts}

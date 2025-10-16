@@ -37,14 +37,19 @@ export function useAccounts() {
     refresh();
   }, []);
 
-  async function addAccount(payload: AccountCreateInput) {
-    await api.post<Account>('/accounts', payload);
+  async function addAccount(payload: AccountCreateInput): Promise<Account> {
+    const { data } = await api.post<Account>('/accounts', payload);
     await refresh();
+    return data;
   }
 
-  async function updateAccount(accountId: number, payload: AccountUpdateInput) {
-    await api.put<Account>(`/accounts/${accountId}`, payload);
+  async function updateAccount(
+    accountId: number,
+    payload: AccountUpdateInput,
+  ): Promise<Account> {
+    const { data } = await api.put<Account>(`/accounts/${accountId}`, payload);
     await refresh();
+    return data;
   }
 
   async function removeAccount(accountId: number) {
