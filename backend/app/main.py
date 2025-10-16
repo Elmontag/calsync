@@ -60,6 +60,7 @@ from .services.imap_client import (
     FolderSelection,
     ImapSettings,
     MailAttachment,
+    delete_message,
     fetch_calendar_candidates,
 )
 from .services.job_tracker import job_tracker
@@ -1724,6 +1725,92 @@ def disable_event_tracking(event_id: int, db: Session = Depends(get_db)) -> Trac
 
     db.refresh(event)
     setattr(event, "conflicts", [])
+    _attach_sync_state([event])
+    _attach_attendees([event])
+    return event
+
+
+@app.post("/events/{event_id}/delete-mail", response_model=TrackedEventRead)
+def delete_event_mail(event_id: int, db: Session = Depends(get_db)) -> TrackedEvent:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+
+    if (
+        not event.mailbox_message_id
+        or event.source_account_id is None
+        or not event.source_folder
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Für diesen Termin ist keine verknüpfte E-Mail vorhanden.",
+        )
+
+    account = db.get(Account, event.source_account_id)
+    if account is None or account.type != AccountType.IMAP:
+        raise HTTPException(
+            status_code=404,
+            detail="IMAP-Konto für diesen Termin wurde nicht gefunden.",
+        )
+
+    try:
+        settings = ImapSettings(**account.settings)
+    except TypeError:
+        logger.exception("Ungültige IMAP Einstellungen für Konto %s", account.id)
+        raise HTTPException(
+            status_code=500,
+            detail="IMAP-Einstellungen für das Konto sind ungültig.",
+        )
+
+    try:
+        deleted = delete_message(settings, event.source_folder, event.mailbox_message_id)
+    except Exception:
+        logger.exception(
+            "Konnte E-Mail %s in Ordner %s (Konto %s) nicht löschen",
+            event.mailbox_message_id,
+            event.source_folder,
+            account.id,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Die E-Mail konnte nicht im Postfach gelöscht werden.",
+        )
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Die E-Mail wurde im Postfach nicht gefunden.",
+        )
+
+    now = datetime.utcnow()
+    note = "Die ursprüngliche E-Mail wurde aus dem Postfach gelöscht."
+    event.mailbox_message_id = None
+    event.mail_error = (
+        f"{event.mail_error} – Nachricht wurde aus dem Postfach gelöscht."
+        if event.mail_error
+        else note
+    )
+    event.history = merge_histories(
+        event.history or [],
+        {
+            "timestamp": now.isoformat(),
+            "action": "mail-deleted",
+            "description": note,
+        },
+    )
+    event.local_last_modified = now
+    event.last_modified_source = "local"
+    event.updated_at = now
+    db.add(event)
+    db.commit()
+    logger.info(
+        "E-Mail für Termin %s gelöscht (Konto %s, Ordner %s)",
+        event.uid,
+        account.id,
+        event.source_folder,
+    )
+    db.refresh(event)
+    _attach_conflicts([event], db)
     _attach_sync_state([event])
     _attach_attendees([event])
     return event

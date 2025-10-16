@@ -244,6 +244,107 @@ def test_mail_scan_records_failed_messages(monkeypatch: pytest.MonkeyPatch) -> N
     assert failed.tracking_disabled is False
 
 
+def test_delete_failed_mail_removes_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deleting a failed mail should update the tracked event and audit history."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {
+        "host": "imap.example.com",
+        "username": "user",
+        "password": "secret",
+    }
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    event = TrackedEvent(
+        uid="mail-error::1:inbox:42",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="42",
+        summary="Fehlerhafte Einladung",
+        organizer="orga@example.com",
+        status=EventStatus.FAILED,
+        response_status=EventResponseStatus.NONE,
+        mail_error="Kaputter Inhalt",
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    calls: List[Tuple[str, str]] = []
+
+    def fake_delete(settings, folder, message_id):
+        calls.append((folder, message_id))
+        assert settings.host == "imap.example.com"
+        return True
+
+    monkeypatch.setattr("backend.app.main.delete_message", fake_delete)
+
+    client = TestClient(app)
+    response = client.post(f"/events/{event.id}/delete-mail")
+    assert response.status_code == 200
+    payload = response.json()
+    assert any(entry["action"] == "mail-deleted" for entry in payload["history"])
+    assert "gelöscht" in (payload["mail_error"] or "")
+    assert calls == [("INBOX", "42")]
+
+    with session_scope() as verify:
+        updated = verify.get(TrackedEvent, event.id)
+        assert updated is not None
+        assert updated.mailbox_message_id is None
+        assert any(entry["action"] == "mail-deleted" for entry in updated.history)
+
+
+def test_delete_failed_mail_handles_missing_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Users should see a helpful error when the mail is already gone."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {
+        "host": "imap.example.com",
+        "username": "user",
+        "password": "secret",
+    }
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    event = TrackedEvent(
+        uid="mail-error::1:inbox:99",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="99",
+        summary="Fehlerhafte Einladung",
+        organizer="orga@example.com",
+        status=EventStatus.FAILED,
+        response_status=EventResponseStatus.NONE,
+        mail_error="Kaputter Inhalt",
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    def fake_delete(_settings, _folder, _message_id):
+        return False
+
+    monkeypatch.setattr("backend.app.main.delete_message", fake_delete)
+
+    client = TestClient(app)
+    response = client.post(f"/events/{event.id}/delete-mail")
+    assert response.status_code == 404
+    assert "nicht gefunden" in response.json()["detail"]
+
+    with session_scope() as verify:
+        persisted = verify.get(TrackedEvent, event.id)
+        assert persisted is not None
+        assert persisted.mailbox_message_id == "99"
+        assert not any(entry["action"] == "mail-deleted" for entry in persisted.history or [])
+
+
 def test_list_events_handles_duplicate_caldav_targets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Listing events remains stable when different folders target the same calendar."""
     session = SessionLocal()

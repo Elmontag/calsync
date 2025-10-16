@@ -86,6 +86,40 @@ def _is_calendar_attachment(content_type: str, filename: Optional[str]) -> bool:
     return False
 
 
+def delete_message(settings: ImapSettings, folder: str, message_id: str) -> bool:
+    """Remove a message from the given folder by UID or Message-ID.
+
+    Returns ``True`` when the message was deleted (or already absent) and
+    ``False`` when no matching message could be located.
+    """
+
+    with ImapConnection(settings) as client:
+        logger.info("Deleting IMAP message %s from %s", message_id, folder)
+        client.select_folder(folder)
+
+        # Prefer using the numeric UID as it is stable for most servers.
+        try:
+            uid = int(message_id)
+        except (TypeError, ValueError):
+            uid = None
+
+        if uid is not None:
+            matches = client.search(["UID", str(uid)], uid=True)
+        else:
+            # Fall back to a Message-ID search when the identifier is not numeric.
+            matches = client.search(["HEADER", "Message-ID", message_id], uid=True)
+
+        if not matches:
+            logger.warning(
+                "Keine Nachricht %s in Ordner %s gefunden", message_id, folder
+            )
+            return False
+
+        client.delete_messages(matches, uid=True)
+        client.expunge()
+        return True
+
+
 class ImapConnection:
     """Context manager for IMAP operations."""
 

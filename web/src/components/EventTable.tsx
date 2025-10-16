@@ -26,6 +26,7 @@ interface Props {
     response: TrackedEvent['response_status'],
   ) => Promise<TrackedEvent>;
   onDisableTracking: (eventId: number) => Promise<TrackedEvent>;
+  onDeleteMail: (eventId: number) => Promise<TrackedEvent>;
   onResolveConflict: (
     eventId: number,
     payload: { action: string; selections?: Record<string, 'email' | 'calendar'> },
@@ -233,6 +234,7 @@ export default function EventTable({
   onAutoSyncIntervalChange,
   onRespondToEvent,
   onDisableTracking,
+  onDeleteMail,
   onResolveConflict,
   loading = false,
   onRefresh,
@@ -259,6 +261,7 @@ export default function EventTable({
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
   const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
+  const [mailActionId, setMailActionId] = useState<number | null>(null);
   const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
   const [activeMergeId, setActiveMergeId] = useState<number | null>(null);
   const [mergeSelections, setMergeSelections] = useState<MergeSelectionMap>({});
@@ -887,6 +890,9 @@ export default function EventTable({
     if (resolvingConflictId !== null) {
       return;
     }
+    if (mailActionId !== null) {
+      return;
+    }
     setResolvingConflictId(event.id);
     setSyncError(null);
     setSyncResult([]);
@@ -894,7 +900,7 @@ export default function EventTable({
     try {
       await onDisableTracking(event.id);
       const title = event.summary ?? event.uid;
-      setSyncNotice(`"${title}" wird nicht mehr automatisch verfolgt.`);
+      setSyncNotice(`"${title}" wird bei zukünftigen Scans ignoriert.`);
       resetMerge(event.id);
       await onRefresh();
     } catch (error) {
@@ -902,6 +908,30 @@ export default function EventTable({
       setSyncError('Tracking konnte nicht deaktiviert werden.');
     } finally {
       setResolvingConflictId(null);
+    }
+  }
+
+  async function handleDeleteMail(event: TrackedEvent) {
+    if (mailActionId !== null) {
+      return;
+    }
+    if (resolvingConflictId !== null) {
+      return;
+    }
+    setMailActionId(event.id);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      const updated = await onDeleteMail(event.id);
+      const title = updated.summary ?? updated.uid;
+      setSyncNotice(`E-Mail für "${title}" wurde im Postfach gelöscht.`);
+      await onRefresh();
+    } catch (error) {
+      console.error('Konnte E-Mail nicht löschen.', error);
+      setSyncError('Die E-Mail konnte nicht gelöscht werden.');
+    } finally {
+      setMailActionId(null);
     }
   }
 
@@ -1265,6 +1295,8 @@ export default function EventTable({
             const differencesExpanded = expandedDifferences[event.id] ?? false;
             const isSelectable = !hasSyncConflict && event.status !== 'failed';
             const historyEntries = sortHistoryEntries(event.history ?? []);
+            const deletingMail = mailActionId === event.id;
+            const disablingTracking = resolvingConflictId === event.id;
             return (
               <div
                 key={event.id}
@@ -1362,8 +1394,35 @@ export default function EventTable({
                           {event.mail_error ?? 'Der Kalenderinhalt dieser E-Mail konnte nicht verarbeitet werden.'}
                         </p>
                         <p className="mt-2 text-rose-100/60">
-                          Deaktiviere das Tracking, um diese Nachricht bei zukünftigen Scans zu überspringen.
+                          Lösche die Nachricht oder schließe sie vom zukünftigen Tracking aus, um weitere Fehler zu
+                          vermeiden.
                         </p>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteMail(event)}
+                            disabled={deletingMail || disablingTracking}
+                            className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-rose-300/60 ${
+                              deletingMail || disablingTracking
+                                ? 'cursor-progress bg-rose-500/30 text-rose-200/80'
+                                : 'bg-rose-500 text-rose-950 hover:bg-rose-400'
+                            }`}
+                          >
+                            {deletingMail ? 'Wird gelöscht…' : 'Mail im Postfach löschen'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDisableTracking(event)}
+                            disabled={deletingMail || disablingTracking}
+                            className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-rose-300/60 ${
+                              deletingMail || disablingTracking
+                                ? 'cursor-progress border-rose-400/40 text-rose-200/70'
+                                : 'border-rose-400/60 text-rose-100 hover:border-rose-300 hover:bg-rose-900/40'
+                            }`}
+                          >
+                            {disablingTracking ? 'Wird ausgeschlossen…' : 'Vom Tracking ausschließen'}
+                          </button>
+                        </div>
                       </div>
                     )}
                     {event.attendees.length > 0 && (

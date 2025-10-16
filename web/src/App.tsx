@@ -26,6 +26,7 @@ function App() {
     respondToEvent,
     loadAutoSync,
     disableTracking,
+    deleteMail,
     resolveConflict,
   } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
@@ -123,6 +124,7 @@ function App() {
               onAutoSyncIntervalChange={setAutoSyncInterval}
               onRespondToEvent={respondToEvent}
               onDisableTracking={disableTracking}
+              onDeleteMail={deleteMail}
               onResolveConflict={resolveConflict}
               onRefresh={refresh}
               autoSyncJob={autoSync.active_job ?? null}
