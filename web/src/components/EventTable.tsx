@@ -55,12 +55,11 @@ const statusStyleMap: Record<TrackedEvent['status'], string> = {
   failed: 'bg-rose-600/20 text-rose-200',
 };
 
-const statusFilterOptions: Array<{ value: TrackedEvent['status']; label: string }> = [
-  { value: 'new', label: statusLabelMap.new },
-  { value: 'updated', label: statusLabelMap.updated },
-  { value: 'cancelled', label: statusLabelMap.cancelled },
-  { value: 'synced', label: statusLabelMap.synced },
-  { value: 'failed', label: statusLabelMap.failed },
+const responseFilterOptions: Array<{ value: TrackedEvent['response_status']; label: string }> = [
+  { value: 'accepted', label: 'Zugesagt' },
+  { value: 'declined', label: 'Abgesagt' },
+  { value: 'tentative', label: 'Vielleicht' },
+  { value: 'none', label: 'Antwort offen' },
 ];
 
 const responseLabelMap: Record<TrackedEvent['response_status'], string> = {
@@ -94,6 +93,16 @@ const responseActions: Array<{
 ];
 
 type SortOption = 'email-desc' | 'email-asc' | 'event-asc' | 'event-desc' | 'none';
+
+type KpiKey = 'outstanding' | 'processed' | 'calendarConflicts' | 'failedImports' | 'syncConflicts';
+
+const KPI_FILTERS: Record<KpiKey, (event: TrackedEvent) => boolean> = {
+  outstanding: (event) => event.status === 'new' || event.status === 'updated',
+  processed: (event) => event.status === 'synced',
+  calendarConflicts: (event) => (event.conflicts?.length ?? 0) > 0,
+  failedImports: (event) => event.status === 'failed',
+  syncConflicts: (event) => event.sync_state?.has_conflict ?? false,
+};
 
 const sortOptionItems: Array<{ value: SortOption; label: string }> = [
   { value: 'email-desc', label: 'E-Mail-Datum (neueste zuerst)' },
@@ -255,8 +264,8 @@ export default function EventTable({
   const [respondingId, setRespondingId] = useState<number | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortOption, setSortOption] = useState<SortOption>('email-desc');
-  const [statusFilters, setStatusFilters] = useState<TrackedEvent['status'][]>([]);
-  const [syncConflictFilter, setSyncConflictFilter] = useState<'all' | 'sync-only'>('all');
+  const [responseFilters, setResponseFilters] = useState<TrackedEvent['response_status'][]>([]);
+  const [activeKpi, setActiveKpi] = useState<KpiKey | null>(null);
   const [intervalInput, setIntervalInput] = useState(String(autoSyncIntervalMinutes));
   const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
@@ -291,8 +300,8 @@ export default function EventTable({
   }, [events]);
 
   useEffect(() => {
-    setStatusFilters((prev) =>
-      prev.filter((status) => events.some((event) => event.status === status)),
+    setResponseFilters((prev) =>
+      prev.filter((status) => events.some((event) => event.response_status === status)),
     );
   }, [events]);
 
@@ -302,19 +311,19 @@ export default function EventTable({
 
   useEffect(() => {
     setPage(1);
-  }, [searchTerm, statusFilters, sortOption, pageSize, syncConflictFilter]);
+  }, [searchTerm, responseFilters, sortOption, pageSize, activeKpi]);
 
   // Compose the visible event list by applying search, status filters and sorting preferences.
   const filteredEvents = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
     const hasTerm = term.length > 0;
-    const statusSet = new Set(statusFilters);
+    const responseSet = new Set(responseFilters);
 
     const filtered = events.filter((event) => {
-      if (statusSet.size > 0 && !statusSet.has(event.status)) {
+      if (activeKpi && !KPI_FILTERS[activeKpi](event)) {
         return false;
       }
-      if (syncConflictFilter === 'sync-only' && !(event.sync_state?.has_conflict ?? false)) {
+      if (responseSet.size > 0 && !responseSet.has(event.response_status)) {
         return false;
       }
       if (!hasTerm) {
@@ -355,7 +364,7 @@ export default function EventTable({
     }
 
     return sorted;
-  }, [events, searchTerm, statusFilters, sortOption, syncConflictFilter]);
+  }, [events, searchTerm, responseFilters, sortOption, activeKpi]);
 
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(filteredEvents.length / pageSize));
@@ -375,35 +384,66 @@ export default function EventTable({
   }, [totalPages]);
 
   // Aggregate key performance indicators for the overview widgets.
-  const metrics = useMemo(() => {
-    const outstanding = events.filter(
-      (event) => event.status === 'new' || event.status === 'updated',
-    ).length;
-    const processed = events.filter((event) => event.status === 'synced').length;
-    const cancelled = events.filter((event) => event.status === 'cancelled').length;
-    const awaitingDecision = events.filter(
-      (event) =>
-        event.response_status === 'none' &&
-        event.status !== 'cancelled' &&
-        event.status !== 'failed',
-    ).length;
-    const conflicts = events.filter((event) => (event.conflicts?.length ?? 0) > 0).length;
-    const syncConflicts = events.filter((event) => event.sync_state?.has_conflict).length;
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    const todayEnd = new Date();
-    todayEnd.setHours(23, 59, 59, 999);
-    const today = events.filter((event) => {
-      if (!event.start) {
-        return false;
-      }
-      const startDate = new Date(event.start);
-      return startDate >= todayStart && startDate <= todayEnd;
-    }).length;
-    return { outstanding, processed, cancelled, awaitingDecision, today, conflicts, syncConflicts };
-  }, [events]);
+  const metrics = useMemo(
+    () => ({
+      outstanding: events.filter(KPI_FILTERS.outstanding).length,
+      processed: events.filter(KPI_FILTERS.processed).length,
+      calendarConflicts: events.filter(KPI_FILTERS.calendarConflicts).length,
+      failedImports: events.filter(KPI_FILTERS.failedImports).length,
+      syncConflicts: events.filter(KPI_FILTERS.syncConflicts).length,
+    }),
+    [events],
+  );
 
-  const showOnlySyncConflicts = syncConflictFilter === 'sync-only';
+  useEffect(() => {
+    if (activeKpi && metrics[activeKpi] === 0) {
+      setActiveKpi(null);
+    }
+  }, [activeKpi, metrics]);
+
+  const kpiItems: Array<{
+    key: KpiKey;
+    label: string;
+    count: number;
+    accent: string;
+    description?: string;
+  }> = [
+    {
+      key: 'outstanding',
+      label: 'Ausstehend',
+      count: metrics.outstanding,
+      accent: 'text-slate-100',
+      description: 'Offene Mails mit noch nicht übernommenen Änderungen.',
+    },
+    {
+      key: 'processed',
+      label: 'Verarbeitet',
+      count: metrics.processed,
+      accent: 'text-emerald-400',
+      description: 'Mails, deren Termine bereits synchronisiert wurden.',
+    },
+    {
+      key: 'failedImports',
+      label: 'Fehlerhafte Mailimporte',
+      count: metrics.failedImports,
+      accent: 'text-rose-300',
+      description: 'Mails, die nicht importiert werden konnten.',
+    },
+    {
+      key: 'calendarConflicts',
+      label: 'Kalender-Konflikte',
+      count: metrics.calendarConflicts,
+      accent: 'text-amber-300',
+      description: 'Termine mit Konflikten im Zielkalender.',
+    },
+    {
+      key: 'syncConflicts',
+      label: 'Sync-Konflikte',
+      count: metrics.syncConflicts,
+      accent: 'text-rose-300',
+      description: 'Konflikte zwischen Mail-Import und Kalenderdaten.',
+    },
+  ];
 
   function toggleSelection(id: number) {
     setSelected((prev) =>
@@ -421,18 +461,18 @@ export default function EventTable({
     setSortOption(event.target.value as SortOption);
   }
 
-  function toggleStatusFilter(status: TrackedEvent['status']) {
-    setStatusFilters((prev) =>
+  function toggleResponseFilter(status: TrackedEvent['response_status']) {
+    setResponseFilters((prev) =>
       prev.includes(status) ? prev.filter((item) => item !== status) : [...prev, status],
     );
   }
 
-  function toggleSyncConflictFilter() {
-    setSyncConflictFilter((prev) => (prev === 'sync-only' ? 'all' : 'sync-only'));
+  function toggleKpiFilter(key: KpiKey) {
+    setActiveKpi((prev) => (prev === key ? null : key));
   }
 
-  function resetStatusFilters() {
-    setStatusFilters([]);
+  function resetResponseFilters() {
+    setResponseFilters([]);
   }
 
   function handlePageSizeChange(event: ChangeEvent<HTMLSelectElement>) {
@@ -1039,195 +1079,132 @@ export default function EventTable({
 
   return (
     <div className="space-y-6">
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Ausstehend</p>
-          <p className="mt-1 text-2xl font-semibold text-slate-100">{metrics.outstanding}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Verarbeitet</p>
-          <p className="mt-1 text-2xl font-semibold text-emerald-400">{metrics.processed}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Abgesagt</p>
-          <p className="mt-1 text-2xl font-semibold text-rose-300">{metrics.cancelled}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Antwort offen</p>
-          <p className="mt-1 text-2xl font-semibold text-amber-300">{metrics.awaitingDecision}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Heute</p>
-          <p className="mt-1 text-2xl font-semibold text-sky-300">{metrics.today}</p>
-        </div>
-        <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-          <p className="text-xs uppercase tracking-wide text-slate-500">Kalender-Konflikte</p>
-          <p className="mt-1 text-2xl font-semibold text-amber-300">{metrics.conflicts}</p>
-          <p className="mt-2 text-xs text-slate-400">
-            Sync-Konflikte:{' '}
-            <span className="font-semibold text-rose-300">{metrics.syncConflicts}</span>
-          </p>
-        </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+        {kpiItems.map((item) => {
+          const isActive = activeKpi === item.key;
+          return (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => toggleKpiFilter(item.key)}
+              aria-pressed={isActive}
+              className={`rounded-xl border p-4 text-left transition focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 focus:ring-offset-slate-950 ${
+                isActive
+                  ? 'border-emerald-400/80 bg-emerald-500/10 shadow-lg shadow-emerald-500/20'
+                  : 'border-slate-800 bg-slate-900 hover:border-emerald-400/60 hover:bg-slate-900/80'
+              }`}
+            >
+              <p className="text-xs uppercase tracking-wide text-slate-500">{item.label}</p>
+              <p className={`mt-1 text-2xl font-semibold ${item.accent}`}>{item.count}</p>
+              {item.description ? (
+                <p className="mt-2 text-xs text-slate-400">{item.description}</p>
+              ) : null}
+            </button>
+          );
+        })}
       </div>
 
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex flex-col gap-4">
+            <div>
+              <p className="text-sm font-semibold text-slate-100">Manuelle Synchronisation</p>
+              <p className="mt-1 text-xs text-slate-400">
+                Starte Scans und Synchronisationen bei Bedarf, um Postfächer und Termine sofort zu aktualisieren.
+              </p>
+            </div>
             <div className="flex flex-wrap items-center gap-2">
               <button
                 onClick={handleScan}
-              disabled={busy}
-              className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-700 disabled:opacity-40"
-            >
-              Postfächer scannen
-            </button>
-            <button
-              onClick={handleSyncAll}
-              disabled={busy}
-              className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-sky-950 transition hover:bg-sky-500 disabled:opacity-40"
-            >
-              Alle synchronisieren
-            </button>
-            <button
-              onClick={handleAutoSyncToggle}
-              disabled={busy}
-              className={`rounded-lg px-4 py-2 text-sm font-semibold transition disabled:opacity-40 ${
-                autoSyncEnabled
-                  ? 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400'
-                  : 'bg-slate-800 text-slate-100 hover:bg-slate-700'
-              }`}
-            >
-              {autoSyncEnabled ? 'AutoSync deaktivieren' : 'AutoSync aktivieren'}
-            </button>
-            <button
-              onClick={handleSyncSelection}
-              disabled={selected.length === 0 || busy}
-              className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:opacity-50"
-            >
-              Auswahl synchronisieren ({selected.length})
-            </button>
-          </div>
-          <div className="flex flex-wrap items-center gap-4">
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
-              <input
-                type="checkbox"
-                className="h-4 w-4 rounded border-slate-600 bg-slate-950"
-                checked={autoSyncResponse === 'accepted'}
-                onChange={handleAutoResponseToggle}
                 disabled={busy}
-              />
-              <span>AutoSync sagt Termine automatisch zu</span>
-            </label>
-            <label className="flex items-center gap-2 text-xs text-slate-300">
-              <span>AutoSync-Intervall (Minuten)</span>
-              <input
-                type="number"
-                min={1}
-                max={720}
-                step={1}
-                value={intervalInput}
-                onChange={handleAutoSyncIntervalInput}
-                onBlur={handleAutoSyncIntervalBlur}
-                onKeyDown={handleAutoSyncIntervalKeyDown}
-                disabled={busy}
-                className="w-24 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none disabled:opacity-50"
-                aria-label="AutoSync-Intervall in Minuten"
-              />
-            </label>
-            <div className="relative">
-              <input
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-                className="w-64 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-emerald-400 focus:outline-none"
-                placeholder="Termine suchen…"
-                />
-              </div>
-            </div>
-          </div>
-          <div className="mt-3 flex flex-col gap-3 border-t border-slate-800 pt-3 md:flex-row md:items-center md:justify-between">
-            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
-              <label className="flex items-center gap-2">
-                <span className="font-semibold uppercase tracking-wide text-slate-400">Sortierung</span>
-                <select
-                  value={sortOption}
-                  onChange={handleSortChange}
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
-                >
-                  {sortOptionItems.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="flex items-center gap-2">
-                <span className="font-semibold uppercase tracking-wide text-slate-400">Termine pro Seite</span>
-                <select
-                  value={pageSize}
-                  onChange={handlePageSizeChange}
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
-                >
-                  {PAGE_SIZE_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Statusfilter</span>
-              <button
-                type="button"
-                onClick={resetStatusFilters}
-                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                  statusFilters.length === 0
-                    ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
-                    : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
-                }`}
+                className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-700 disabled:opacity-40"
               >
-                Alle Stati
+                Postfächer scannen
               </button>
-              {statusFilterOptions.map((option) => {
-                const active = statusFilters.includes(option.value);
-                return (
-                  <button
-                    key={option.value}
-                    type="button"
-                    onClick={() => toggleStatusFilter(option.value)}
-                    className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                      active
-                        ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
-                        : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
-                    }`}
-                  >
-                    {option.label}
-                  </button>
-                );
-              })}
               <button
-                type="button"
-                onClick={toggleSyncConflictFilter}
-                aria-pressed={showOnlySyncConflicts}
-                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                  showOnlySyncConflicts
-                    ? 'border-rose-400 bg-rose-500/20 text-rose-200'
-                    : 'border-slate-700 text-slate-300 hover:border-rose-400 hover:text-rose-200'
-                }`}
+                onClick={handleSyncAll}
+                disabled={busy}
+                className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-sky-950 transition hover:bg-sky-500 disabled:opacity-40"
               >
-                Nur Sync-Konflikte
+                Alle synchronisieren
+              </button>
+              <button
+                onClick={handleSyncSelection}
+                disabled={selected.length === 0 || busy}
+                className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:opacity-50"
+              >
+                Auswahl synchronisieren ({selected.length})
               </button>
             </div>
           </div>
         </div>
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-slate-100">AutoSync</p>
+                <p className="text-xs text-slate-400">
+                  Steuere Intervall und Antwortverhalten für die automatische Synchronisation.
+                </p>
+              </div>
+              <button
+                onClick={handleAutoSyncToggle}
+                disabled={busy}
+                className={`mt-2 rounded-lg px-4 py-2 text-sm font-semibold transition disabled:opacity-40 sm:mt-0 ${
+                  autoSyncEnabled
+                    ? 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400'
+                    : 'bg-slate-800 text-slate-100 hover:bg-slate-700'
+                }`}
+              >
+                {autoSyncEnabled ? 'AutoSync deaktivieren' : 'AutoSync aktivieren'}
+              </button>
+            </div>
+            <div className="flex flex-col gap-3 text-xs text-slate-300">
+              <label className="flex cursor-pointer items-center gap-2">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                  checked={autoSyncResponse === 'accepted'}
+                  onChange={handleAutoResponseToggle}
+                  disabled={busy}
+                />
+                <span>AutoSync sagt Termine automatisch zu</span>
+              </label>
+              <label className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+                <span className="text-xs uppercase tracking-wide text-slate-400">Intervall (Minuten)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={720}
+                  step={1}
+                  value={intervalInput}
+                  onChange={handleAutoSyncIntervalInput}
+                  onBlur={handleAutoSyncIntervalBlur}
+                  onKeyDown={handleAutoSyncIntervalKeyDown}
+                  disabled={busy}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none disabled:opacity-50 sm:w-28"
+                  aria-label="AutoSync-Intervall in Minuten"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
 
-        {(scanJob || syncAllJob || selectionJob || autoJob) && (
-          <div className="space-y-3">
+      {(scanJob || syncAllJob || selectionJob || autoJob) && (
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm font-semibold text-slate-100">Laufende Jobs</p>
+            <p className="text-xs text-slate-400">Überblick über Fortschritt und Status aktueller Prozesse.</p>
+          </div>
+          <div className="mt-3 space-y-3">
             {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
             {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
             {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
             {renderJobProgress(autoJob, 'AutoSync', 'bg-emerald-300')}
           </div>
-        )}
+        </div>
+      )}
 
       {syncError && (
         <div className="rounded-lg border border-rose-700 bg-rose-500/10 p-4 text-sm text-rose-200">
@@ -1263,6 +1240,71 @@ export default function EventTable({
               </ul>
             </div>
           )}
+        </div>
+      )}
+
+      {!showInitialLoading && (
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="flex flex-wrap items-center gap-4 text-xs text-slate-300">
+              <label className="flex items-center gap-2">
+                <span className="font-semibold uppercase tracking-wide text-slate-400">Sortierung</span>
+                <select
+                  value={sortOption}
+                  onChange={handleSortChange}
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+                >
+                  {sortOptionItems.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="flex flex-1 flex-col gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Terminstatus</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={resetResponseFilters}
+                  className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                    responseFilters.length === 0
+                      ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                      : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
+                  }`}
+                >
+                  Alle Terminstatus
+                </button>
+                {responseFilterOptions.map((option) => {
+                  const active = responseFilters.includes(option.value);
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => toggleResponseFilter(option.value)}
+                      className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                        active
+                          ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                          : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="flex w-full flex-col gap-1 lg:w-56">
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Suche</span>
+              <input
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-emerald-400 focus:outline-none"
+                placeholder="Termine suchen…"
+              />
+            </div>
+          </div>
         </div>
       )}
 
@@ -1739,32 +1781,48 @@ export default function EventTable({
       )}
 
       {!showEmptyState && totalEvents > 0 && (
-        <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <span>
-              Zeige {pageStart}–{pageEnd} von {totalEvents} Terminen
-            </span>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-stretch sm:justify-between">
+          <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <span>
+                Zeige {pageStart}–{pageEnd} von {totalEvents} Terminen
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <button
+                type="button"
+                onClick={goToPreviousPage}
+                disabled={page === 1}
+                className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+              >
+                Vorherige Seite
+              </button>
+              <span className="px-2 py-1 text-slate-400">
+                Seite {page} von {totalPages}
+              </span>
+              <button
+                type="button"
+                onClick={goToNextPage}
+                disabled={page === totalPages || totalEvents === 0}
+                className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+              >
+                Nächste Seite
+              </button>
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <button
-              type="button"
-              onClick={goToPreviousPage}
-              disabled={page === 1}
-              className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300 sm:w-60">
+            <span className="font-semibold uppercase tracking-wide text-slate-400">Termine pro Seite</span>
+            <select
+              value={pageSize}
+              onChange={handlePageSizeChange}
+              className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
             >
-              Vorherige Seite
-            </button>
-            <span className="px-2 py-1 text-slate-400">
-              Seite {page} von {totalPages}
-            </span>
-            <button
-              type="button"
-              onClick={goToNextPage}
-              disabled={page === totalPages || totalEvents === 0}
-              className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
-            >
-              Nächste Seite
-            </button>
+              {PAGE_SIZE_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
       )}
