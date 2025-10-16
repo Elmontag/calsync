@@ -410,12 +410,20 @@ def _build_merged_payload(
     for field, property_name in allowed_fields.items():
         source = normalized.get(field, "calendar")
         source_component = local_component if source == "email" else remote_component
-        try:
-            if property_name in remote_component:
-                del remote_component[property_name]
-        except KeyError:
-            pass
+
+        # Preserve the remote values unless the user explicitly chose the
+        # E-Mail-Import as the source. Deleting the property ahead of time would
+        # otherwise wipe the CalDAV payload even if "Kalenderdaten" was
+        # selected.
         value = source_component.get(property_name)
+
+        if source == "email":
+            try:
+                if property_name in remote_component:
+                    del remote_component[property_name]
+            except KeyError:
+                pass
+
         if value is not None:
             remote_component[property_name] = value
 

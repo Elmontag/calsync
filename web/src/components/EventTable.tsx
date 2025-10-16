@@ -36,6 +36,8 @@ interface Props {
   onLoadAutoSync: () => Promise<void>;
 }
 
+type MergeSelectionMap = Record<number, Record<string, 'email' | 'calendar'>>;
+
 const statusLabelMap: Record<TrackedEvent['status'], string> = {
   new: 'Neu',
   updated: 'Aktualisiert',
@@ -256,9 +258,7 @@ export default function EventTable({
   const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
   const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
   const [activeMergeId, setActiveMergeId] = useState<number | null>(null);
-  const [mergeSelections, setMergeSelections] = useState<
-    Record<number, Record<string, 'email' | 'calendar'>
-  >({});
+  const [mergeSelections, setMergeSelections] = useState<MergeSelectionMap>({});
   const pollersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -911,9 +911,10 @@ export default function EventTable({
     differences.forEach((difference) => {
       defaults[difference.field] = difference.field === 'response_status' ? 'email' : 'calendar';
     });
-    setMergeSelections({
+    setMergeSelections((prev) => ({
+      ...prev,
       [event.id]: defaults,
-    });
+    }));
     setActiveMergeId(event.id);
     setExpandedDifferences((prev) => ({
       ...prev,
