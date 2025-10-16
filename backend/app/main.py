@@ -21,6 +21,7 @@ from .models import (
     AccountType,
     EventResponseStatus,
     EventStatus,
+    IgnoredMailImport,
     ImapFolder,
     SyncMapping,
     TrackedEvent,
@@ -104,6 +105,82 @@ def _active_auto_sync_job() -> Optional[SyncJobStatus]:
     if state is None:
         return None
     return state.to_status()
+
+
+def _parse_mail_uid(message_id: str | None) -> Optional[int]:
+    """Attempt to convert a message identifier to an IMAP UID integer."""
+
+    if not message_id:
+        return None
+    try:
+        value = int(str(message_id).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _record_ignored_mail_import(db: Session, event: TrackedEvent) -> None:
+    """Persist ignore markers to suppress future imports from the same message."""
+
+    message_id = event.mailbox_message_id
+    if not message_id:
+        return
+
+    marker_uid = _parse_mail_uid(message_id)
+    markers = (
+        db.execute(
+            select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+        )
+        .scalars()
+        .all()
+    )
+
+    def _scope_matches(marker: IgnoredMailImport) -> bool:
+        account_matches = marker.account_id is None or marker.account_id == event.source_account_id
+        folder_matches = marker.folder is None or marker.folder == event.source_folder
+        return account_matches and folder_matches
+
+    scoped_markers = [marker for marker in markers if _scope_matches(marker)]
+    matching_marker = next(
+        (marker for marker in scoped_markers if marker.message_id == message_id),
+        None,
+    )
+    if matching_marker:
+        if marker_uid is not None and (
+            matching_marker.max_uid is None or marker_uid > matching_marker.max_uid
+        ):
+            matching_marker.max_uid = marker_uid
+            db.add(matching_marker)
+            logger.info(
+                "Raised ignore threshold for %s to UID %s", event.uid, marker_uid
+            )
+        return
+
+    marker = IgnoredMailImport(
+        event_id=event.id,
+        account_id=event.source_account_id,
+        folder=event.source_folder,
+        message_id=message_id,
+        max_uid=marker_uid,
+    )
+    db.add(marker)
+    logger.info(
+        "Marked message %s as ignored for event %s", message_id, event.uid
+    )
+
+    if marker_uid is None:
+        return
+
+    for scoped_marker in scoped_markers:
+        if scoped_marker.max_uid is None or marker_uid > scoped_marker.max_uid:
+            scoped_marker.max_uid = marker_uid
+            db.add(scoped_marker)
+            logger.info(
+                "Propagated ignore threshold UID %s to marker %s for event %s",
+                marker_uid,
+                scoped_marker.id,
+                event.uid,
+            )
 
 
 def _ensure_timezone(value: Optional[datetime]) -> Optional[datetime]:
@@ -1599,6 +1676,7 @@ def resolve_event_conflict(
                 ),
             },
         )
+        _record_ignored_mail_import(db, event)
         db.add(event)
         db.commit()
         db.refresh(event)
@@ -1675,6 +1753,7 @@ def resolve_event_conflict(
             },
         )
         event_processor.annotate_response(event)
+        _record_ignored_mail_import(db, event)
         db.add(event)
         db.commit()
         db.refresh(event)
