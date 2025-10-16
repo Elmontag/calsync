@@ -212,4 +212,4 @@ Antworten liefern jeweils das aktualisierte `TrackedEvent` inklusive Feldern wie
 
 ## Lizenz
 
-MIT-Lizenz (siehe `LICENSE`, falls vorhanden).
+GNU General Public License v3.0 (siehe `LICENSE`)
