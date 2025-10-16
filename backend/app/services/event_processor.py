@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -77,7 +78,7 @@ def upsert_events(
                     response_status=parsed.response_status or EventResponseStatus.NONE,
                     cancelled_by_organizer=cancelled_by_organizer,
                     mailbox_message_id=source_message_id,
-                    payload=parsed.event.to_ical().decode(),
+                    payload=_serialize_parsed_event(parsed),
                     history=[history_entry],
                     local_version=1,
                     synced_version=0,
@@ -151,7 +152,7 @@ def upsert_events(
                     stored_events.append(event)
                     continue
 
-                new_payload = parsed.event.to_ical().decode()
+                new_payload = _serialize_parsed_event(parsed)
                 previous_status = event.status
                 content_changed = False
                 metadata_changed = False
@@ -601,18 +602,63 @@ def _apply_remote_snapshot(
     logger.info("Updated local event %s from CalDAV changes", event.uid)
 
 
-def event_payload_to_ical(event: TrackedEvent):
+_DEFAULT_PRODID = "-//CalSync//DE"
+
+
+def _base_calendar():
     from icalendar import Calendar
 
-    cal = Calendar.from_ical(event.payload)
-    return cal
+    calendar = Calendar()
+    calendar.add("PRODID", _DEFAULT_PRODID)
+    calendar.add("VERSION", "2.0")
+    calendar.add("CALSCALE", "GREGORIAN")
+    return calendar
+
+
+def _serialize_parsed_event(parsed: ParsedEvent) -> str:
+    calendar = _base_calendar()
+    for timezone_component in parsed.timezone_components:
+        calendar.add_component(deepcopy(timezone_component))
+    calendar.add_component(deepcopy(parsed.event))
+    return calendar.to_ical().decode()
+
+
+def _load_calendar_from_payload(payload) -> "Calendar":
+    from icalendar import Calendar
+
+    if payload is None:
+        raw_payload = b""
+    elif isinstance(payload, bytes):
+        raw_payload = payload
+    else:
+        raw_payload = str(payload).encode()
+
+    if not raw_payload.strip():
+        return _base_calendar()
+
+    parsed = Calendar.from_ical(raw_payload)
+    if isinstance(parsed, Calendar):
+        calendar = parsed
+    else:
+        calendar = _base_calendar()
+        calendar.add_component(deepcopy(parsed))
+
+    if not calendar.get("PRODID"):
+        calendar.add("PRODID", _DEFAULT_PRODID)
+    if not calendar.get("VERSION"):
+        calendar.add("VERSION", "2.0")
+    if not calendar.get("CALSCALE"):
+        calendar.add("CALSCALE", "GREGORIAN")
+    return calendar
+
+
+def event_payload_to_ical(event: TrackedEvent):
+    return _load_calendar_from_payload(event.payload)
 
 
 def annotate_response(event: TrackedEvent) -> None:
     """Embed the stored response status within the ICS payload for CalDAV."""
-    from icalendar import Calendar
-
-    calendar = Calendar.from_ical(event.payload)
+    calendar = _load_calendar_from_payload(event.payload)
     updated = False
     for component in calendar.walk("VEVENT"):
         component["X-CALSYNC-RESPONSE"] = event.response_status.value.upper()

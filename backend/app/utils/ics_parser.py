@@ -1,6 +1,7 @@
 """Utility helpers to parse ICS payloads."""
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import date, datetime, time, timezone
 from typing import Iterable, List, Optional
@@ -26,6 +27,7 @@ class ParsedEvent(BaseModel):
     location: Optional[str] = None
     description: Optional[str] = None
     attendees: List[dict] = Field(default_factory=list)
+    timezone_components: List = Field(default_factory=list)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -35,6 +37,11 @@ def parse_ics_payload(payload: bytes) -> List[ParsedEvent]:
     calendar = Calendar.from_ical(payload)
     method_raw = calendar.get("METHOD")
     method = str(method_raw).upper() if method_raw else None
+    timezone_components = [
+        component
+        for component in calendar.walk()
+        if getattr(component, "name", "").upper() == "VTIMEZONE"
+    ]
     events: List[ParsedEvent] = []
     for component in calendar.walk("VEVENT"):
         uid = str(component.get("UID"))
@@ -97,6 +104,7 @@ def parse_ics_payload(payload: bytes) -> List[ParsedEvent]:
                 location=str(component.get("LOCATION")) if component.get("LOCATION") else None,
                 description=str(component.get("DESCRIPTION")) if component.get("DESCRIPTION") else None,
                 attendees=attendees_info,
+                timezone_components=[copy.deepcopy(item) for item in timezone_components],
             )
         )
     logger.debug("Parsed %s events from ICS", len(events))
