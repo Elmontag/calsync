@@ -1104,152 +1104,107 @@ export default function EventTable({
         })}
       </div>
 
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex flex-col gap-4">
+            <div>
+              <p className="text-sm font-semibold text-slate-100">Manuelle Synchronisation</p>
+              <p className="mt-1 text-xs text-slate-400">
+                Starte Scans und Synchronisationen bei Bedarf, um Postfächer und Termine sofort zu aktualisieren.
+              </p>
+            </div>
             <div className="flex flex-wrap items-center gap-2">
               <button
                 onClick={handleScan}
-              disabled={busy}
-              className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-700 disabled:opacity-40"
-            >
-              Postfächer scannen
-            </button>
-            <button
-              onClick={handleSyncAll}
-              disabled={busy}
-              className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-sky-950 transition hover:bg-sky-500 disabled:opacity-40"
-            >
-              Alle synchronisieren
-            </button>
-            <button
-              onClick={handleAutoSyncToggle}
-              disabled={busy}
-              className={`rounded-lg px-4 py-2 text-sm font-semibold transition disabled:opacity-40 ${
-                autoSyncEnabled
-                  ? 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400'
-                  : 'bg-slate-800 text-slate-100 hover:bg-slate-700'
-              }`}
-            >
-              {autoSyncEnabled ? 'AutoSync deaktivieren' : 'AutoSync aktivieren'}
-            </button>
-            <button
-              onClick={handleSyncSelection}
-              disabled={selected.length === 0 || busy}
-              className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:opacity-50"
-            >
-              Auswahl synchronisieren ({selected.length})
-            </button>
-          </div>
-          <div className="flex flex-wrap items-center gap-4">
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
-              <input
-                type="checkbox"
-                className="h-4 w-4 rounded border-slate-600 bg-slate-950"
-                checked={autoSyncResponse === 'accepted'}
-                onChange={handleAutoResponseToggle}
                 disabled={busy}
-              />
-              <span>AutoSync sagt Termine automatisch zu</span>
-            </label>
-            <label className="flex items-center gap-2 text-xs text-slate-300">
-              <span>AutoSync-Intervall (Minuten)</span>
-              <input
-                type="number"
-                min={1}
-                max={720}
-                step={1}
-                value={intervalInput}
-                onChange={handleAutoSyncIntervalInput}
-                onBlur={handleAutoSyncIntervalBlur}
-                onKeyDown={handleAutoSyncIntervalKeyDown}
-                disabled={busy}
-                className="w-24 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none disabled:opacity-50"
-                aria-label="AutoSync-Intervall in Minuten"
-              />
-            </label>
-            <div className="relative">
-              <input
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-                className="w-64 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-emerald-400 focus:outline-none"
-                placeholder="Termine suchen…"
-                />
-              </div>
-            </div>
-          </div>
-          <div className="mt-3 flex flex-col gap-3 border-t border-slate-800 pt-3 md:flex-row md:items-center md:justify-between">
-            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
-              <label className="flex items-center gap-2">
-                <span className="font-semibold uppercase tracking-wide text-slate-400">Sortierung</span>
-                <select
-                  value={sortOption}
-                  onChange={handleSortChange}
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
-                >
-                  {sortOptionItems.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="flex items-center gap-2">
-                <span className="font-semibold uppercase tracking-wide text-slate-400">Termine pro Seite</span>
-                <select
-                  value={pageSize}
-                  onChange={handlePageSizeChange}
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
-                >
-                  {PAGE_SIZE_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Terminstatus</span>
-              <button
-                type="button"
-                onClick={resetResponseFilters}
-                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                  responseFilters.length === 0
-                    ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
-                    : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
-                }`}
+                className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-700 disabled:opacity-40"
               >
-                Alle Terminstatus
+                Postfächer scannen
               </button>
-              {responseFilterOptions.map((option) => {
-                const active = responseFilters.includes(option.value);
-                return (
-                  <button
-                    key={option.value}
-                    type="button"
-                    onClick={() => toggleResponseFilter(option.value)}
-                    className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                      active
-                        ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
-                        : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
-                    }`}
-                  >
-                    {option.label}
-                  </button>
-                );
-              })}
+              <button
+                onClick={handleSyncAll}
+                disabled={busy}
+                className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-sky-950 transition hover:bg-sky-500 disabled:opacity-40"
+              >
+                Alle synchronisieren
+              </button>
+              <button
+                onClick={handleSyncSelection}
+                disabled={selected.length === 0 || busy}
+                className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:opacity-50"
+              >
+                Auswahl synchronisieren ({selected.length})
+              </button>
             </div>
           </div>
         </div>
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-slate-100">AutoSync</p>
+                <p className="text-xs text-slate-400">
+                  Steuere Intervall und Antwortverhalten für die automatische Synchronisation.
+                </p>
+              </div>
+              <button
+                onClick={handleAutoSyncToggle}
+                disabled={busy}
+                className={`mt-2 rounded-lg px-4 py-2 text-sm font-semibold transition disabled:opacity-40 sm:mt-0 ${
+                  autoSyncEnabled
+                    ? 'bg-emerald-500 text-emerald-950 hover:bg-emerald-400'
+                    : 'bg-slate-800 text-slate-100 hover:bg-slate-700'
+                }`}
+              >
+                {autoSyncEnabled ? 'AutoSync deaktivieren' : 'AutoSync aktivieren'}
+              </button>
+            </div>
+            <div className="flex flex-col gap-3 text-xs text-slate-300">
+              <label className="flex cursor-pointer items-center gap-2">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                  checked={autoSyncResponse === 'accepted'}
+                  onChange={handleAutoResponseToggle}
+                  disabled={busy}
+                />
+                <span>AutoSync sagt Termine automatisch zu</span>
+              </label>
+              <label className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+                <span className="text-xs uppercase tracking-wide text-slate-400">Intervall (Minuten)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={720}
+                  step={1}
+                  value={intervalInput}
+                  onChange={handleAutoSyncIntervalInput}
+                  onBlur={handleAutoSyncIntervalBlur}
+                  onKeyDown={handleAutoSyncIntervalKeyDown}
+                  disabled={busy}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none disabled:opacity-50 sm:w-28"
+                  aria-label="AutoSync-Intervall in Minuten"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
 
-        {(scanJob || syncAllJob || selectionJob || autoJob) && (
-          <div className="space-y-3">
+      {(scanJob || syncAllJob || selectionJob || autoJob) && (
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm font-semibold text-slate-100">Laufende Jobs</p>
+            <p className="text-xs text-slate-400">Überblick über Fortschritt und Status aktueller Prozesse.</p>
+          </div>
+          <div className="mt-3 space-y-3">
             {renderJobProgress(scanJob, 'Postfach-Scan', 'bg-sky-500')}
             {renderJobProgress(syncAllJob, 'Alle synchronisieren', 'bg-emerald-500')}
             {renderJobProgress(selectionJob, 'Auswahl synchronisieren', 'bg-emerald-400')}
             {renderJobProgress(autoJob, 'AutoSync', 'bg-emerald-300')}
           </div>
-        )}
+        </div>
+      )}
 
       {syncError && (
         <div className="rounded-lg border border-rose-700 bg-rose-500/10 p-4 text-sm text-rose-200">
@@ -1285,6 +1240,85 @@ export default function EventTable({
               </ul>
             </div>
           )}
+        </div>
+      )}
+
+      {!showInitialLoading && (
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="flex flex-wrap items-center gap-4 text-xs text-slate-300">
+              <label className="flex items-center gap-2">
+                <span className="font-semibold uppercase tracking-wide text-slate-400">Sortierung</span>
+                <select
+                  value={sortOption}
+                  onChange={handleSortChange}
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+                >
+                  {sortOptionItems.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="font-semibold uppercase tracking-wide text-slate-400">Termine pro Seite</span>
+                <select
+                  value={pageSize}
+                  onChange={handlePageSizeChange}
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
+                >
+                  {PAGE_SIZE_OPTIONS.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="flex flex-1 flex-col gap-2">
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Terminstatus</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={resetResponseFilters}
+                  className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                    responseFilters.length === 0
+                      ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                      : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
+                  }`}
+                >
+                  Alle Terminstatus
+                </button>
+                {responseFilterOptions.map((option) => {
+                  const active = responseFilters.includes(option.value);
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => toggleResponseFilter(option.value)}
+                      className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                        active
+                          ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                          : 'border-slate-700 text-slate-300 hover:border-emerald-400 hover:text-emerald-200'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="flex w-full flex-col gap-1 lg:w-64">
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Suche</span>
+              <input
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-emerald-400 focus:outline-none"
+                placeholder="Termine suchen…"
+              />
+            </div>
+          </div>
         </div>
       )}
 
