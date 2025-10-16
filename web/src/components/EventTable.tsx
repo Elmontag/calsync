@@ -1261,20 +1261,6 @@ export default function EventTable({
                   ))}
                 </select>
               </label>
-              <label className="flex items-center gap-2">
-                <span className="font-semibold uppercase tracking-wide text-slate-400">Termine pro Seite</span>
-                <select
-                  value={pageSize}
-                  onChange={handlePageSizeChange}
-                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
-                >
-                  {PAGE_SIZE_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
             </div>
             <div className="flex flex-1 flex-col gap-2">
               <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Terminstatus</span>
@@ -1309,7 +1295,7 @@ export default function EventTable({
                 })}
               </div>
             </div>
-            <div className="flex w-full flex-col gap-1 lg:w-64">
+            <div className="flex w-full flex-col gap-1 lg:w-56">
               <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Suche</span>
               <input
                 value={searchTerm}
@@ -1795,32 +1781,48 @@ export default function EventTable({
       )}
 
       {!showEmptyState && totalEvents > 0 && (
-        <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <span>
-              Zeige {pageStart}–{pageEnd} von {totalEvents} Terminen
-            </span>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-stretch sm:justify-between">
+          <div className="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <span>
+                Zeige {pageStart}–{pageEnd} von {totalEvents} Terminen
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <button
+                type="button"
+                onClick={goToPreviousPage}
+                disabled={page === 1}
+                className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+              >
+                Vorherige Seite
+              </button>
+              <span className="px-2 py-1 text-slate-400">
+                Seite {page} von {totalPages}
+              </span>
+              <button
+                type="button"
+                onClick={goToNextPage}
+                disabled={page === totalPages || totalEvents === 0}
+                className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+              >
+                Nächste Seite
+              </button>
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <button
-              type="button"
-              onClick={goToPreviousPage}
-              disabled={page === 1}
-              className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
+          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-300 sm:w-60">
+            <span className="font-semibold uppercase tracking-wide text-slate-400">Termine pro Seite</span>
+            <select
+              value={pageSize}
+              onChange={handlePageSizeChange}
+              className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-emerald-400 focus:outline-none"
             >
-              Vorherige Seite
-            </button>
-            <span className="px-2 py-1 text-slate-400">
-              Seite {page} von {totalPages}
-            </span>
-            <button
-              type="button"
-              onClick={goToNextPage}
-              disabled={page === totalPages || totalEvents === 0}
-              className="rounded-lg border border-slate-700 px-3 py-1 font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-500"
-            >
-              Nächste Seite
-            </button>
+              {PAGE_SIZE_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
       )}
