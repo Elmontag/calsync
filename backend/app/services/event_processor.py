@@ -8,7 +8,7 @@ from typing import Callable, Dict, Iterable, List, Optional
 from sqlalchemy import select
 
 from ..database import session_scope
-from ..models import EventResponseStatus, EventStatus, TrackedEvent
+from ..models import EventResponseStatus, EventStatus, IgnoredMailImport, TrackedEvent
 from ..utils.ics_parser import (
     ParsedEvent,
     extract_event_snapshot,
@@ -80,6 +80,49 @@ def upsert_events(
                 session.add(event)
                 logger.info("Stored new event %s", parsed.uid)
             else:
+                ignored_marker = session.execute(
+                    select(IgnoredMailImport)
+                    .where(IgnoredMailImport.event_id == event.id)
+                    .where(IgnoredMailImport.message_id == source_message_id)
+                ).scalar_one_or_none()
+                if ignored_marker:
+                    account_matches = (
+                        ignored_marker.account_id is None
+                        or ignored_marker.account_id == source_account_id
+                    )
+                    folder_matches = (
+                        ignored_marker.folder is None
+                        or ignored_marker.folder == source_folder
+                    )
+                    if account_matches and folder_matches:
+                        logger.info(
+                            "Skipping update for %s from ignored message %s",
+                            parsed.uid,
+                            source_message_id,
+                        )
+                        ignore_description = (
+                            "E-Mail-Import ignoriert – Nachricht {message} wurde nach "
+                            "einer Konfliktauflösung ausgeschlossen."
+                        ).format(message=source_message_id)
+                        already_recorded = any(
+                            entry.get("action") == "mail-ignored"
+                            and entry.get("description") == ignore_description
+                            for entry in event.history or []
+                        )
+                        if not already_recorded:
+                            event.history = merge_histories(
+                                event.history or [],
+                                {
+                                    "timestamp": now.isoformat(),
+                                    "action": "mail-ignored",
+                                    "description": ignore_description,
+                                },
+                            )
+                        event.updated_at = datetime.utcnow()
+                        session.add(event)
+                        stored_events.append(event)
+                        continue
+
                 new_payload = parsed.event.to_ical().decode()
                 previous_status = event.status
                 content_changed = False

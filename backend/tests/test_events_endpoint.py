@@ -28,6 +28,7 @@ from backend.app.models import (
     AccountType,
     EventResponseStatus,
     EventStatus,
+    IgnoredMailImport,
     SyncMapping,
     TrackedEvent,
 )
@@ -868,6 +869,7 @@ def test_resolve_conflict_skip_email_import(monkeypatch: pytest.MonkeyPatch) -> 
         uid="uid-skip",
         source_account_id=imap.id,
         source_folder="INBOX",
+        mailbox_message_id="msg-skip",
         summary="Mail Titel",
         start=start,
         end=end,
@@ -907,6 +909,17 @@ def test_resolve_conflict_skip_email_import(monkeypatch: pytest.MonkeyPatch) -> 
     history_descriptions = [entry["description"] for entry in payload_event["history"]]
     assert any("Konflikt verworfen" in description for description in history_descriptions)
 
+    with SessionLocal() as verify_session:
+        markers = (
+            verify_session.execute(
+                select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+            )
+            .scalars()
+            .all()
+        )
+        assert len(markers) == 1
+        assert markers[0].message_id == "msg-skip"
+
 
 def test_resolve_conflict_skip_email_import_applies_remote_snapshot(
     monkeypatch: pytest.MonkeyPatch,
@@ -938,6 +951,7 @@ def test_resolve_conflict_skip_email_import_applies_remote_snapshot(
         uid="uid-skip-remote",
         source_account_id=imap.id,
         source_folder="INBOX",
+        mailbox_message_id="msg-skip-remote",
         summary="Mail Titel",
         start=start,
         end=end,
@@ -986,6 +1000,15 @@ def test_resolve_conflict_skip_email_import_applies_remote_snapshot(
         assert stored.status == EventStatus.SYNCED
         assert stored.last_modified_source == "remote"
         assert stored.local_last_modified == stored.remote_last_modified
+        markers = (
+            verify_session.execute(
+                select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+            )
+            .scalars()
+            .all()
+        )
+        assert len(markers) == 1
+        assert markers[0].message_id == "msg-skip-remote"
 
 
 def test_resolve_conflict_merge_fields(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1016,6 +1039,7 @@ def test_resolve_conflict_merge_fields(monkeypatch: pytest.MonkeyPatch) -> None:
         uid="uid-merge",
         source_account_id=imap.id,
         source_folder="INBOX",
+        mailbox_message_id="msg-merge",
         summary="Mail Titel",
         start=start,
         end=end,
@@ -1081,17 +1105,29 @@ def test_resolve_conflict_merge_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     assert payload_event["response_status"] == EventResponseStatus.NONE.value
     history_descriptions = [entry["description"] for entry in payload_event["history"]]
     assert any("Daten wurden zusammengeführt" in description for description in history_descriptions)
+    with SessionLocal() as verify_session:
+        markers = (
+            verify_session.execute(
+                select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+            )
+            .scalars()
+            .all()
+        )
+        assert len(markers) == 1
+        assert markers[0].message_id == "msg-merge"
+
 
 def test_attendee_cancellation_updates_history_without_deletion(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cancellations from attendees must not trigger deletions but still leave a history entry."""
 
     session = SessionLocal()
     imap, _caldav = _store_basic_accounts(session)
+    imap_id = imap.id
     event = TrackedEvent(
         uid="uid-attendee",
         status=EventStatus.CANCELLED,
         response_status=EventResponseStatus.NONE,
-        source_account_id=imap.id,
+        source_account_id=imap_id,
         source_folder="INBOX",
         start=datetime(2024, 1, 2, 9, 0, tzinfo=timezone.utc),
         end=datetime(2024, 1, 2, 10, 0, tzinfo=timezone.utc),
@@ -1199,6 +1235,88 @@ def test_upsert_events_preserves_synced_status_for_identical_payload(monkeypatch
 
     assert captured == []
     assert uploaded == 0
+
+
+def test_upsert_events_respects_ignored_mail_marker() -> None:
+    """Events marked to ignore a mail must not be overwritten by the same message."""
+
+    session = SessionLocal()
+    imap, _caldav = _store_basic_accounts(session)
+    imap_id = imap.id
+    start = datetime(2024, 8, 1, 9, 0, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    expected_start = start.replace(tzinfo=None)
+    original_payload = _build_ical(
+        method="REQUEST",
+        uid="uid-ignore",
+        summary="Kalender Stand",
+        start=start,
+        end=end,
+        status="CONFIRMED",
+    )
+    event = TrackedEvent(
+        uid="uid-ignore",
+        source_account_id=imap_id,
+        source_folder="INBOX",
+        mailbox_message_id="msg-ignore",
+        summary="Kalender Stand",
+        start=start,
+        end=end,
+        payload=original_payload,
+        status=EventStatus.SYNCED,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+        local_version=2,
+        synced_version=2,
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+    event_id = event.id
+
+    marker = IgnoredMailImport(
+        event_id=event.id,
+        account_id=imap_id,
+        folder="INBOX",
+        message_id="msg-ignore",
+    )
+    session.add(marker)
+    session.commit()
+    session.close()
+
+    incoming_payload = _build_ical(
+        method="REQUEST",
+        uid="uid-ignore",
+        summary="Mail Vorschlag",
+        start=start + timedelta(hours=2),
+        end=end + timedelta(hours=2),
+        status="CONFIRMED",
+    )
+    parsed = parse_ics_payload(incoming_payload.encode())
+
+    stored = event_processor.upsert_events(
+        parsed,
+        "msg-ignore",
+        source_account_id=imap_id,
+        source_folder="INBOX",
+    )
+
+    assert stored
+    assert len(stored) == 1
+
+    with SessionLocal() as verify_session:
+        refreshed = verify_session.get(TrackedEvent, event_id)
+        assert refreshed is not None
+        assert refreshed.summary == "Kalender Stand"
+        assert refreshed.start == expected_start
+        assert refreshed.local_version == 2
+        ignore_entries = [
+            entry
+            for entry in refreshed.history or []
+            if entry.get("action") == "mail-ignored"
+            and "msg-ignore" in entry.get("description", "")
+        ]
+        assert len(ignore_entries) == 1
 
 
 def test_remote_cancellation_keeps_server_status(monkeypatch: pytest.MonkeyPatch) -> None:

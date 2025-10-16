@@ -21,6 +21,7 @@ from .models import (
     AccountType,
     EventResponseStatus,
     EventStatus,
+    IgnoredMailImport,
     ImapFolder,
     SyncMapping,
     TrackedEvent,
@@ -104,6 +105,37 @@ def _active_auto_sync_job() -> Optional[SyncJobStatus]:
     if state is None:
         return None
     return state.to_status()
+
+
+def _record_ignored_mail_import(db: Session, event: TrackedEvent) -> None:
+    """Persist ignore markers to suppress future imports from the same message."""
+
+    message_id = event.mailbox_message_id
+    if not message_id:
+        return
+
+    existing_marker = (
+        db.execute(
+            select(IgnoredMailImport)
+            .where(IgnoredMailImport.event_id == event.id)
+            .where(IgnoredMailImport.message_id == message_id)
+        )
+        .scalars()
+        .first()
+    )
+    if existing_marker:
+        return
+
+    marker = IgnoredMailImport(
+        event_id=event.id,
+        account_id=event.source_account_id,
+        folder=event.source_folder,
+        message_id=message_id,
+    )
+    db.add(marker)
+    logger.info(
+        "Marked message %s as ignored for event %s", message_id, event.uid
+    )
 
 
 def _ensure_timezone(value: Optional[datetime]) -> Optional[datetime]:
@@ -1599,6 +1631,7 @@ def resolve_event_conflict(
                 ),
             },
         )
+        _record_ignored_mail_import(db, event)
         db.add(event)
         db.commit()
         db.refresh(event)
@@ -1675,6 +1708,7 @@ def resolve_event_conflict(
             },
         )
         event_processor.annotate_response(event)
+        _record_ignored_mail_import(db, event)
         db.add(event)
         db.commit()
         db.refresh(event)

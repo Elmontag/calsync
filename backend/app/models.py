@@ -121,6 +121,25 @@ class TrackedEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    ignored_mail_imports = relationship(
+        "IgnoredMailImport", back_populates="event", cascade="all, delete-orphan"
+    )
+
+
+class IgnoredMailImport(Base):
+    """Persist markers for mail messages that should no longer update an event."""
+
+    __tablename__ = "ignored_mail_imports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey("tracked_events.id"), nullable=False)
+    account_id = Column(Integer, nullable=True)
+    folder = Column(String, nullable=True)
+    message_id = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    event = relationship("TrackedEvent", back_populates="ignored_mail_imports")
+
 
 class SyncMapping(Base):
     """Configuration describing how IMAP sources map to CalDAV targets."""
