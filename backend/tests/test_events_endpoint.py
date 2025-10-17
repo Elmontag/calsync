@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 import sys
 from textwrap import dedent
@@ -434,6 +435,126 @@ def test_download_event_mail_returns_payload(monkeypatch: pytest.MonkeyPatch) ->
         assert persisted.mailbox_message_id == "200"
         assert not any(entry["action"] == "mail-deleted" for entry in persisted.history or [])
 
+
+def test_view_event_mail_prefers_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The inline mail view should render sanitized HTML content when available."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {
+        "host": "imap.example.com",
+        "username": "user",
+        "password": "secret",
+    }
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    event = TrackedEvent(
+        uid="event-mail-html",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="201",
+        summary="Mail HTML",
+        organizer="orga@example.com",
+        status=EventStatus.NEW,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    def fake_fetch(settings, folder, message_id):
+        assert settings.host == "imap.example.com"
+        assert folder == "INBOX"
+        assert message_id == "201"
+        msg = EmailMessage()
+        msg["From"] = "Alice <alice@example.com>"
+        msg["To"] = "Bob <bob@example.com>"
+        msg["Subject"] = "Einladung"
+        msg["Date"] = "Mon, 03 Jun 2024 10:00:00 +0000"
+        msg.set_content("Hallo Bob, hier ist der Termin.")
+        msg.add_alternative(
+            """
+            <html>
+              <body>
+                <h1>Hallo Bob</h1>
+                <p>Hier <strong>findest</strong> du die <a href="https://example.com">Details</a>.</p>
+                <script>alert('xss');</script>
+              </body>
+            </html>
+            """,
+            subtype="html",
+        )
+        return msg.as_bytes()
+
+    monkeypatch.setattr("backend.app.main.fetch_message", fake_fetch)
+
+    client = TestClient(app)
+    response = client.get(f"/events/{event.id}/mail/view")
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+    body = response.text
+    assert "Hallo Bob" in body
+    assert "<script" not in body
+    assert "alert" not in body
+    assert "https://example.com" in body
+    assert "target=\"_blank\"" in body
+    assert "noopener" in body
+    assert "Alice" in body
+    assert "Bob" in body
+
+
+def test_view_event_mail_falls_back_to_plaintext(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plaintext mails should be rendered when no HTML alternative exists."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {
+        "host": "imap.example.com",
+        "username": "user",
+        "password": "secret",
+    }
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    event = TrackedEvent(
+        uid="event-mail-text",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="202",
+        summary="Mail Text",
+        organizer="orga@example.com",
+        status=EventStatus.NEW,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    def fake_fetch(settings, folder, message_id):
+        assert settings.host == "imap.example.com"
+        assert folder == "INBOX"
+        assert message_id == "202"
+        msg = EmailMessage()
+        msg["From"] = "Alice <alice@example.com>"
+        msg["To"] = "Bob <bob@example.com>"
+        msg["Subject"] = "Nur Text"
+        msg.set_content("Nur Textinhalt ohne HTML.")
+        return msg.as_bytes()
+
+    monkeypatch.setattr("backend.app.main.fetch_message", fake_fetch)
+
+    client = TestClient(app)
+    response = client.get(f"/events/{event.id}/mail/view")
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+    body = response.text
+    assert "Nur Textinhalt ohne HTML." in body
+    assert "<pre" in body
 
 def test_list_events_handles_duplicate_caldav_targets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Listing events remains stable when different folders target the same calendar."""

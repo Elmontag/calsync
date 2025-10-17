@@ -9,6 +9,7 @@ from email.message import Message
 from typing import Callable, Iterable, List, Optional, Sequence
 
 from imapclient import IMAPClient
+from imapclient.exceptions import IMAPClientError
 
 logger = logging.getLogger(__name__)
 
@@ -110,20 +111,45 @@ def delete_message(settings: ImapSettings, folder: str, message_id: str) -> bool
             uid = None
 
         if uid is not None:
-            matches = client.search(["UID", str(uid)], uid=True)
-        else:
-            # Fall back to a Message-ID search when the identifier is not numeric.
-            matches = client.search(["HEADER", "Message-ID", message_id], uid=True)
+            try:
+                client.delete_messages([uid], uid=True)
+                client.expunge()
+                return True
+            except IMAPClientError:
+                logger.debug(
+                    "Keine Nachricht mit UID %s in Ordner %s gefunden", uid, folder
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Fehler beim Löschen der Nachricht %s über UID", message_id
+                )
 
-        if not matches:
-            logger.warning(
-                "Keine Nachricht %s in Ordner %s gefunden", message_id, folder
-            )
-            return False
+            try:
+                client.delete_messages([uid], uid=False)
+                client.expunge()
+                return True
+            except IMAPClientError:
+                logger.debug(
+                    "Keine Nachricht mit Sequenznummer %s in Ordner %s gefunden",
+                    uid,
+                    folder,
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Fehler beim Löschen der Nachricht %s über Sequenznummer",
+                    message_id,
+                )
 
-        client.delete_messages(matches, uid=True)
-        client.expunge()
-        return True
+        matches = client.search(["HEADER", "Message-ID", message_id], uid=True)
+        if matches:
+            client.delete_messages(matches, uid=True)
+            client.expunge()
+            return True
+
+        logger.warning(
+            "Keine Nachricht %s in Ordner %s gefunden", message_id, folder
+        )
+        return False
 
 
 def fetch_message(settings: ImapSettings, folder: str, message_id: str) -> bytes:
@@ -139,22 +165,27 @@ def fetch_message(settings: ImapSettings, folder: str, message_id: str) -> bytes
             uid = None
 
         if uid is not None:
-            matches = client.search(["UID", str(uid)], uid=True)
-        else:
-            matches = client.search(["HEADER", "Message-ID", message_id], uid=True)
+            payloads = client.fetch([uid], ["RFC822"], uid=True)
+            for data in payloads.values():
+                raw_message = data.get(b"RFC822")
+                if raw_message:
+                    return raw_message
 
-        if not matches:
-            raise MessageNotFoundError(f"Message {message_id!r} not found in {folder}")
+            payloads = client.fetch([uid], ["RFC822"], uid=False)
+            for data in payloads.values():
+                raw_message = data.get(b"RFC822")
+                if raw_message:
+                    return raw_message
 
-        payloads = client.fetch(matches, ["RFC822"], uid=True)
-        for data in payloads.values():
-            raw_message = data.get(b"RFC822")
-            if raw_message:
-                return raw_message
+        matches = client.search(["HEADER", "Message-ID", message_id], uid=True)
+        if matches:
+            payloads = client.fetch(matches, ["RFC822"], uid=True)
+            for data in payloads.values():
+                raw_message = data.get(b"RFC822")
+                if raw_message:
+                    return raw_message
 
-        raise MessageNotFoundError(
-            f"Message {message_id!r} in {folder} did not return a payload"
-        )
+        raise MessageNotFoundError(f"Message {message_id!r} not found in {folder}")
 
 
 class ImapConnection:
@@ -210,13 +241,13 @@ def fetch_calendar_candidates(
             except Exception:
                 logger.exception("Konnte IMAP Ordner %s nicht öffnen", folder_name)
                 continue
-            message_ids = client.search("ALL")
-            if not message_ids:
+            message_uids = client.search("ALL", uid=True)
+            if not message_uids:
                 logger.debug("No messages found in folder %s", folder_name)
                 continue
             if progress_callback is not None:
-                progress_callback(0, len(message_ids))
-            for uid, message_data in client.fetch(message_ids, ["RFC822"]).items():
+                progress_callback(0, len(message_uids))
+            for uid, message_data in client.fetch(message_uids, ["RFC822"], uid=True).items():
                 raw_message: bytes = message_data[b"RFC822"]
                 message: Message = email.message_from_bytes(raw_message)
                 attachments: List[MailAttachment] = []

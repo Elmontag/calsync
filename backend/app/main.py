@@ -3,15 +3,24 @@ from __future__ import annotations
 
 import logging
 import json
+import html
+import re
 from datetime import datetime, timedelta, timezone
 from json import JSONDecodeError
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from email import policy
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+from email.parser import BytesParser
+
+import bleach
+from bleach.css_sanitizer import CSSSanitizer
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 from icalendar import Calendar
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
@@ -121,6 +130,314 @@ def _parse_mail_uid(message_id: str | None) -> Optional[int]:
         return None
     return value if value >= 0 else None
 
+
+_MAIL_ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
+    "p",
+    "div",
+    "span",
+    "br",
+    "hr",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "td",
+    "th",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "pre",
+    "code",
+    "blockquote",
+}
+_MAIL_ALLOWED_ATTRS = dict(bleach.sanitizer.ALLOWED_ATTRIBUTES)
+_MAIL_ALLOWED_ATTRS.update(
+    {
+        "a": ["href", "title", "target", "rel"],
+        "td": ["colspan", "rowspan", "align"],
+        "th": ["colspan", "rowspan", "align"],
+        "table": ["border", "cellpadding", "cellspacing"],
+        "span": ["style"],
+        "p": ["style"],
+        "div": ["style"],
+    }
+)
+_MAIL_ALLOWED_STYLES = [
+    "color",
+    "background-color",
+    "font-weight",
+    "font-style",
+    "text-decoration",
+    "text-align",
+]
+_MAIL_CSS_SANITIZER = CSSSanitizer(allowed_css_properties=_MAIL_ALLOWED_STYLES)
+_SCRIPT_STYLE_RE = re.compile(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _link_target_blank(attrs, new=False):
+    href = attrs.get((None, "href"), "")
+    if href:
+        attrs[(None, "target")] = "_blank"
+        rel_values = set(filter(None, (attrs.get((None, "rel"), "") or "").split()))
+        rel_values.update({"noopener", "noreferrer"})
+        attrs[(None, "rel")] = " ".join(sorted(rel_values))
+    return attrs
+
+
+def _sanitize_mail_html(value: str) -> str:
+    sanitized_source = _SCRIPT_STYLE_RE.sub("", value)
+    cleaned = bleach.clean(
+        sanitized_source,
+        tags=_MAIL_ALLOWED_TAGS,
+        attributes=_MAIL_ALLOWED_ATTRS,
+        css_sanitizer=_MAIL_CSS_SANITIZER,
+        strip=True,
+    )
+    return bleach.linkify(
+        cleaned,
+        callbacks=[bleach.callbacks.nofollow, _link_target_blank],
+    )
+
+
+def _wrap_plaintext(value: str) -> str:
+    escaped = html.escape(value)
+    if not escaped:
+        return ""
+    return f"<pre class=\"mail-plain\">{escaped}</pre>"
+
+
+def _format_mail_header(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        decoded = str(make_header(decode_header(value)))
+    except Exception:  # pragma: no cover - defensive logging
+        logger.debug("Konnte Mail-Header %r nicht dekodieren", value, exc_info=True)
+        decoded = value
+    cleaned = decoded.strip()
+    return cleaned or None
+
+
+def _extract_mail_bodies(message: EmailMessage) -> tuple[Optional[str], Optional[str]]:
+    text_body: Optional[str] = None
+    html_body: Optional[str] = None
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_disposition() == "attachment":
+            continue
+        content_type = part.get_content_type()
+        payload_str: Optional[str]
+        try:
+            content = part.get_content()
+        except Exception:
+            payload = part.get_payload(decode=True)
+            if isinstance(payload, bytes):
+                charset = part.get_content_charset() or "utf-8"
+                payload_str = payload.decode(charset, errors="replace")
+            else:
+                payload_str = None
+        else:
+            payload_str = content if isinstance(content, str) else None
+        if not payload_str:
+            continue
+        if content_type == "text/html" and html_body is None:
+            html_body = payload_str
+        elif content_type == "text/plain" and text_body is None:
+            text_body = payload_str
+    return text_body, html_body
+
+
+def _render_mail_document(
+    subject: str,
+    sender: Optional[str],
+    recipients: Optional[str],
+    cc: Optional[str],
+    date_header: Optional[str],
+    body_html: str,
+) -> str:
+    def _meta_row(label: str, value: Optional[str]) -> str:
+        if not value:
+            return ""
+        return (
+            "<div class=\"meta-row\">"
+            f"<span class=\"meta-label\">{html.escape(label)}</span>"
+            f"<span class=\"meta-value\">{html.escape(value)}</span>"
+            "</div>"
+        )
+
+    metadata = "".join(
+        [
+            _meta_row("Von", sender),
+            _meta_row("An", recipients),
+            _meta_row("Cc", cc),
+            _meta_row("Datum", date_header),
+        ]
+    )
+    meta_content = metadata or '<p class="meta-value">Keine Metadaten verfügbar.</p>'
+
+    title = subject or "(Ohne Betreff)"
+    return f"""<!DOCTYPE html>
+<html lang=\"de\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{
+      margin: 0;
+      background-color: #0f172a;
+      color: #e2e8f0;
+      font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      line-height: 1.5;
+    }}
+    .container {{
+      max-width: 48rem;
+      margin: 0 auto;
+      padding: 2.5rem 1.5rem 3rem;
+    }}
+    .mail-card {{
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(51, 65, 85, 0.6);
+      border-radius: 1rem;
+      box-shadow: 0 20px 45px rgba(15, 118, 110, 0.15);
+      overflow: hidden;
+    }}
+    .mail-header {{
+      padding: 1.75rem 2rem 1rem;
+      border-bottom: 1px solid rgba(71, 85, 105, 0.6);
+    }}
+    .mail-header h1 {{
+      margin: 0;
+      font-size: 1.5rem;
+      color: #5eead4;
+    }}
+    .mail-meta {{
+      margin-top: 1rem;
+      font-size: 0.875rem;
+      color: #94a3b8;
+    }}
+    .meta-row {{
+      display: grid;
+      grid-template-columns: 5rem 1fr;
+      gap: 0.75rem;
+      margin-bottom: 0.4rem;
+    }}
+    .meta-label {{
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #38bdf8;
+      font-size: 0.7rem;
+    }}
+    .meta-value {{
+      color: #e2e8f0;
+      word-break: break-word;
+    }}
+    .mail-body {{
+      padding: 1.75rem 2rem 2.25rem;
+      font-size: 1rem;
+    }}
+    .mail-body a {{
+      color: #38bdf8;
+      text-decoration: underline;
+    }}
+    .mail-body table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+    }}
+    .mail-body th,
+    .mail-body td {{
+      border: 1px solid rgba(148, 163, 184, 0.3);
+      padding: 0.5rem 0.75rem;
+    }}
+    .mail-body pre {{
+      background: rgba(15, 23, 42, 0.7);
+      border-radius: 0.5rem;
+      padding: 1rem;
+      overflow-x: auto;
+    }}
+    .mail-plain {{
+      white-space: pre-wrap;
+      font-family: "Fira Code", "SFMono-Regular", monospace;
+    }}
+    .mail-empty {{
+      color: #94a3b8;
+      font-style: italic;
+    }}
+  </style>
+</head>
+<body>
+  <main class=\"container\">
+    <section class=\"mail-card\">
+      <header class=\"mail-header\">
+        <h1>{html.escape(title)}</h1>
+        <div class=\"mail-meta\">{meta_content}</div>
+      </header>
+      <article class=\"mail-body\">{body_html}</article>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
+def _get_event_or_404(db: Session, event_id: int) -> TrackedEvent:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+    return event
+
+
+def _load_event_mail_payload(event: TrackedEvent, db: Session) -> bytes:
+    if (
+        not event.mailbox_message_id
+        or event.source_account_id is None
+        or not event.source_folder
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Für diesen Termin ist keine verknüpfte E-Mail vorhanden.",
+        )
+
+    account = db.get(Account, event.source_account_id)
+    if account is None or account.type != AccountType.IMAP:
+        raise HTTPException(
+            status_code=404,
+            detail="IMAP-Konto für diesen Termin wurde nicht gefunden.",
+        )
+
+    try:
+        settings = ImapSettings(**account.settings)
+    except TypeError:
+        logger.exception("Ungültige IMAP Einstellungen für Konto %s", account.id)
+        raise HTTPException(
+            status_code=500,
+            detail="IMAP-Einstellungen für das Konto sind ungültig.",
+        )
+
+    try:
+        return fetch_message(
+            settings, event.source_folder, event.mailbox_message_id
+        )
+    except MessageNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Die E-Mail wurde im Postfach nicht gefunden.",
+        )
+    except Exception:
+        logger.exception(
+            "Konnte E-Mail %s in Ordner %s (Konto %s) nicht laden",
+            event.mailbox_message_id,
+            event.source_folder,
+            account.id,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Die E-Mail konnte nicht geladen werden.",
+        )
 
 def _record_ignored_mail_import(db: Session, event: TrackedEvent) -> None:
     """Persist ignore markers to suppress future imports from the same message."""
@@ -1903,63 +2220,46 @@ def ignore_event(event_id: int, db: Session = Depends(get_db)) -> TrackedEvent:
 
 @app.get("/events/{event_id}/mail")
 def download_event_mail(event_id: int, db: Session = Depends(get_db)) -> Response:
-    event = db.get(TrackedEvent, event_id)
-    if event is None:
-        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
-
-    if (
-        not event.mailbox_message_id
-        or event.source_account_id is None
-        or not event.source_folder
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Für diesen Termin ist keine verknüpfte E-Mail vorhanden.",
-        )
-
-    account = db.get(Account, event.source_account_id)
-    if account is None or account.type != AccountType.IMAP:
-        raise HTTPException(
-            status_code=404,
-            detail="IMAP-Konto für diesen Termin wurde nicht gefunden.",
-        )
-
-    try:
-        settings = ImapSettings(**account.settings)
-    except TypeError:
-        logger.exception("Ungültige IMAP Einstellungen für Konto %s", account.id)
-        raise HTTPException(
-            status_code=500,
-            detail="IMAP-Einstellungen für das Konto sind ungültig.",
-        )
-
-    try:
-        raw_message = fetch_message(
-            settings, event.source_folder, event.mailbox_message_id
-        )
-    except MessageNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail="Die E-Mail wurde im Postfach nicht gefunden.",
-        )
-    except Exception:
-        logger.exception(
-            "Konnte E-Mail %s in Ordner %s (Konto %s) nicht laden",
-            event.mailbox_message_id,
-            event.source_folder,
-            account.id,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Die E-Mail konnte nicht geladen werden.",
-        )
-
+    event = _get_event_or_404(db, event_id)
+    raw_message = _load_event_mail_payload(event, db)
     base_name = event.summary or event.uid or "termin"
     safe_name = "".join(ch if str(ch).isalnum() or ch in {"-", "_"} else "-" for ch in base_name)
     safe_name = safe_name.strip("-") or "termin"
     filename = f"{safe_name}.eml"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(content=raw_message, media_type="message/rfc822", headers=headers)
+
+
+@app.get("/events/{event_id}/mail/view")
+def view_event_mail(event_id: int, db: Session = Depends(get_db)) -> HTMLResponse:
+    event = _get_event_or_404(db, event_id)
+    raw_message = _load_event_mail_payload(event, db)
+    parser = BytesParser(policy=policy.default)
+    message = parser.parsebytes(raw_message)
+    subject = _format_mail_header(message.get("Subject")) or "(Ohne Betreff)"
+    sender = _format_mail_header(message.get("From"))
+    recipients = _format_mail_header(message.get("To"))
+    cc = _format_mail_header(message.get("Cc"))
+    date_header = _format_mail_header(message.get("Date"))
+
+    text_body, html_body = _extract_mail_bodies(message)
+    content_html: Optional[str] = None
+    if html_body:
+        content_html = _sanitize_mail_html(html_body)
+    if not content_html and text_body:
+        content_html = _wrap_plaintext(text_body)
+    if not content_html:
+        content_html = '<p class="mail-empty">Diese Nachricht enthält keinen darstellbaren Inhalt.</p>'
+
+    document = _render_mail_document(
+        subject,
+        sender,
+        recipients,
+        cc,
+        date_header,
+        content_html,
+    )
+    return HTMLResponse(content=document)
 
 
 @app.post("/events/{event_id}/delete-mail", response_model=TrackedEventRead)

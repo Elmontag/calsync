@@ -1121,7 +1121,7 @@ export default function EventTable({
       return;
     }
     const base = (import.meta.env.VITE_API_BASE ?? '/api').replace(/\/$/, '');
-    const url = `${base}/events/${event.id}/mail`;
+    const url = `${base}/events/${event.id}/mail/view`;
     const opened = window.open(url, '_blank', 'noopener');
     if (!opened) {
       setSyncError('Die E-Mail konnte nicht geöffnet werden. Bitte Pop-up-Blocker prüfen.');
@@ -1560,33 +1560,21 @@ export default function EventTable({
                     </div>
                   </div>
                   <div className="flex flex-col items-start gap-2 sm:items-end">
-                    <div className="flex w-full items-start justify-between gap-2 sm:justify-end">
-                      <div className="flex flex-col items-start gap-2 sm:items-end">
-                        <span
-                          className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
-                            statusStyleMap[event.status]
-                          }`}
-                        >
-                          {statusLabelMap[event.status]}
-                        </span>
-                        <span
-                          className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
-                            responseStyleMap[event.response_status]
-                          }`}
-                        >
-                          {responseLabelMap[event.response_status]}
-                        </span>
-                      </div>
-                      <EventActionMenu
-                        onOpenMail={() => handleOpenMail(event)}
-                        onDeleteMail={() => handleDeleteMail(event)}
-                        onIgnore={() => handleIgnoreEvent(event)}
-                        openMailDisabled={!event.mailbox_message_id || deletingMail || disablingTracking || ignoring}
-                        deleteDisabled={deletingMail || disablingTracking || ignoring}
-                        ignoreDisabled={ignoring || deletingMail || disablingTracking}
-                        isDeleting={deletingMail}
-                        isIgnoring={ignoring}
-                      />
+                    <div className="flex flex-col items-start gap-2 sm:items-end">
+                      <span
+                        className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
+                          statusStyleMap[event.status]
+                        }`}
+                      >
+                        {statusLabelMap[event.status]}
+                      </span>
+                      <span
+                        className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
+                          responseStyleMap[event.response_status]
+                        }`}
+                      >
+                        {responseLabelMap[event.response_status]}
+                      </span>
                     </div>
                     {conflictCount > 0 && (
                       <span className="inline-flex items-center rounded-full bg-amber-500/20 px-3 py-1 text-xs font-semibold text-amber-300">
@@ -1602,24 +1590,38 @@ export default function EventTable({
                 </div>
                 {isOpen && (
                   <div className="border-t border-slate-800 bg-slate-900/70 px-4 py-4 text-sm text-slate-200">
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <div>
-                        <p className="text-xs uppercase tracking-wide text-slate-500">Organisator</p>
-                        <p className="mt-1 text-slate-200">{event.organizer ?? 'Keine Angabe'}</p>
+                    <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                      <div className="grid flex-1 gap-3 sm:grid-cols-2">
+                        <div>
+                          <p className="text-xs uppercase tracking-wide text-slate-500">Organisator</p>
+                          <p className="mt-1 text-slate-200">{event.organizer ?? 'Keine Angabe'}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs uppercase tracking-wide text-slate-500">UID</p>
+                          <p className="mt-1 break-all text-slate-300">{event.uid}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs uppercase tracking-wide text-slate-500">Quelle</p>
+                          <p className="mt-1 text-slate-300">
+                            {sourceParts.length > 0 ? sourceParts.join(' · ') : 'Keine Zuordnung'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs uppercase tracking-wide text-slate-500">Zeitspanne</p>
+                          <p className="mt-1 text-slate-300">{dateRange}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="text-xs uppercase tracking-wide text-slate-500">UID</p>
-                        <p className="mt-1 break-all text-slate-300">{event.uid}</p>
-                      </div>
-                      <div>
-                        <p className="text-xs uppercase tracking-wide text-slate-500">Quelle</p>
-                        <p className="mt-1 text-slate-300">
-                          {sourceParts.length > 0 ? sourceParts.join(' · ') : 'Keine Zuordnung'}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs uppercase tracking-wide text-slate-500">Zeitspanne</p>
-                        <p className="mt-1 text-slate-300">{dateRange}</p>
+                      <div className="flex justify-end lg:ml-6 lg:justify-start">
+                        <EventActionMenu
+                          onOpenMail={() => handleOpenMail(event)}
+                          onDeleteMail={() => handleDeleteMail(event)}
+                          onIgnore={() => handleIgnoreEvent(event)}
+                          openMailDisabled={!event.mailbox_message_id || deletingMail || disablingTracking || ignoring}
+                          deleteDisabled={deletingMail || disablingTracking || ignoring}
+                          ignoreDisabled={ignoring || deletingMail || disablingTracking}
+                          isDeleting={deletingMail}
+                          isIgnoring={ignoring}
+                        />
                       </div>
                     </div>
                     {event.status === 'failed' && (
