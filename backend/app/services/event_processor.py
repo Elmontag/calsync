@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -628,8 +627,8 @@ def _base_calendar():
 def _serialize_parsed_event(parsed: ParsedEvent) -> str:
     calendar = _base_calendar()
     for timezone_component in parsed.timezone_components:
-        calendar.add_component(deepcopy(timezone_component))
-    calendar.add_component(deepcopy(parsed.event))
+        calendar.add_component(timezone_component.copy())
+    calendar.add_component(parsed.event.copy())
     return calendar.to_ical().decode()
 
 
@@ -651,7 +650,7 @@ def _load_calendar_from_payload(payload) -> "Calendar":
         calendar = parsed
     else:
         calendar = _base_calendar()
-        calendar.add_component(deepcopy(parsed))
+        calendar.add_component(parsed.copy())
 
     if not calendar.get("PRODID"):
         calendar.add("PRODID", _DEFAULT_PRODID)

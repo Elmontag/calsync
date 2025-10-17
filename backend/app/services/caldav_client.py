@@ -58,9 +58,23 @@ def upload_ical(
     with CalDavConnection(settings) as client:
         principal = client.principal()
         calendar: Calendar = principal.calendar(cal_url=calendar_url)
-        logger.info("Uploading event %s to %s", ical.get("UID"), calendar_url)
+        uid: Optional[str] = None
+        for component in ical.walk("VEVENT"):
+            raw_uid = component.get("UID")
+            if raw_uid:
+                uid = str(raw_uid)
+                break
+
+        logger.info("Uploading event %s to %s", uid or "<unknown>", calendar_url)
         calendar.save_event(ical.to_ical())
-        uid = str(ical.get("UID"))
+
+        if uid is None:
+            logger.warning(
+                "Uploaded calendar data to %s without a VEVENT UID; skipping state lookup",
+                calendar_url,
+            )
+            return None
+
         return _fetch_event_state(calendar, uid)
 
 
