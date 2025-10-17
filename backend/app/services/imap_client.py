@@ -13,6 +13,12 @@ from imapclient import IMAPClient
 logger = logging.getLogger(__name__)
 
 
+class MessageNotFoundError(Exception):
+    """Raised when an IMAP message could not be located."""
+
+    pass
+
+
 def _load_default_timeout() -> int:
     """Determine the default IMAP socket timeout in seconds.
 
@@ -118,6 +124,37 @@ def delete_message(settings: ImapSettings, folder: str, message_id: str) -> bool
         client.delete_messages(matches, uid=True)
         client.expunge()
         return True
+
+
+def fetch_message(settings: ImapSettings, folder: str, message_id: str) -> bytes:
+    """Return the raw RFC822 payload for a specific message."""
+
+    with ImapConnection(settings) as client:
+        logger.info("Fetching IMAP message %s from %s", message_id, folder)
+        client.select_folder(folder)
+
+        try:
+            uid = int(message_id)
+        except (TypeError, ValueError):
+            uid = None
+
+        if uid is not None:
+            matches = client.search(["UID", str(uid)], uid=True)
+        else:
+            matches = client.search(["HEADER", "Message-ID", message_id], uid=True)
+
+        if not matches:
+            raise MessageNotFoundError(f"Message {message_id!r} not found in {folder}")
+
+        payloads = client.fetch(matches, ["RFC822"], uid=True)
+        for data in payloads.values():
+            raw_message = data.get(b"RFC822")
+            if raw_message:
+                return raw_message
+
+        raise MessageNotFoundError(
+            f"Message {message_id!r} in {folder} did not return a payload"
+        )
 
 
 class ImapConnection:

@@ -165,7 +165,13 @@ export function useEvents() {
 
   async function deleteMail(eventId: number) {
     const { data } = await api.post<TrackedEvent>(`/events/${eventId}/delete-mail`);
-    setEvents((prev) => prev.map((event) => (event.id === eventId ? data : event)));
+    setEvents((prev) => prev.filter((event) => event.id !== eventId));
+    return data;
+  }
+
+  async function ignoreEvent(eventId: number) {
+    const { data } = await api.post<TrackedEvent>(`/events/${eventId}/ignore`);
+    setEvents((prev) => prev.filter((event) => event.id !== eventId));
     return data;
   }
 
@@ -195,6 +201,7 @@ export function useEvents() {
     disableTracking,
     deleteMail,
     resolveConflict,
+    ignoreEvent,
   };
 }
 

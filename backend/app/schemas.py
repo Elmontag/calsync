@@ -118,7 +118,9 @@ class TrackedEventRead(BaseModel):
     id: int
     uid: str
     source_account_id: Optional[int] = None
+    source_account_label: Optional[str] = None
     source_folder: Optional[str] = None
+    mailbox_message_id: Optional[str] = None
     summary: Optional[str] = None
     organizer: Optional[str] = None
     start: Optional[datetime] = None

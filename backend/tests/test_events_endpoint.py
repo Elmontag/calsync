@@ -246,7 +246,7 @@ def test_mail_scan_records_failed_messages(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_delete_failed_mail_removes_message(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Deleting a failed mail should update the tracked event and audit history."""
+    """Deleting a failed mail should disable further tracking and add an audit entry."""
 
     session = SessionLocal()
     imap, _ = _store_basic_accounts(session)
@@ -290,6 +290,7 @@ def test_delete_failed_mail_removes_message(monkeypatch: pytest.MonkeyPatch) -> 
     payload = response.json()
     assert any(entry["action"] == "mail-deleted" for entry in payload["history"])
     assert "gelöscht" in (payload["mail_error"] or "")
+    assert payload["tracking_disabled"] is True
     assert calls == [("INBOX", "42")]
 
     with session_scope() as verify:
@@ -297,6 +298,7 @@ def test_delete_failed_mail_removes_message(monkeypatch: pytest.MonkeyPatch) -> 
         assert updated is not None
         assert updated.mailbox_message_id is None
         assert any(entry["action"] == "mail-deleted" for entry in updated.history)
+        assert updated.tracking_disabled is True
 
 
 def test_delete_failed_mail_handles_missing_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -339,10 +341,97 @@ def test_delete_failed_mail_handles_missing_message(monkeypatch: pytest.MonkeyPa
     assert response.status_code == 404
     assert "nicht gefunden" in response.json()["detail"]
 
+
+def test_ignore_event_marks_tracking_disabled() -> None:
+    """Ignoring an event should disable tracking and persist a wildcard marker."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    event = TrackedEvent(
+        uid="event-ignore-test",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="150",
+        summary="Testtermin",
+        organizer="orga@example.com",
+        status=EventStatus.NEW,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    client = TestClient(app)
+    response = client.post(f"/events/{event.id}/ignore")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["tracking_disabled"] is True
+    assert any(entry["action"] == "mail-ignored" for entry in payload["history"])
+
+    with session_scope() as verify:
+        stored = verify.get(TrackedEvent, event.id)
+        assert stored is not None
+        assert stored.tracking_disabled is True
+        markers = (
+            verify.execute(
+                select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+            )
+            .scalars()
+            .all()
+        )
+        assert len(markers) == 1
+        assert markers[0].ignore_all is True
+
+
+def test_download_event_mail_returns_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Users can download the original mail for a tracked event."""
+
+    session = SessionLocal()
+    imap, _ = _store_basic_accounts(session)
+    imap.settings = {
+        "host": "imap.example.com",
+        "username": "user",
+        "password": "secret",
+    }
+    session.add(imap)
+    session.commit()
+    session.refresh(imap)
+
+    event = TrackedEvent(
+        uid="event-mail-test",
+        source_account_id=imap.id,
+        source_folder="INBOX",
+        mailbox_message_id="200",
+        summary="Mail Test",
+        organizer="orga@example.com",
+        status=EventStatus.NEW,
+        response_status=EventResponseStatus.NONE,
+        history=[],
+    )
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+
+    def fake_fetch(settings, folder, message_id):
+        assert settings.host == "imap.example.com"
+        assert folder == "INBOX"
+        assert message_id == "200"
+        return b"raw email content"
+
+    monkeypatch.setattr("backend.app.main.fetch_message", fake_fetch)
+
+    client = TestClient(app)
+    response = client.get(f"/events/{event.id}/mail")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "message/rfc822"
+    assert "attachment" in response.headers.get("content-disposition", "")
+    assert response.content == b"raw email content"
+
     with session_scope() as verify:
         persisted = verify.get(TrackedEvent, event.id)
         assert persisted is not None
-        assert persisted.mailbox_message_id == "99"
+        assert persisted.mailbox_message_id == "200"
         assert not any(entry["action"] == "mail-deleted" for entry in persisted.history or [])
 
 
@@ -399,6 +488,7 @@ def test_list_events_handles_duplicate_caldav_targets(monkeypatch: pytest.Monkey
     events = list_events(db=session)
 
     assert {event.uid for event in events} == {"uid-1", "uid-2"}
+    assert all(getattr(event, "source_account_label", None) == imap.label for event in events)
     mapped = {event.uid: getattr(event, "conflicts", []) for event in events}
     assert mapped["uid-1"][0]["uid"] == "conflict-uid"
     assert mapped["uid-2"] == []

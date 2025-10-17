@@ -101,6 +101,13 @@ def upsert_events(
                     .scalars()
                     .all()
                 )
+
+                if event.tracking_disabled:
+                    logger.info(
+                        "Skipping update for %s because tracking is disabled", parsed.uid
+                    )
+                    stored_events.append(event)
+                    continue
                 skip_reason: Optional[str] = None
                 for marker in markers:
                     account_matches = (
@@ -111,6 +118,9 @@ def upsert_events(
                     )
                     if not (account_matches and folder_matches):
                         continue
+                    if getattr(marker, "ignore_all", False):
+                        skip_reason = "all messages ignored"
+                        break
                     if marker.message_id == source_message_id:
                         skip_reason = f"ignored message {source_message_id}"
                         break

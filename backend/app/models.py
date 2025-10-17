@@ -124,6 +124,7 @@ class TrackedEvent(Base):
     ignored_mail_imports = relationship(
         "IgnoredMailImport", back_populates="event", cascade="all, delete-orphan"
     )
+    source_account = relationship("Account", foreign_keys=[source_account_id])
 
 
 class IgnoredMailImport(Base):
@@ -137,6 +138,7 @@ class IgnoredMailImport(Base):
     folder = Column(String, nullable=True)
     message_id = Column(String, nullable=False)
     max_uid = Column(Integer, nullable=True)
+    ignore_all = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     event = relationship("TrackedEvent", back_populates="ignored_mail_imports")

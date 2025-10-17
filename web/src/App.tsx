@@ -28,6 +28,7 @@ function App() {
     disableTracking,
     deleteMail,
     resolveConflict,
+    ignoreEvent,
   } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
   const [editingAccountId, setEditingAccountId] = useState<number | null>(null);
@@ -151,6 +152,7 @@ function App() {
               onRespondToEvent={respondToEvent}
               onDisableTracking={disableTracking}
               onDeleteMail={deleteMail}
+              onIgnoreEvent={ignoreEvent}
               onResolveConflict={resolveConflict}
               onRefresh={refresh}
               autoSyncJob={autoSync.active_job ?? null}

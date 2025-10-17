@@ -39,7 +39,9 @@ export interface TrackedEvent {
   id: number;
   uid: string;
   source_account_id?: number;
+  source_account_label?: string;
   source_folder?: string;
+  mailbox_message_id?: string | null;
   summary?: string;
   organizer?: string;
   start?: string;

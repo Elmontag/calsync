@@ -27,6 +27,7 @@ interface Props {
   ) => Promise<TrackedEvent>;
   onDisableTracking: (eventId: number) => Promise<TrackedEvent>;
   onDeleteMail: (eventId: number) => Promise<TrackedEvent>;
+  onIgnoreEvent: (eventId: number) => Promise<TrackedEvent>;
   onResolveConflict: (
     eventId: number,
     payload: { action: string; selections?: Record<string, 'email' | 'calendar'> },
@@ -38,6 +39,145 @@ interface Props {
 }
 
 type MergeSelectionMap = Record<number, Record<string, 'email' | 'calendar'>>;
+
+interface EventActionMenuProps {
+  onOpenMail: () => void;
+  onDeleteMail: () => void;
+  onIgnore: () => void;
+  openMailDisabled: boolean;
+  deleteDisabled: boolean;
+  ignoreDisabled: boolean;
+  isDeleting: boolean;
+  isIgnoring: boolean;
+}
+
+function EventActionMenu({
+  onOpenMail,
+  onDeleteMail,
+  onIgnore,
+  openMailDisabled,
+  deleteDisabled,
+  ignoreDisabled,
+  isDeleting,
+  isIgnoring,
+}: EventActionMenuProps) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    function handleClick(event: MouseEvent) {
+      if (!menuRef.current) {
+        return;
+      }
+      if (event.target instanceof Node && menuRef.current.contains(event.target)) {
+        return;
+      }
+      setOpen(false);
+    }
+    if (open) {
+      document.addEventListener('mousedown', handleClick);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClick);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    function handleKey(event: globalThis.KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setOpen(false);
+      }
+    }
+    if (open) {
+      document.addEventListener('keydown', handleKey);
+    }
+    return () => {
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [open]);
+
+  function closeAnd(action: () => void) {
+    setOpen(false);
+    action();
+  }
+
+  return (
+    <div ref={menuRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex h-8 w-8 items-center justify-center rounded-full border border-slate-700 bg-slate-900/80 text-slate-300 transition hover:border-slate-500 hover:text-slate-100"
+        aria-haspopup="true"
+        aria-expanded={open}
+        aria-label="Weitere Aktionen"
+      >
+        <span className="text-lg">☰</span>
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-2 w-56 rounded-lg border border-slate-800 bg-slate-900/95 p-2 text-left shadow-lg shadow-slate-900/40">
+          <button
+            type="button"
+            onClick={() => closeAnd(onOpenMail)}
+            disabled={openMailDisabled}
+            className={`flex w-full items-start gap-2 rounded-md px-3 py-2 text-sm transition ${
+              openMailDisabled
+                ? 'cursor-not-allowed text-slate-500'
+                : 'text-slate-200 hover:bg-slate-800'
+            }`}
+          >
+            <span className="mt-0.5 text-base">✉️</span>
+            <span>
+              <span className="block font-semibold">E-Mail aufrufen</span>
+              <span className="block text-xs text-slate-400">Öffnet die ursprüngliche Einladung im neuen Tab.</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => closeAnd(onDeleteMail)}
+            disabled={deleteDisabled}
+            className={`mt-1 flex w-full items-start gap-2 rounded-md px-3 py-2 text-sm transition ${
+              deleteDisabled
+                ? 'cursor-not-allowed text-slate-500'
+                : 'text-rose-200 hover:bg-rose-900/40'
+            }`}
+          >
+            <span className="mt-0.5 text-base">🗑️</span>
+            <span>
+              <span className="block font-semibold">E-Mail löschen</span>
+              <span className="block text-xs text-slate-400">Entfernt die Nachricht und den Termin aus CalSync.</span>
+              {(isDeleting || isIgnoring) && (
+                <span className="mt-1 block text-xs text-rose-200">
+                  {isDeleting ? 'Wird gelöscht…' : 'Wird ignoriert…'}
+                </span>
+              )}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => closeAnd(onIgnore)}
+            disabled={ignoreDisabled}
+            className={`mt-1 flex w-full items-start gap-2 rounded-md px-3 py-2 text-sm transition ${
+              ignoreDisabled
+                ? 'cursor-not-allowed text-slate-500'
+                : 'text-amber-200 hover:bg-amber-900/30'
+            }`}
+          >
+            <span className="mt-0.5 text-base">🚫</span>
+            <span>
+              <span className="block font-semibold">Termin ignorieren</span>
+              <span className="block text-xs text-slate-400">
+                Überspringt alle bisherigen und zukünftigen E-Mail-Updates zu diesem Termin.
+              </span>
+              {isIgnoring && (
+                <span className="mt-1 block text-xs text-amber-200">Wird ignoriert…</span>
+              )}
+            </span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 const statusLabelMap: Record<TrackedEvent['status'], string> = {
   new: 'Neu',
@@ -244,6 +384,7 @@ export default function EventTable({
   onRespondToEvent,
   onDisableTracking,
   onDeleteMail,
+  onIgnoreEvent,
   onResolveConflict,
   loading = false,
   onRefresh,
@@ -271,6 +412,7 @@ export default function EventTable({
   const [page, setPage] = useState(1);
   const [resolvingConflictId, setResolvingConflictId] = useState<number | null>(null);
   const [mailActionId, setMailActionId] = useState<number | null>(null);
+  const [ignoringId, setIgnoringId] = useState<number | null>(null);
   const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
   const [activeMergeId, setActiveMergeId] = useState<number | null>(null);
   const [mergeSelections, setMergeSelections] = useState<MergeSelectionMap>({});
@@ -336,7 +478,7 @@ export default function EventTable({
         event.source_folder ?? '',
         event.status,
         event.response_status,
-        event.source_account_id ? String(event.source_account_id) : '',
+        event.source_account_label ?? (event.source_account_id ? String(event.source_account_id) : ''),
         event.conflicts?.map((conflict) => conflict.summary ?? conflict.uid).join(' ') ?? '',
       ]
         .join(' ')
@@ -942,7 +1084,6 @@ export default function EventTable({
       const title = event.summary ?? event.uid;
       setSyncNotice(`"${title}" wird bei zukünftigen Scans ignoriert.`);
       resetMerge(event.id);
-      await onRefresh();
     } catch (error) {
       console.error('Konnte Tracking nicht deaktivieren.', error);
       setSyncError('Tracking konnte nicht deaktiviert werden.');
@@ -966,12 +1107,24 @@ export default function EventTable({
       const updated = await onDeleteMail(event.id);
       const title = updated.summary ?? updated.uid;
       setSyncNotice(`E-Mail für "${title}" wurde im Postfach gelöscht.`);
-      await onRefresh();
     } catch (error) {
       console.error('Konnte E-Mail nicht löschen.', error);
       setSyncError('Die E-Mail konnte nicht gelöscht werden.');
     } finally {
       setMailActionId(null);
+    }
+  }
+
+  function handleOpenMail(event: TrackedEvent) {
+    if (!event.mailbox_message_id) {
+      setSyncError('Für diesen Termin ist keine verknüpfte E-Mail hinterlegt.');
+      return;
+    }
+    const base = (import.meta.env.VITE_API_BASE ?? '/api').replace(/\/$/, '');
+    const url = `${base}/events/${event.id}/mail`;
+    const opened = window.open(url, '_blank', 'noopener');
+    if (!opened) {
+      setSyncError('Die E-Mail konnte nicht geöffnet werden. Bitte Pop-up-Blocker prüfen.');
     }
   }
 
@@ -1046,6 +1199,31 @@ export default function EventTable({
       setSyncError('Konflikt konnte nicht gelöst werden.');
     } finally {
       setResolvingConflictId(null);
+    }
+  }
+
+  async function handleIgnoreEvent(event: TrackedEvent) {
+    if (ignoringId !== null || mailActionId !== null || resolvingConflictId !== null) {
+      return;
+    }
+    if (!event.source_account_id || !event.source_folder) {
+      setSyncError('Dieser Termin ist keiner E-Mail-Quelle zugeordnet und kann nicht ignoriert werden.');
+      return;
+    }
+    setIgnoringId(event.id);
+    setSyncError(null);
+    setSyncResult([]);
+    setMissing([]);
+    try {
+      await onIgnoreEvent(event.id);
+      const title = event.summary ?? event.uid;
+      setSyncNotice(`"${title}" wird ignoriert. Weitere E-Mail-Updates werden übersprungen.`);
+      resetMerge(event.id);
+    } catch (error) {
+      console.error('Termin konnte nicht ignoriert werden.', error);
+      setSyncError('Termin konnte nicht ignoriert werden.');
+    } finally {
+      setIgnoringId(null);
     }
   }
 
@@ -1325,10 +1503,10 @@ export default function EventTable({
           {paginatedEvents.map((event) => {
             const isOpen = openItems.includes(event.id);
             const dateRange = formatDateRange(event);
-            const sourceParts = [
-              event.source_account_id ? `Konto #${event.source_account_id}` : null,
-              event.source_folder,
-            ].filter(Boolean);
+            const accountLabel =
+              event.source_account_label ??
+              (event.source_account_id ? `Konto #${event.source_account_id}` : null);
+            const sourceParts = [accountLabel, event.source_folder].filter(Boolean);
             const conflictCount = event.conflicts?.length ?? 0;
             const syncState = event.sync_state;
             const hasSyncConflict = syncState?.has_conflict ?? false;
@@ -1339,6 +1517,7 @@ export default function EventTable({
             const historyEntries = sortHistoryEntries(event.history ?? []);
             const deletingMail = mailActionId === event.id;
             const disablingTracking = resolvingConflictId === event.id;
+            const ignoring = ignoringId === event.id;
             return (
               <div
                 key={event.id}
@@ -1381,20 +1560,34 @@ export default function EventTable({
                     </div>
                   </div>
                   <div className="flex flex-col items-start gap-2 sm:items-end">
-                    <span
-                      className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
-                        statusStyleMap[event.status]
-                      }`}
-                    >
-                      {statusLabelMap[event.status]}
-                    </span>
-                    <span
-                      className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
-                        responseStyleMap[event.response_status]
-                      }`}
-                    >
-                      {responseLabelMap[event.response_status]}
-                    </span>
+                    <div className="flex w-full items-start justify-between gap-2 sm:justify-end">
+                      <div className="flex flex-col items-start gap-2 sm:items-end">
+                        <span
+                          className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
+                            statusStyleMap[event.status]
+                          }`}
+                        >
+                          {statusLabelMap[event.status]}
+                        </span>
+                        <span
+                          className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
+                            responseStyleMap[event.response_status]
+                          }`}
+                        >
+                          {responseLabelMap[event.response_status]}
+                        </span>
+                      </div>
+                      <EventActionMenu
+                        onOpenMail={() => handleOpenMail(event)}
+                        onDeleteMail={() => handleDeleteMail(event)}
+                        onIgnore={() => handleIgnoreEvent(event)}
+                        openMailDisabled={!event.mailbox_message_id || deletingMail || disablingTracking || ignoring}
+                        deleteDisabled={deletingMail || disablingTracking || ignoring}
+                        ignoreDisabled={ignoring || deletingMail || disablingTracking}
+                        isDeleting={deletingMail}
+                        isIgnoring={ignoring}
+                      />
+                    </div>
                     {conflictCount > 0 && (
                       <span className="inline-flex items-center rounded-full bg-amber-500/20 px-3 py-1 text-xs font-semibold text-amber-300">
                         {conflictCount === 1 ? '1 Konflikt' : `${conflictCount} Konflikte`}

@@ -10,8 +10,9 @@ from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
-from icalendar import Calendar
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from icalendar import Calendar
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
@@ -61,8 +62,10 @@ from .services.imap_client import (
     FolderSelection,
     ImapSettings,
     MailAttachment,
+    MessageNotFoundError,
     delete_message,
     fetch_calendar_candidates,
+    fetch_message,
 )
 from .services.job_tracker import job_tracker
 from .services.scheduler import scheduler
@@ -410,6 +413,22 @@ def _attach_attendees(events: List[TrackedEvent]) -> None:
             except Exception:
                 logger.exception("Teilnehmerliste konnte nicht gelesen werden: %s", event.uid)
         setattr(event, "attendees", attendees)
+
+
+def _attach_account_labels(events: List[TrackedEvent], db: Session) -> None:
+    """Annotate tracked events with the human readable account label."""
+
+    account_ids = {event.source_account_id for event in events if event.source_account_id}
+    if not account_ids:
+        return
+    rows = (
+        db.execute(select(Account.id, Account.label).where(Account.id.in_(account_ids)))
+        .all()
+    )
+    label_map = {row[0]: row[1] for row in rows}
+    for event in events:
+        if event.source_account_id in label_map:
+            setattr(event, "source_account_label", label_map[event.source_account_id])
 
 
 def _resolve_caldav_context(
@@ -1458,6 +1477,7 @@ def list_events(db: Session = Depends(get_db)):
     _attach_conflicts(events, db)
     _attach_sync_state(events)
     _attach_attendees(events)
+    _attach_account_labels(events, db)
     return events
 
 
@@ -1572,6 +1592,7 @@ def update_event_response(
     _attach_conflicts([event], db)
     _attach_sync_state([event])
     _attach_attendees([event])
+    _attach_account_labels([event], db)
     return event
 
 
@@ -1773,6 +1794,7 @@ def resolve_event_conflict(
     _attach_conflicts([event], db)
     _attach_sync_state([event])
     _attach_attendees([event])
+    _attach_account_labels([event], db)
     return event
 
 
@@ -1806,7 +1828,138 @@ def disable_event_tracking(event_id: int, db: Session = Depends(get_db)) -> Trac
     setattr(event, "conflicts", [])
     _attach_sync_state([event])
     _attach_attendees([event])
+    _attach_account_labels([event], db)
     return event
+
+
+@app.post("/events/{event_id}/ignore", response_model=TrackedEventRead)
+def ignore_event(event_id: int, db: Session = Depends(get_db)) -> TrackedEvent:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+
+    if event.source_account_id is None or not event.source_folder:
+        raise HTTPException(
+            status_code=400,
+            detail="Termin verfügt über keine E-Mail-Quelle und kann nicht ignoriert werden.",
+        )
+
+    markers = (
+        db.execute(
+            select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+        )
+        .scalars()
+        .all()
+    )
+    marker_uid = _parse_mail_uid(event.mailbox_message_id)
+    updated_marker = False
+    for marker in markers:
+        marker.account_id = event.source_account_id
+        marker.folder = event.source_folder
+        marker.ignore_all = True
+        if marker_uid is not None and (marker.max_uid is None or marker.max_uid < marker_uid):
+            marker.max_uid = marker_uid
+        db.add(marker)
+        updated_marker = True
+
+    if not updated_marker:
+        message_identifier = event.mailbox_message_id or f"ignore::{event.uid}"
+        marker = IgnoredMailImport(
+            event_id=event.id,
+            account_id=event.source_account_id,
+            folder=event.source_folder,
+            message_id=message_identifier,
+            max_uid=marker_uid,
+            ignore_all=True,
+        )
+        db.add(marker)
+
+    now = datetime.utcnow()
+    event.tracking_disabled = True
+    event.sync_conflict = False
+    event.sync_conflict_reason = "Tracking deaktiviert"
+    event.sync_conflict_snapshot = None
+    event.updated_at = now
+    event.local_last_modified = event.local_last_modified or now
+    event.last_modified_source = event.last_modified_source or "local"
+    event.history = merge_histories(
+        event.history or [],
+        {
+            "timestamp": now.isoformat(),
+            "action": "mail-ignored",
+            "description": "Termin wird ignoriert – weitere E-Mail-Updates werden übersprungen.",
+        },
+    )
+
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    setattr(event, "conflicts", [])
+    _attach_sync_state([event])
+    _attach_attendees([event])
+    _attach_account_labels([event], db)
+    return event
+
+
+@app.get("/events/{event_id}/mail")
+def download_event_mail(event_id: int, db: Session = Depends(get_db)) -> Response:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+
+    if (
+        not event.mailbox_message_id
+        or event.source_account_id is None
+        or not event.source_folder
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Für diesen Termin ist keine verknüpfte E-Mail vorhanden.",
+        )
+
+    account = db.get(Account, event.source_account_id)
+    if account is None or account.type != AccountType.IMAP:
+        raise HTTPException(
+            status_code=404,
+            detail="IMAP-Konto für diesen Termin wurde nicht gefunden.",
+        )
+
+    try:
+        settings = ImapSettings(**account.settings)
+    except TypeError:
+        logger.exception("Ungültige IMAP Einstellungen für Konto %s", account.id)
+        raise HTTPException(
+            status_code=500,
+            detail="IMAP-Einstellungen für das Konto sind ungültig.",
+        )
+
+    try:
+        raw_message = fetch_message(
+            settings, event.source_folder, event.mailbox_message_id
+        )
+    except MessageNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Die E-Mail wurde im Postfach nicht gefunden.",
+        )
+    except Exception:
+        logger.exception(
+            "Konnte E-Mail %s in Ordner %s (Konto %s) nicht laden",
+            event.mailbox_message_id,
+            event.source_folder,
+            account.id,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Die E-Mail konnte nicht geladen werden.",
+        )
+
+    base_name = event.summary or event.uid or "termin"
+    safe_name = "".join(ch if str(ch).isalnum() or ch in {"-", "_"} else "-" for ch in base_name)
+    safe_name = safe_name.strip("-") or "termin"
+    filename = f"{safe_name}.eml"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=raw_message, media_type="message/rfc822", headers=headers)
 
 
 @app.post("/events/{event_id}/delete-mail", response_model=TrackedEventRead)
@@ -1880,6 +2033,10 @@ def delete_event_mail(event_id: int, db: Session = Depends(get_db)) -> TrackedEv
     event.local_last_modified = now
     event.last_modified_source = "local"
     event.updated_at = now
+    event.tracking_disabled = True
+    event.sync_conflict = False
+    event.sync_conflict_reason = "Tracking deaktiviert"
+    event.sync_conflict_snapshot = None
     db.add(event)
     db.commit()
     logger.info(
@@ -1889,9 +2046,10 @@ def delete_event_mail(event_id: int, db: Session = Depends(get_db)) -> TrackedEv
         event.source_folder,
     )
     db.refresh(event)
-    _attach_conflicts([event], db)
+    setattr(event, "conflicts", [])
     _attach_sync_state([event])
     _attach_attendees([event])
+    _attach_account_labels([event], db)
     return event
 
 

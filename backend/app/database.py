@@ -135,6 +135,16 @@ def apply_schema_upgrades() -> None:
                 """
             )
 
+    if ignored_mail_columns and "ignore_all" not in ignored_mail_columns:
+        logger.info("Adding ignore_all column to ignored_mail_imports table")
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                ALTER TABLE ignored_mail_imports
+                ADD COLUMN ignore_all BOOLEAN NOT NULL DEFAULT 0
+                """
+            )
+
     if needs_status_enum_upgrade:
         logger.info(
             "Rebuilding tracked_events table to allow the failed status in enum constraint"
