@@ -54,6 +54,11 @@ def upsert_events(
             event: TrackedEvent | None = session.execute(
                 select(TrackedEvent).where(TrackedEvent.uid == parsed.uid)
             ).scalar_one_or_none()
+            if event is not None and event.tracking_disabled:
+                logger.info(
+                    "Skipping update for %s because tracking is disabled", parsed.uid
+                )
+                continue
             now = datetime.utcnow()
             history_entry = {
                 "timestamp": now.isoformat(),

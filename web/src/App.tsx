@@ -28,6 +28,10 @@ function App() {
     disableTracking,
     deleteMail,
     resolveConflict,
+    ignoredEvents,
+    ignoredLoading,
+    loadIgnoredEvents,
+    enableTracking,
   } = useEvents();
   const { mappings, addMapping, removeMapping } = useSyncMappings();
   const [editingAccountId, setEditingAccountId] = useState<number | null>(null);
@@ -156,6 +160,10 @@ function App() {
               autoSyncJob={autoSync.active_job ?? null}
               onLoadAutoSync={loadAutoSync}
               loading={eventsLoading}
+              ignoredEvents={ignoredEvents}
+              ignoredLoading={ignoredLoading}
+              onLoadIgnored={loadIgnoredEvents}
+              onRestoreTracking={enableTracking}
             />
           </div>
         )}

@@ -35,6 +35,10 @@ interface Props {
   onRefresh: () => Promise<void>;
   autoSyncJob: SyncJobStatus | null;
   onLoadAutoSync: () => Promise<void>;
+  ignoredEvents: TrackedEvent[];
+  ignoredLoading: boolean;
+  onLoadIgnored: () => Promise<void>;
+  onRestoreTracking: (eventId: number) => Promise<TrackedEvent>;
 }
 
 type MergeSelectionMap = Record<number, Record<string, 'email' | 'calendar'>>;
@@ -94,7 +98,13 @@ const responseActions: Array<{
 
 type SortOption = 'email-desc' | 'email-asc' | 'event-asc' | 'event-desc' | 'none';
 
-type KpiKey = 'outstanding' | 'processed' | 'calendarConflicts' | 'failedImports' | 'syncConflicts';
+type KpiKey =
+  | 'outstanding'
+  | 'processed'
+  | 'calendarConflicts'
+  | 'failedImports'
+  | 'syncConflicts'
+  | 'ignored';
 
 const KPI_FILTERS: Record<KpiKey, (event: TrackedEvent) => boolean> = {
   outstanding: (event) => event.status === 'new' || event.status === 'updated',
@@ -102,6 +112,7 @@ const KPI_FILTERS: Record<KpiKey, (event: TrackedEvent) => boolean> = {
   calendarConflicts: (event) => (event.conflicts?.length ?? 0) > 0,
   failedImports: (event) => event.status === 'failed',
   syncConflicts: (event) => event.sync_state?.has_conflict ?? false,
+  ignored: () => false,
 };
 
 const sortOptionItems: Array<{ value: SortOption; label: string }> = [
@@ -249,6 +260,10 @@ export default function EventTable({
   onRefresh,
   autoSyncJob,
   onLoadAutoSync,
+  ignoredEvents,
+  ignoredLoading,
+  onLoadIgnored,
+  onRestoreTracking,
 }: Props) {
   const [selected, setSelected] = useState<number[]>([]);
   const [openItems, setOpenItems] = useState<number[]>([]);
@@ -274,6 +289,8 @@ export default function EventTable({
   const [expandedDifferences, setExpandedDifferences] = useState<Record<number, boolean>>({});
   const [activeMergeId, setActiveMergeId] = useState<number | null>(null);
   const [mergeSelections, setMergeSelections] = useState<MergeSelectionMap>({});
+  const [ignoredError, setIgnoredError] = useState<string | null>(null);
+  const [restoringId, setRestoringId] = useState<number | null>(null);
   const pollersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -320,7 +337,7 @@ export default function EventTable({
     const responseSet = new Set(responseFilters);
 
     const filtered = events.filter((event) => {
-      if (activeKpi && !KPI_FILTERS[activeKpi](event)) {
+      if (activeKpi && activeKpi !== 'ignored' && !KPI_FILTERS[activeKpi](event)) {
         return false;
       }
       if (responseSet.size > 0 && !responseSet.has(event.response_status)) {
@@ -366,6 +383,27 @@ export default function EventTable({
     return sorted;
   }, [events, searchTerm, responseFilters, sortOption, activeKpi]);
 
+  const sortedIgnoredEvents = useMemo(() => {
+    const copy = [...ignoredEvents];
+    copy.sort((a, b) => {
+      const dateA = parseIsoDate(a.updated_at) ?? parseIsoDate(a.created_at);
+      const dateB = parseIsoDate(b.updated_at) ?? parseIsoDate(b.created_at);
+      const timeA = dateA ? dateA.getTime() : Number.NaN;
+      const timeB = dateB ? dateB.getTime() : Number.NaN;
+      if (Number.isNaN(timeA) && Number.isNaN(timeB)) {
+        return 0;
+      }
+      if (Number.isNaN(timeA)) {
+        return 1;
+      }
+      if (Number.isNaN(timeB)) {
+        return -1;
+      }
+      return timeB - timeA;
+    });
+    return copy;
+  }, [ignoredEvents]);
+
   const totalPages = useMemo(() => {
     return Math.max(1, Math.ceil(filteredEvents.length / pageSize));
   }, [filteredEvents, pageSize]);
@@ -391,12 +429,13 @@ export default function EventTable({
       calendarConflicts: events.filter(KPI_FILTERS.calendarConflicts).length,
       failedImports: events.filter(KPI_FILTERS.failedImports).length,
       syncConflicts: events.filter(KPI_FILTERS.syncConflicts).length,
+      ignored: ignoredEvents.length,
     }),
-    [events],
+    [events, ignoredEvents],
   );
 
   useEffect(() => {
-    if (activeKpi && metrics[activeKpi] === 0) {
+    if (activeKpi && activeKpi !== 'ignored' && metrics[activeKpi] === 0) {
       setActiveKpi(null);
     }
   }, [activeKpi, metrics]);
@@ -443,6 +482,13 @@ export default function EventTable({
       accent: 'text-rose-300',
       description: 'Konflikte zwischen Mail-Import und Kalenderdaten.',
     },
+    {
+      key: 'ignored',
+      label: 'Ignoriert',
+      count: metrics.ignored,
+      accent: 'text-slate-200',
+      description: 'Vom Tracking ausgeschlossene Termine verwalten.',
+    },
   ];
 
   function toggleSelection(id: number) {
@@ -468,6 +514,12 @@ export default function EventTable({
   }
 
   function toggleKpiFilter(key: KpiKey) {
+    if (key === 'ignored' && activeKpi !== 'ignored') {
+      setIgnoredError(null);
+      onLoadIgnored().catch(() => {
+        setIgnoredError('Ignorierte Termine konnten nicht geladen werden.');
+      });
+    }
     setActiveKpi((prev) => (prev === key ? null : key));
   }
 
@@ -723,6 +775,40 @@ export default function EventTable({
     }
   }
 
+  function handleIgnoredRefresh() {
+    setIgnoredError(null);
+    onLoadIgnored().catch(() => {
+      setIgnoredError('Ignorierte Termine konnten nicht geladen werden.');
+    });
+  }
+
+  async function handleRestoreTracking(event: TrackedEvent) {
+    if (restoringId !== null) {
+      return;
+    }
+    setRestoringId(event.id);
+    setIgnoredError(null);
+    setSyncError(null);
+    setSyncNotice(null);
+    try {
+      const restored = await onRestoreTracking(event.id);
+      const title = restored.summary ?? restored.uid;
+      setSyncNotice(`"${title}" wird wieder verfolgt.`);
+      await onRefresh();
+      try {
+        await onLoadIgnored();
+      } catch (loadError) {
+        console.error('Ignorierte Termine konnten nicht aktualisiert werden.', loadError);
+        setIgnoredError('Ignorierte Termine konnten nicht geladen werden.');
+      }
+    } catch (error) {
+      console.error('Konnte Tracking nicht reaktivieren.', error);
+      setIgnoredError('Tracking konnte nicht reaktiviert werden.');
+    } finally {
+      setRestoringId(null);
+    }
+  }
+
   async function handleScan() {
     setBusy(true);
     setSyncError(null);
@@ -943,6 +1029,12 @@ export default function EventTable({
       setSyncNotice(`"${title}" wird bei zukünftigen Scans ignoriert.`);
       resetMerge(event.id);
       await onRefresh();
+      try {
+        await onLoadIgnored();
+      } catch (error) {
+        console.error('Ignorierte Termine konnten nicht aktualisiert werden.', error);
+        setIgnoredError('Ignorierte Termine konnten nicht geladen werden.');
+      }
     } catch (error) {
       console.error('Konnte Tracking nicht deaktivieren.', error);
       setSyncError('Tracking konnte nicht deaktiviert werden.');
@@ -1103,6 +1195,78 @@ export default function EventTable({
           );
         })}
       </div>
+
+      {activeKpi === 'ignored' && (
+        <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-200">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-slate-100">Ignorierte Termine</p>
+              <p className="text-xs text-slate-400">
+                Termine, die aktuell vom automatischen Tracking ausgeschlossen sind.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleIgnoredRefresh}
+              className="inline-flex items-center justify-center rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-emerald-400 hover:text-emerald-200"
+            >
+              Liste aktualisieren
+            </button>
+          </div>
+          {ignoredError && (
+            <div className="mt-3 rounded-lg border border-rose-600/60 bg-rose-500/10 p-3 text-xs text-rose-200">
+              {ignoredError}
+            </div>
+          )}
+          {ignoredLoading ? (
+            <p className="mt-3 text-xs text-slate-400">Lade ignorierte Termine …</p>
+          ) : sortedIgnoredEvents.length === 0 ? (
+            <p className="mt-3 text-xs text-slate-400">Keine ignorierten Termine vorhanden.</p>
+          ) : (
+            <ul className="mt-4 space-y-3">
+              {sortedIgnoredEvents.map((event) => {
+                const dateRange = formatDateRange(event);
+                const sourceParts = [
+                  event.source_account_id ? `Konto #${event.source_account_id}` : null,
+                  event.source_folder,
+                ].filter(Boolean);
+                const restoring = restoringId === event.id;
+                return (
+                  <li
+                    key={event.id}
+                    className="rounded-lg border border-slate-800 bg-slate-900/60 p-3"
+                  >
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="space-y-1">
+                        <p className="text-sm font-semibold text-slate-100">
+                          {event.summary ?? 'Unbenannter Termin'}
+                        </p>
+                        <p className="text-xs text-slate-400">{dateRange}</p>
+                        <p className="break-all text-xs text-slate-500">{event.uid}</p>
+                        {sourceParts.length > 0 && (
+                          <p className="text-xs text-slate-500">{sourceParts.join(' · ')}</p>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleRestoreTracking(event)}
+                        disabled={restoring}
+                        className={`inline-flex items-center justify-center rounded-lg border px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-emerald-400/60 ${
+                          restoring
+                            ? 'cursor-progress border-emerald-500/40 text-emerald-200/70'
+                            : 'border-emerald-500/60 text-emerald-200 hover:border-emerald-400 hover:bg-emerald-500/10'
+                        }`}
+                      >
+                        {restoring ? 'Wird reaktiviert…' : 'Tracking wieder aktivieren'}
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-lg shadow-emerald-500/5">
@@ -1429,6 +1593,27 @@ export default function EventTable({
                         <p className="mt-1 text-slate-300">{dateRange}</p>
                       </div>
                     </div>
+                    {event.status !== 'failed' && (
+                      <div className="mt-4">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleDisableTracking(event)}
+                            disabled={disablingTracking}
+                            className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-emerald-300/60 ${
+                              disablingTracking
+                                ? 'cursor-progress border-emerald-500/40 text-emerald-200/70'
+                                : 'border-emerald-500/50 text-emerald-200 hover:border-emerald-400 hover:bg-emerald-500/10'
+                            }`}
+                          >
+                            {disablingTracking ? 'Wird ausgeschlossen…' : 'Termin ignorieren'}
+                          </button>
+                          <p className="text-[11px] text-slate-400">
+                            Entfernt den Termin aus der Übersicht und ignoriert zugehörige Mail-Updates.
+                          </p>
+                        </div>
+                      </div>
+                    )}
                     {event.status === 'failed' && (
                       <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-100">
                         <p className="text-sm font-semibold text-rose-200">Importfehler</p>

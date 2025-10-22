@@ -65,6 +65,8 @@ export async function runConnectionTest(payload: ConnectionTestRequest) {
 export function useEvents() {
   const [events, setEvents] = useState<TrackedEvent[]>([]);
   const [loading, setLoading] = useState(true);
+  const [ignoredEvents, setIgnoredEvents] = useState<TrackedEvent[]>([]);
+  const [ignoredLoading, setIgnoredLoading] = useState(true);
   const [autoSync, setAutoSync] = useState<AutoSyncStatus>({
     enabled: false,
     interval_minutes: 5,
@@ -85,6 +87,18 @@ export function useEvents() {
     }
   }
 
+  async function loadIgnoredEvents() {
+    setIgnoredLoading(true);
+    try {
+      const { data } = await api.get<TrackedEvent[]>('/events/ignored');
+      setIgnoredEvents(data);
+    } catch (error) {
+      console.error('Konnte ignorierte Termine nicht laden.', error);
+    } finally {
+      setIgnoredLoading(false);
+    }
+  }
+
   async function loadAutoSync() {
     const { data } = await api.get<AutoSyncStatus>('/events/auto-sync');
     setAutoSync((prev) => ({
@@ -98,6 +112,7 @@ export function useEvents() {
   useEffect(() => {
     refresh();
     loadAutoSync();
+    loadIgnoredEvents();
   }, []);
 
   async function scan() {
@@ -160,12 +175,26 @@ export function useEvents() {
   async function disableTracking(eventId: number) {
     const { data } = await api.post<TrackedEvent>(`/events/${eventId}/disable-tracking`);
     setEvents((prev) => prev.filter((event) => event.id !== eventId));
+    setIgnoredEvents((prev) => {
+      const withoutCurrent = prev.filter((event) => event.id !== eventId);
+      return [...withoutCurrent, data];
+    });
     return data;
   }
 
   async function deleteMail(eventId: number) {
     const { data } = await api.post<TrackedEvent>(`/events/${eventId}/delete-mail`);
     setEvents((prev) => prev.map((event) => (event.id === eventId ? data : event)));
+    return data;
+  }
+
+  async function enableTracking(eventId: number) {
+    const { data } = await api.post<TrackedEvent>(`/events/${eventId}/enable-tracking`);
+    setIgnoredEvents((prev) => prev.filter((event) => event.id !== eventId));
+    setEvents((prev) => {
+      const withoutCurrent = prev.filter((event) => event.id !== eventId);
+      return [...withoutCurrent, data];
+    });
     return data;
   }
 
@@ -195,6 +224,10 @@ export function useEvents() {
     disableTracking,
     deleteMail,
     resolveConflict,
+    ignoredEvents,
+    ignoredLoading,
+    loadIgnoredEvents,
+    enableTracking,
   };
 }
 

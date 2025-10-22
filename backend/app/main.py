@@ -1461,6 +1461,20 @@ def list_events(db: Session = Depends(get_db)):
     return events
 
 
+@app.get("/events/ignored", response_model=List[TrackedEventRead])
+def list_ignored_events(db: Session = Depends(get_db)):
+    events = (
+        db.execute(select(TrackedEvent).where(TrackedEvent.tracking_disabled.is_(True)))
+        .scalars()
+        .all()
+    )
+    _normalize_histories(events, db)
+    _attach_conflicts(events, db)
+    _attach_sync_state(events)
+    _attach_attendees(events)
+    return events
+
+
 @app.post("/events/scan", response_model=SyncJobStatus)
 def scan_mailboxes(background_tasks: BackgroundTasks):
     state = job_tracker.create("scan", total=0)
@@ -1787,6 +1801,7 @@ def disable_event_tracking(event_id: int, db: Session = Depends(get_db)) -> Trac
         event.sync_conflict = False
         event.sync_conflict_reason = "Tracking deaktiviert"
         event.sync_conflict_snapshot = None
+        _record_ignored_mail_import(db, event)
         event.history = merge_histories(
             event.history or [],
             {
@@ -1804,6 +1819,50 @@ def disable_event_tracking(event_id: int, db: Session = Depends(get_db)) -> Trac
 
     db.refresh(event)
     setattr(event, "conflicts", [])
+    _attach_sync_state([event])
+    _attach_attendees([event])
+    return event
+
+
+@app.post("/events/{event_id}/enable-tracking", response_model=TrackedEventRead)
+def enable_event_tracking(event_id: int, db: Session = Depends(get_db)) -> TrackedEvent:
+    event = db.get(TrackedEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Termin nicht gefunden")
+
+    if event.tracking_disabled:
+        markers = (
+            db.execute(
+                select(IgnoredMailImport).where(IgnoredMailImport.event_id == event.id)
+            )
+            .scalars()
+            .all()
+        )
+        for marker in markers:
+            db.delete(marker)
+
+        event.tracking_disabled = False
+        event.sync_conflict = False
+        event.sync_conflict_reason = None
+        event.sync_conflict_snapshot = None
+        event.history = merge_histories(
+            event.history or [],
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "action": "tracking-enabled",
+                "description": "Tracking für diesen Termin wurde wieder aktiviert.",
+            },
+        )
+        event.updated_at = datetime.utcnow()
+        db.add(event)
+        db.commit()
+        logger.info("Tracking für Termin %s wurde reaktiviert", event.uid)
+    else:
+        db.commit()
+
+    db.refresh(event)
+    setattr(event, "conflicts", [])
+    _attach_conflicts([event], db)
     _attach_sync_state([event])
     _attach_attendees([event])
     return event
